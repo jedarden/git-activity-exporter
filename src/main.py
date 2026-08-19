@@ -97,19 +97,33 @@ def _run_cycle(cfg, s3, family_map):
         scanned, len(repos), len(failed), len(commits), len(events), len(hourly),
     )
 
-    # REFUSE TO PUBLISH A TOTAL FAILURE.
-    # Every repo failing is an infrastructure fault -- an unwritable volume, a
-    # dead credential, the forge unreachable -- not a quiet fleet. Uploading
-    # the resulting empty tables would overwrite a good dataset with zeroes
-    # and render as "no activity", which is indistinguishable from a real
-    # lull and far harder to notice than a stale timestamp. Bail instead:
-    # readiness stays false, meta.json keeps its previous generated_at, and
-    # the panel keeps showing the last good data.
-    if repos and not scanned:
-        raise RuntimeError(
-            f"all {len(repos)} repo(s) failed this cycle; refusing to publish "
-            f"empty data over the previous cycle's. First failures: {failed[:3]}"
-        )
+    # REFUSE TO PUBLISH A BADLY DEGRADED CYCLE.
+    # An infrastructure fault -- an unwritable volume, a revoked credential,
+    # the forge unreachable -- is not a quiet fleet, and publishing its
+    # result overwrites a good dataset with something that reads as "the
+    # fleet did much less work", which is indistinguishable from a real lull
+    # and far harder to notice than a stale timestamp.
+    #
+    # An earlier version of this check only fired when EVERY repo failed, and
+    # that proved far too weak in practice: when the Forgejo token was
+    # rotated, 97 of 112 repos failed authentication but the 15 PUBLIC ones
+    # still cloned anonymously, so `scanned` was non-zero, the guard stayed
+    # quiet, and a 6,588-cell dataset was replaced by a 1,580-cell one. The
+    # threshold is a fraction for that reason -- partial failure is the
+    # dangerous case, not total failure.
+    if repos:
+        failure_rate = len(failed) / len(repos)
+        if failure_rate > cfg.max_failure_rate:
+            raise RuntimeError(
+                f"{len(failed)}/{len(repos)} repo(s) failed this cycle "
+                f"({failure_rate:.0%} > {cfg.max_failure_rate:.0%} limit); refusing to "
+                f"publish over the previous cycle's data. First failures: {failed[:3]}"
+            )
+        if failed:
+            log.warning(
+                "publishing with %d/%d repo(s) missing (%.0f%%, under the %.0f%% limit)",
+                len(failed), len(repos), failure_rate * 100, cfg.max_failure_rate * 100,
+            )
 
     for key, rows, schema in (
         ("hourly.parquet", hourly, parquet_io.HOURLY_SCHEMA),

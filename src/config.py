@@ -82,6 +82,11 @@ class Config:
     # just under the per-repo bar during the same mass import.
     bead_bulk_hour_share: float
     families_file: str
+    # Fraction of repos that may fail before a cycle is treated as an
+    # infrastructure fault and withheld rather than published. Sized to catch
+    # a revoked credential (which failed 87% of repos while the public ones
+    # kept working) without withholding a cycle over a couple of slow clones.
+    max_failure_rate: float
     dest: S3Endpoint
     dest_prefix: str
     version: str
@@ -135,6 +140,7 @@ def load() -> Config:
         bead_bulk_close_threshold=int(_optional("BEAD_BULK_CLOSE_THRESHOLD", "150")),
         bead_bulk_hour_share=float(_optional("BEAD_BULK_HOUR_SHARE", "0.5")),
         families_file=_optional("FAMILIES_FILE", "families.yaml"),
+        max_failure_rate=float(_optional("MAX_FAILURE_RATE", "0.2")),
         dest=dest,
         dest_prefix=_optional("DEST_S3_PREFIX", "git-activity/data").rstrip("/"),
         version=_read_version(_optional("VERSION_FILE", "VERSION")),
