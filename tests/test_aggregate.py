@@ -74,3 +74,10 @@ def test_hour_bucket_is_utc_and_explicitly_zoned():
     rows = aggregate.build_hourly([_commit("NEEDLE", 1786899261)], [], FAMILY_MAP)
     assert rows[0]["hour_utc"].endswith("Z")
     assert rows[0]["hour_utc"] == "2026-08-16T16:00:00Z"  # 16:34:21Z truncated to the hour
+
+
+def test_total_failure_produces_no_rows_to_publish():
+    # Guards the invariant behind main's refuse-to-publish check: when every
+    # repo fails there is genuinely nothing, and zeroes written over a good
+    # dataset read as a quiet fleet rather than as the outage they are.
+    assert aggregate.build_hourly([], [], FAMILY_MAP) == []

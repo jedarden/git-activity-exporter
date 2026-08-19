@@ -97,6 +97,20 @@ def _run_cycle(cfg, s3, family_map):
         scanned, len(repos), len(failed), len(commits), len(events), len(hourly),
     )
 
+    # REFUSE TO PUBLISH A TOTAL FAILURE.
+    # Every repo failing is an infrastructure fault -- an unwritable volume, a
+    # dead credential, the forge unreachable -- not a quiet fleet. Uploading
+    # the resulting empty tables would overwrite a good dataset with zeroes
+    # and render as "no activity", which is indistinguishable from a real
+    # lull and far harder to notice than a stale timestamp. Bail instead:
+    # readiness stays false, meta.json keeps its previous generated_at, and
+    # the panel keeps showing the last good data.
+    if repos and not scanned:
+        raise RuntimeError(
+            f"all {len(repos)} repo(s) failed this cycle; refusing to publish "
+            f"empty data over the previous cycle's. First failures: {failed[:3]}"
+        )
+
     for key, rows, schema in (
         ("hourly.parquet", hourly, parquet_io.HOURLY_SCHEMA),
         ("commits.parquet", aggregate.commit_rows(commits, family_map), parquet_io.COMMITS_SCHEMA),
