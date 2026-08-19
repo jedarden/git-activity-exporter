@@ -32,20 +32,57 @@ class GitError(Exception):
     pass
 
 
-def _run(args, timeout, cwd=None):
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+def _run(args, timeout, cwd=None, env=None):
+    """Run git, and NEVER let a credential reach an exception string.
+
+    subprocess.TimeoutExpired stringifies the entire argv. When the token was
+    embedded in the clone URL that put it verbatim into the log on every
+    timeout -- which is exactly what happened on the first live cold pass.
+    The token now travels in the environment (see _credential_env) so argv is
+    clean, and every failure path is additionally scrubbed here so a future
+    change cannot silently reintroduce the leak.
+    """
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
+        )
+    except subprocess.TimeoutExpired:
+        raise GitError(f"{_safe(args)} timed out after {timeout}s")
     if proc.returncode != 0:
-        raise GitError(f"{' '.join(args[:3])}... failed rc={proc.returncode}: {proc.stderr.strip()[:300]}")
+        raise GitError(f"{_safe(args)} failed rc={proc.returncode}: {_scrub(proc.stderr.strip()[:300])}")
     return proc.stdout
 
 
-def _authed_url(clone_url: str, token: str) -> str:
-    # Token goes into the URL only in-process, never into a file. Mirrors are
-    # cloned with the credential stripped from the stored remote (below) so it
-    # never lands in .git/config on the PVC.
-    if clone_url.startswith("https://"):
-        return "https://x-access-token:" + token + "@" + clone_url[len("https://"):]
-    raise GitError(f"refusing to embed a token in a non-https clone URL: {clone_url}")
+# Anything that looks like credentials in a URL, whatever the scheme.
+_CRED_RE = re.compile(r"(https?://)[^/@\s]+@")
+
+
+def _scrub(text: str) -> str:
+    return _CRED_RE.sub(r"\1<redacted>@", text or "")
+
+
+def _safe(args) -> str:
+    """A loggable rendering of a git command with any credential removed."""
+    return _scrub(" ".join(str(a) for a in args))
+
+
+def _credential_env(token: str) -> dict:
+    """Supply the credential through git's config-via-environment mechanism.
+
+    The token never appears in argv, in the stored remote, or in .git/config
+    on the PVC -- so it cannot be captured by a process listing, an exception
+    string, or anything that echoes a command back.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["FORGE_TOKEN"] = token
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "credential.helper"
+    env["GIT_CONFIG_VALUE_0"] = (
+        '!f() { test "$1" = get && echo "username=x-access-token" '
+        '&& echo "password=$FORGE_TOKEN"; }; f'
+    )
+    return env
 
 
 def mirror_path(clone_root: str, repo_name: str) -> str:
@@ -56,13 +93,13 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     """Clone or refresh one bare mirror. Returns its path."""
     path = mirror_path(clone_root, repo["name"])
     since = (datetime.now(timezone.utc) - timedelta(days=shallow_since_days)).strftime("%Y-%m-%d")
-    url = _authed_url(repo["clone_url"], token)
+    url = repo["clone_url"]
+    env = _credential_env(token)
 
     if os.path.exists(os.path.join(path, "HEAD")):
         try:
-            # The stored remote has no credential, so re-supply it per fetch.
             _run(["git", "-C", path, "fetch", "--quiet", "--prune", f"--shallow-since={since}",
-                  url, "+refs/heads/*:refs/heads/*"], timeout)
+                  url, "+refs/heads/*:refs/heads/*"], timeout, env=env)
             return path
         except GitError as e:
             # A mirror can be left unusable by a killed clone (partial pack,
@@ -74,10 +111,18 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     os.makedirs(clone_root, exist_ok=True)
     tmp = path + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
-    _run(["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp], timeout)
-    # Strip the credential from the persisted remote before the mirror becomes
-    # visible under its real name.
-    _run(["git", "-C", tmp, "remote", "set-url", "origin", repo["clone_url"]], timeout)
+    try:
+        _run(["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp], timeout, env=env)
+    except GitError as e:
+        # "error processing shallow info" means the cutoff excludes every
+        # commit on the remote -- a repo dormant longer than the window. It
+        # is a legitimate repo with nothing in range, not a broken one, so
+        # fall back to a minimal clone rather than dropping it from the fleet.
+        if "shallow info" not in str(e):
+            raise
+        log.info("%s has no commits since %s; cloning at depth 1 instead", repo["name"], since)
+        shutil.rmtree(tmp, ignore_errors=True)
+        _run(["git", "clone", "--quiet", "--mirror", "--depth", "1", url, tmp], timeout, env=env)
     shutil.rmtree(path, ignore_errors=True)
     os.rename(tmp, path)
     return path

@@ -50,3 +50,31 @@ def test_mark_bulk_flags_but_does_not_drop():
     out = gitscan.mark_bulk(commits, 5000, 200)
     assert [c["is_bulk"] for c in out] == [False, True, True]
     assert len(out) == 3, "bulk commits must survive as commits"
+
+
+def test_credentials_never_survive_into_a_log_line():
+    # The first live cold pass leaked the Forgejo token into the pod log:
+    # subprocess.TimeoutExpired stringifies the whole argv, and the token was
+    # embedded in the clone URL. Both halves of the fix are asserted here --
+    # argv no longer carries it, and any that reappears is scrubbed anyway.
+    leaky = "https://x-access-token:DEADBEEFCAFE1234@git.ardenone.com/jedarden/x.git"
+    assert "DEADBEEFCAFE1234" not in gitscan._scrub(leaky)
+    assert gitscan._scrub(leaky) == "https://<redacted>@git.ardenone.com/jedarden/x.git"
+
+    rendered = gitscan._safe(["git", "clone", "--mirror", leaky, "/data/mirrors/x.git.tmp"])
+    assert "DEADBEEF" not in rendered
+    assert "<redacted>" in rendered
+
+    # stderr from git is scrubbed on the same path
+    assert "DEADBEEF" not in gitscan._scrub(f"fatal: could not read from {leaky}")
+
+
+def test_token_travels_in_env_not_argv():
+    env = gitscan._credential_env("SUPERSECRET")
+    # Present for git to consume...
+    assert env["FORGE_TOKEN"] == "SUPERSECRET"
+    # ...but only ever dereferenced by name, so it cannot appear in a command
+    # line, a process listing, or an exception string.
+    assert "SUPERSECRET" not in env["GIT_CONFIG_VALUE_0"]
+    assert "$FORGE_TOKEN" in env["GIT_CONFIG_VALUE_0"]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
