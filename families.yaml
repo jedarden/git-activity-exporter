@@ -1,0 +1,129 @@
+# Repo -> family. The middle scope tier of the dashboard.
+#
+# Editorial by design: nothing in a repo's metadata says that `commitgraph`
+# and `commitgraph-deprecated` are one programme (2,651 commits between them
+# in a 30-day sample, invisible as a single effort unless grouped), or that
+# the agent tooling repos belong together. Keep it that way -- a repo listed
+# under two families is a hard error, and anything unlisted lands in
+# `unassigned` and still appears in the ecosystem and repo tiers.
+families:
+  agent-fleet:
+    - needle-pod
+    - trail-boss
+    - claude-config
+    - agentists-quickstart
+    - agentists-quickstart-deprecated
+    - SIGIL
+    - sigil-signatures
+    - TRACE
+    - MANA
+    - PERCH
+    - CLASP
+    - ccdash
+    - bobbin
+    - remote-index
+    - NEEDLE
+    - FABRIC
+    - bead-rs
+    - AgentScribe
+    - claude-governor
+    - codex-governor
+    - claude-print
+    - claude-swap
+    - claude-code-rlm
+    - ROTA
+    - HOOP
+    - FORGE
+    - warden
+    - irreversible-command-gate
+    - jeds-curated-skills
+    - aide-de-camp
+
+  commitgraph:
+    - commitgraph
+    - commitgraph-deprecated
+
+  infra:
+    - ardenone-cluster
+    - telegram-claude-bridge
+    - botburrow
+    - botburrow-agents
+    - website-builder
+    - options-downloader-status-exporter
+    - jetstream-watchdog
+    - bootstrap
+    - declarative-config
+    - ARMOR
+    - SEAM
+    - TUNNEL
+    - dashboard-site
+    - cluster-status-exporter
+    - argo-workflows-exporter
+    - git-activity-exporter
+    - b2-usage-exporter
+    - zai-proxy
+    - twitterapi-proxy
+    - clustertop
+    - rackspace-spot-terraform
+    - nixos-asterisk
+
+  trading:
+    - news-trading-ideas
+    - mastagoose-trading
+    - ibkr-mcp
+    - fig-risk
+    - coned-rate-optimizer
+    - gribtract
+    - tradegraph
+    - options-analysis
+    - unfairmarket-research
+    - kalshi-tape
+    - kalshi-weather
+    - news-trader
+
+  sites:
+    - mobile-gaming
+    - sun-sim
+    - feelings-wheel
+    - shuffle-gallery
+    - game-of-life
+    - dwell
+    - vibecodeleaderboard-frontend
+    - brand-kit
+    - jedarden.com
+    - vista
+    - hetzner-auction-dashboard
+    - ai-code-battle
+    - mta-my-way
+    - apexalgo-site
+    - palm-reading
+    - artifacts.hardyrekshin.com
+
+  sensing:
+    - AIVC
+    - spaxel
+    - whofi-bench
+    - whofi
+    - pose-detection
+    - face-detection
+    - screenferry
+
+  data-tools:
+    - tftask
+    - pdftract
+    - miroir
+    - ytt
+    - domain-check
+    - duck-e
+    - agent-transcript-archive
+
+  research:
+    - odin-deep-research
+    - perplexity-jedarden
+    - personal-strategy
+    - doublers-digest
+    - reddit-user-archiver
+    - Research
+    - social-media-strategy
+    - vibe-coding-discovery
+    - vibecodeleaderboard-backend
