@@ -1,5 +1,9 @@
 # git-activity-exporter
 
+> **Internal tooling, public for reference.** The exporter is currently wired
+> to the author's Forgejo estate. Reusers must provide their own owner, family
+> mapping, storage destination, and deployment configuration.
+
 Exports fleet git and bead activity as Parquet for the
 `dashboard.ardenone.com/git-activity/` panel.
 
@@ -58,8 +62,10 @@ acceptable.
 
 ## Configuration
 
-See `docs/notes/configuration.md`. Every knob has a default; only
-`FORGE_TOKEN` and the `DEST_S3_*` credentials are required.
+See `docs/notes/configuration.md`. Treat the committed defaults and
+`families.yaml` as the author's example deployment; set `FORGE_BASE_URL`,
+`FORGE_OWNER`, and your own family mapping in addition to the required
+`FORGE_TOKEN` and `DEST_S3_*` credentials.
 
 ## Development
 
@@ -67,3 +73,7 @@ See `docs/notes/configuration.md`. Every knob has a default; only
 pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
