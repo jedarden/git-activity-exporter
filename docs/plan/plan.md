@@ -63,11 +63,23 @@ tiers cannot drift apart. Affordable because the grid is 1.7% dense.
 - [x] **Phase 3 — Panel.** `public/git-activity/` with scope/measure/time
       selectors, burst timeline, punchcard, and honest captions for the bead
       epoch and the LOC filter.
-- [ ] **Phase 4 — Worker tier (optional).** A fourth scope level from
-      `claimed` actors. Deliberately deferred: closures are 0% attributable,
-      so any worker-level "beads closed" is an inference from a claim→close
-      join that breaks on release-and-reclaim. Ships only if labelled as
-      inferential.
+- [ ] **Phase 4 — Worker tier.** A fourth scope level from bead-event
+      actors. Was deferred because closures are 0% attributable (every
+      `closed`/`released`/`reopened` event carries actor `system`). That is
+      being fixed upstream: bead-rs BR-T12 adds `--actor` to every mutating
+      command and NEEDLE N-T17 passes the worker identity. Once those ship,
+      the actor column on bead events is real for the post-fix epoch and the
+      worker tier can be computed without a claim→close join. Events from
+      before the fix stay labelled inferential; the panel must show the epoch
+      boundary the same way it shows the bead epoch today.
+- [ ] **Phase 5 — Factory ledger join.** This exporter is one of the three
+      join sources for the factory attempt ledger (NEEDLE plan section 4.4;
+      sink and joins owned by declarative-config). Publish bead events at
+      event grain with `issue_id`, `kind`, `actor`, `time` and the workspace
+      identity, and document those join keys against the attempt ledger and
+      `argo/data/runs.parquet` in `docs/notes/output-schema.md`, so the data
+      stack can compute verified-outcome metrics (first-attempt success,
+      time-to-green, redispatch rate) without re-reading forensic files.
 
 ## Key decisions
 
@@ -102,6 +114,9 @@ that silently removes rows is indistinguishable from missing data.
 
 ## Open questions
 
+- Attribution epoch: once BR-T12/N-T17 land, should pre-fix `closed` rows be
+  back-filled from the claim→close inference (labelled), or left `system`?
+  Leaning: leave them; a labelled inference in the same column invites misuse.
 - Does lab's fleet need distinguishing from ex44's? Git carries no host
   attribution and every commit is authored `jedarden <github@jedarden.com>`,
   so host-level slicing is not available from this data at all.
