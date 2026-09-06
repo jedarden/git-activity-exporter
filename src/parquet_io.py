@@ -45,9 +45,11 @@ BEAD_EVENTS_SCHEMA = pa.schema([
     ("hour_utc", pa.string()),
     ("repo", pa.string()),
     ("family", pa.string()),
+    ("workspace_uuid", pa.string()),
     ("issue_id", pa.string()),
     ("kind", pa.string()),
     ("actor", pa.string()),
+    ("resulting_status", pa.string()),
     ("is_bulk_import", pa.bool_()),
 ])
 

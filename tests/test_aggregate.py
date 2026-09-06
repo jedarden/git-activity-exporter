@@ -81,3 +81,35 @@ def test_total_failure_produces_no_rows_to_publish():
     # repo fails there is genuinely nothing, and zeroes written over a good
     # dataset read as a quiet fleet rather than as the outage they are.
     assert aggregate.build_hourly([], [], FAMILY_MAP) == []
+
+
+def test_event_grain_kinds_that_the_rollup_never_counted_mint_no_cells():
+    # bead_events.parquet publishes every forensic kind, but the rollup has
+    # always counted only the four lifecycle transitions. Letting a `created`
+    # or `updated` event reach it would add zero-valued (repo, hour) cells
+    # that hourly.parquet never had, and the panel's totals would shift.
+    events = [
+        {"repo": "NEEDLE", "ts": 3600 * 9, "issue_id": "i1", "kind": "created",
+         "actor": "system"},
+        {"repo": "NEEDLE", "ts": 3600 * 9, "issue_id": "i1", "kind": "updated",
+         "actor": "system"},
+    ]
+    assert aggregate.build_hourly([], events, FAMILY_MAP) == []
+
+
+def test_hourly_counts_stay_reconcilable_with_the_event_grain_file():
+    # The invariant a consumer will check: closures counted in the rollup are
+    # exactly the `closed` rows of bead_events.parquet, however many other
+    # kinds the event file grows.
+    events = [
+        {"repo": "NEEDLE", "ts": 3600 * 9, "issue_id": f"i{i}", "kind": "closed",
+         "actor": "system"}
+        for i in range(3)
+    ] + [
+        {"repo": "NEEDLE", "ts": 3600 * 9, "issue_id": f"j{i}", "kind": "updated",
+         "actor": "system"}
+        for i in range(7)
+    ]
+    rows = aggregate.build_hourly([], events, FAMILY_MAP)
+    assert sum(r["beads_closed"] for r in rows) == 3
+    assert sum(r["commits"] for r in rows) == 0

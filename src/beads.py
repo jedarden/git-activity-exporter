@@ -5,7 +5,7 @@ mirror -- no second data source, no bead CLI, no access to any host's live
 SQLite store. `git show HEAD:<path>` reads it straight out of a bare mirror
 (verified 2026-08-17 against NEEDLE's mirror: 4,936 records).
 
-TWO PROPERTIES OF THIS DATA THAT THE CHARTS MUST RESPECT.
+THREE PROPERTIES OF THIS DATA THAT THE CHARTS MUST RESPECT.
 
 1. It has an epoch, not a history. Every forensic log in the fleet begins
    2026-08-14, the bead-rs migration; the prior bf ids were discarded by the
@@ -17,6 +17,12 @@ TWO PROPERTIES OF THIS DATA THAT THE CHARTS MUST RESPECT.
    dwarfs every real hour -- the ecosystem Fano factor reads 4674 with the
    spike and 47.9 without. Cells above bead_bulk_close_threshold are flagged,
    not deleted, so the UI can toggle them and the total stays reconcilable.
+
+3. Attribution has an epoch, not a history. Until bead-rs BR-T12 and NEEDLE
+   N-T17 ship, only `claimed` carries a real worker identity and every other
+   kind reads actor `system`, so no event predating that fix can be
+   attributed retroactively. Join semantics live in
+   docs/notes/output-schema.md.
 """
 import json
 import logging
@@ -26,7 +32,18 @@ from datetime import datetime, timedelta, timezone
 log = logging.getLogger(__name__)
 
 FORENSIC_PATH = ".beads/checkpoint/forensic.jsonl"
+
+# The kinds the (repo, hour) rollup counts. bead_events.parquet is at event
+# grain and carries every kind the forensic log records; this filter pins the
+# rollup so widening the published event stream cannot move hourly.parquet.
 COUNTED_KINDS = ("closed", "claimed", "released", "reopened")
+
+# Resulting statuses taken from the event kind itself. Only `closed` belongs
+# here: a close event is what makes a bead closed, and its detail records the
+# *prior* status and the reason rather than the result. Every other kind
+# either states its own result in detail.resulting_base_status or is not a
+# status transition at all.
+KIND_RESULTING_STATUS = {"closed": "closed"}
 
 
 def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int):
@@ -34,7 +51,12 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
 
     Only 64 of 97 repos that committed in the last 30 days carry one
     (measured 2026-08-17), so absence is the normal case for a third of the
-    fleet and must not be an error."""
+    fleet and must not be an error.
+
+    Every forensic event is kept, not just the kinds the rollup counts: this
+    file is one join source of the factory attempt ledger, which reads it at
+    event grain (docs/notes/output-schema.md). The rollup filters by
+    COUNTED_KINDS downstream."""
     proc = subprocess.run(
         ["git", "-C", mirror_path, "show", f"HEAD:{FORENSIC_PATH}"],
         capture_output=True, text=True, timeout=timeout,
@@ -43,8 +65,14 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
         return []
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    return parse_events(proc.stdout, repo_name, cutoff)
+
+
+def parse_events(text: str, repo_name: str, cutoff: datetime):
+    """Forensic JSONL -> event dicts. Split from read_events so the fixture
+    tests exercise the real parse without a git mirror."""
     events, malformed = [], 0
-    for line in proc.stdout.splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -53,13 +81,11 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
             malformed += 1
             continue
         if record.get("record_type") != "event":
-            continue
+            continue  # issue snapshots are state, not an event to publish
         e = record.get("event") or {}
         kind = e.get("kind")
-        if kind not in COUNTED_KINDS:
-            continue
         raw_time = e.get("time")
-        if not raw_time:
+        if not kind or not raw_time:
             malformed += 1
             continue
         try:
@@ -72,6 +98,11 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
         events.append({
             "repo": repo_name,
             "ts": int(ts.timestamp()),
+            # Identity of the workspace the event happened in. The forensic
+            # log's own field is origin_store_uuid; a bead id is only unique
+            # inside one workspace, so this is what makes issue_id joinable
+            # when two workspaces could ever share a prefix.
+            "workspace_uuid": e.get("origin_store_uuid"),
             "issue_id": e.get("issue_id"),
             "kind": kind,
             # Only `claimed` carries a real worker identity; closed/released/
@@ -81,11 +112,26 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
             # closed a bead means joining claim->close on issue_id, which is
             # wrong whenever a bead is released and re-claimed.
             "actor": e.get("actor"),
+            "resulting_status": _resulting_status(kind, e.get("detail")),
         })
 
     if malformed:
         log.warning("%s: skipped %d malformed forensic record(s)", repo_name, malformed)
     return events
+
+
+def _resulting_status(kind, detail):
+    """The bead's base_status after this event, or None when the event does
+    not move it.
+
+    `claimed`, `released` and `reopened` state the result themselves in
+    detail.resulting_base_status. A `closed` event's detail records only the
+    prior status and the close reason, so the result comes from the kind.
+    Everything else -- `created`, `updated`, label and dependency edits --
+    carries no transition, and is left null rather than guessed."""
+    if isinstance(detail, dict) and detail.get("resulting_base_status"):
+        return detail["resulting_base_status"]
+    return KIND_RESULTING_STATUS.get(kind)
 
 
 def mark_bulk_hours(events, threshold: int, bulk_hour_share: float = 0.5):

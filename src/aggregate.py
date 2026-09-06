@@ -9,6 +9,7 @@ median hour sees only 4 repos active at once.
 """
 from datetime import datetime, timezone
 
+from .beads import COUNTED_KINDS
 from .families import family_of
 
 _EMPTY = {
@@ -52,9 +53,15 @@ def build_hourly(commits, events, family_map):
             cur["files_changed"] += c["files_changed"]
 
     for e in events:
+        kind = e["kind"]
+        if kind not in COUNTED_KINDS:
+            # bead_events.parquet publishes every forensic kind; only these
+            # four have ever been counted, and letting the rest through would
+            # mint zero-valued (repo, hour) cells that hourly.parquet never
+            # had.
+            continue
         h = e["ts"] // 3600
         cur = cell(e["repo"], h)
-        kind = e["kind"]
         if kind == "closed":
             if e.get("is_bulk_import"):
                 cur["beads_closed_bulk"] += 1
@@ -112,9 +119,11 @@ def bead_event_rows(events, family_map):
             "hour_utc": _hour_iso(e["ts"] // 3600),
             "repo": e["repo"],
             "family": family_of(family_map, e["repo"]),
+            "workspace_uuid": e.get("workspace_uuid"),
             "issue_id": e["issue_id"],
             "kind": e["kind"],
             "actor": e["actor"],
+            "resulting_status": e.get("resulting_status"),
             "is_bulk_import": bool(e.get("is_bulk_import")),
         })
     return out

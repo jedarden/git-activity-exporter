@@ -14,8 +14,12 @@ on a PVC, and publishes three objects to an S3 prefix each cycle:
 |---|---|---|
 | `hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
 | `commits.parquet` | commit | drill-down detail |
-| `bead_events.parquet` | event | bead lifecycle detail |
+| `bead_events.parquet` | forensic event | bead lifecycle detail; a join source of the factory attempt ledger |
 | `meta.json` | — | freshness, coverage, and the caveats the panel must display |
+
+Column types, nullability, and the join keys the attempt ledger uses against
+`commits.parquet` and `bead_events.parquet` are documented in
+[`docs/notes/output-schema.md`](docs/notes/output-schema.md).
 
 ## Three axes of granularity
 
