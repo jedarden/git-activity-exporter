@@ -8,7 +8,7 @@ Exports fleet git and bead activity as Parquet for the
 `dashboard.ardenone.com/git-activity/` panel.
 
 Polls every repo owned by a Forgejo user, keeps a bare shallow mirror of each
-on a PVC, and publishes three objects to an S3 prefix each cycle:
+on a PVC, and publishes four objects to an S3 prefix each cycle:
 
 | Object | Grain | Purpose |
 |---|---|---|
@@ -45,10 +45,11 @@ of raw line volume is plausibly hand-written. Both `lines_*` (filtered) and
 
 **Bead closures carry a migration artifact.** Every forensic log in the fleet
 begins 2026-08-14, the bead-rs migration, and three hours that day hold 87%
-of all closure events. Dense `(repo, hour)` cells are flagged
-`is_bulk_import` rather than deleted. `meta.json` carries `bead_epoch_utc` so
-the panel can caption the bead charts honestly instead of drawing an empty
-left half.
+of all closure events. Nothing is deleted: closures in dense `(repo, hour)`
+cells carry `is_bulk_import` on `bead_events.parquet`, and `hourly.parquet`
+splits the count into `beads_closed` / `beads_closed_bulk`. `meta.json`
+carries `bead_epoch_utc` so the panel can caption the bead charts honestly
+instead of drawing an empty left half.
 
 ## Why mirrors instead of the API
 

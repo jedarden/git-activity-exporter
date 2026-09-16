@@ -215,8 +215,10 @@ totals. Every column needed to recompute one from the other is present.
 
 **Bead closures carry a migration artifact.** Every forensic log in the
 fleet begins 2026-08-14 — the bead-rs migration — and three hours that day
-hold 87% of all closure events. Those hours are flagged `is_bulk_import`
-(density heuristic, not a hard-coded date) and stay in the file, so a
-consumer can exclude them and still reconcile against the total.
+hold 87% of all closure events. Closures in those hours carry
+`is_bulk_import` on `bead_events.parquet` (density heuristic, not a
+hard-coded date) and nothing is deleted: `hourly.parquet` splits the count
+into `beads_closed` / `beads_closed_bulk`, so a consumer can exclude them
+and still reconcile against the total.
 `meta.json`'s `bead_epoch_utc` bounds how far back bead data can reach at
 all: git backfills the window, beads cannot.
