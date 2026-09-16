@@ -11,7 +11,7 @@ everything else has a default.
 | `FORGE_OWNER` | `jedarden` | whose repos to enumerate |
 | `FORGE_TOKEN` | *(required)* | read scope is sufficient |
 | `REPO_DENYLIST` | *(empty)* | comma-separated repo names to skip |
-| `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume |
+| `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
 | `WINDOW_DAYS` | `90` | reporting window |
 | `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | clone depth bound |
 | `TRIM_MAX_LINES` | `5000` | above this a commit is flagged bulk |
@@ -23,7 +23,7 @@ everything else has a default.
 | `FAMILIES_FILE` | `families.yaml` | repo → family map |
 | `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
 | `POLL_INTERVAL_SECONDS` | `3600` | |
-| `GIT_TIMEOUT_SECONDS` | `600` | per git invocation |
+| `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
 | `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API call (repo enumeration only) |
 | `HEALTH_PORT` | `8080` | `/health` liveness, `/ready` readiness |
 | `LOG_LEVEL` | `INFO` | |

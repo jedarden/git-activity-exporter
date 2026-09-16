@@ -29,6 +29,8 @@ import logging
 import subprocess
 from datetime import datetime, timedelta, timezone
 
+from . import gitscan
+
 log = logging.getLogger(__name__)
 
 FORENSIC_PATH = ".beads/checkpoint/forensic.jsonl"
@@ -57,10 +59,15 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
     file is one join source of the factory attempt ledger, which reads it at
     event grain (docs/notes/output-schema.md). The rollup filters by
     COUNTED_KINDS downstream."""
-    proc = subprocess.run(
-        ["git", "-C", mirror_path, "show", f"HEAD:{FORENSIC_PATH}"],
-        capture_output=True, text=True, timeout=timeout,
-    )
+    args = ["git", "-C", mirror_path, "show", f"HEAD:{FORENSIC_PATH}"]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Keep every git invocation on the same typed timeout path. A missing
+        # forensic file is normal and remains a successful empty result below;
+        # a timed-out show is different because we cannot tell whether the
+        # file was read completely, so the caller excludes the repo.
+        raise gitscan.GitTimeout(f"git show timed out after {timeout}s")
     if proc.returncode != 0:
         return []
 

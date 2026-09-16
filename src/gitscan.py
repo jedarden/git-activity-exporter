@@ -32,6 +32,17 @@ class GitError(Exception):
     pass
 
 
+class GitTimeout(GitError):
+    """The invocation exceeded GIT_TIMEOUT_SECONDS and git was killed.
+
+    Distinguished from other GitError so ensure_mirror can preserve an
+    existing mirror when only its fetch timed out. Timeouts during a cold
+    clone, commit scan, or forensic-log read still exclude that repo because
+    those operations cannot provide a complete result. See ensure_mirror and
+    docs/notes/data-sources.md "Failure semantics".
+    """
+
+
 def _run(args, timeout, cwd=None, env=None):
     """Run git, and NEVER let a credential reach an exception string.
 
@@ -47,7 +58,7 @@ def _run(args, timeout, cwd=None, env=None):
             args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
         )
     except subprocess.TimeoutExpired:
-        raise GitError(f"{_safe(args)} timed out after {timeout}s")
+        raise GitTimeout(f"{_safe(args)} timed out after {timeout}s")
     if proc.returncode != 0:
         raise GitError(f"{_safe(args)} failed rc={proc.returncode}: {_scrub(proc.stderr.strip()[:300])}")
     return proc.stdout
@@ -89,8 +100,16 @@ def mirror_path(clone_root: str, repo_name: str) -> str:
     return os.path.join(clone_root, f"{repo_name}.git")
 
 
-def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, timeout: int) -> str:
-    """Clone or refresh one bare mirror. Returns its path."""
+def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, timeout: int):
+    """Clone or refresh one bare mirror. Returns (path, refreshed).
+
+    refreshed is False when the mirror is served stale -- currently only a
+    fetch timeout. The caller still scans it: preserving the mirror beats
+    dropping the repo's whole window from the cycle, and it is how a slow
+    forge degrades (repos_stale in meta.json) instead of escalating. Failure
+    semantics are specified in
+    docs/notes/data-sources.md "Failure semantics".
+    """
     path = mirror_path(clone_root, repo["name"])
     since = (datetime.now(timezone.utc) - timedelta(days=shallow_since_days)).strftime("%Y-%m-%d")
     url = repo["clone_url"]
@@ -100,7 +119,14 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
         try:
             _run(["git", "-C", path, "fetch", "--quiet", "--prune", f"--shallow-since={since}",
                   url, "+refs/heads/*:refs/heads/*"], timeout, env=env)
-            return path
+            return path, True
+        except GitTimeout as e:
+            # A timeout means the mirror is fine and the forge is slow. The
+            # old behavior deleted it and re-cloned here -- a strictly longer
+            # network operation that then timed out too, so one slow cycle
+            # cost the repo its mirror AND its data.
+            log.warning("fetch timed out for %s, keeping the stale mirror: %s", repo["name"], e)
+            return path, False
         except GitError as e:
             # A mirror can be left unusable by a killed clone (partial pack,
             # missing HEAD's target). Re-cloning is cheap relative to serving
@@ -112,20 +138,72 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     tmp = path + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
-        _run(["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp], timeout, env=env)
-    except GitError as e:
-        # "error processing shallow info" means the cutoff excludes every
-        # commit on the remote -- a repo dormant longer than the window. It
-        # is a legitimate repo with nothing in range, not a broken one, so
-        # fall back to a minimal clone rather than dropping it from the fleet.
-        if "shallow info" not in str(e):
-            raise
-        log.info("%s has no commits since %s; cloning at depth 1 instead", repo["name"], since)
+        try:
+            _run(["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp], timeout, env=env)
+        except GitError as e:
+            # "error processing shallow info" means the cutoff excludes every
+            # commit on the remote -- a repo dormant longer than the window. It
+            # is a legitimate repo with nothing in range, not a broken one, so
+            # fall back to a minimal clone rather than dropping it from the fleet.
+            if "shallow info" not in str(e):
+                raise
+            log.info("%s has no commits since %s; cloning at depth 1 instead", repo["name"], since)
+            shutil.rmtree(tmp, ignore_errors=True)
+            _run(["git", "clone", "--quiet", "--mirror", "--depth", "1", url, tmp], timeout, env=env)
+        shutil.rmtree(path, ignore_errors=True)
+        os.rename(tmp, path)
+        return path, True
+    finally:
+        # A failed or timed-out clone must not leave its partial pack on the
+        # PVC -- before this finally, an interrupted clone left <name>.git.tmp
+        # behind until the next clone of the SAME repo, which might be never.
         shutil.rmtree(tmp, ignore_errors=True)
-        _run(["git", "clone", "--quiet", "--mirror", "--depth", "1", url, tmp], timeout, env=env)
-    shutil.rmtree(path, ignore_errors=True)
-    os.rename(tmp, path)
-    return path
+
+
+def prune_orphans(clone_root: str, live_names) -> list:
+    """Delete mirrors and clone litter whose repo is no longer live.
+
+    Runs after a successful enumeration, against exactly that enumeration: a
+    repo deleted or renamed on the forge, denylisted, or turned empty stops
+    costing PVC the same cycle. A repo that merely FAILED to scan is still
+    live and keeps its mirror.
+
+    Refuses to run against an empty live set. An enumeration returning
+    nothing is far more likely a listing fault (wrong owner, API change) than
+    a fleet that genuinely shrank to zero, and being wrong here deletes every
+    mirror at once and re-pays the full cold pass.
+
+    Returns the sorted names whose mirrors were removed; the caller records
+    them in meta.json so a deletion is auditable rather than silent.
+    <name>.git.tmp litter from a killed clone is swept too, but is not a repo
+    and is only logged.
+    """
+    live = {f"{name}.git" for name in live_names}
+    if not live:
+        log.warning("clone_root %s not pruned: enumeration returned no repos", clone_root)
+        return []
+
+    try:
+        entries = sorted(os.listdir(clone_root))
+    except FileNotFoundError:
+        return []
+
+    pruned = []
+    for entry in entries:
+        if entry in live:
+            continue
+        path = os.path.join(clone_root, entry)
+        if not os.path.isdir(path):
+            continue
+        if entry.endswith(".git.tmp"):
+            shutil.rmtree(path, ignore_errors=True)
+            log.info("removed clone litter %s", entry)
+        elif entry.endswith(".git") and os.path.exists(os.path.join(path, "HEAD")):
+            # The HEAD check: only something that looks like one of our bare
+            # mirrors is assumed to be ours to delete.
+            shutil.rmtree(path, ignore_errors=True)
+            pruned.append(entry[: -len(".git")])
+    return pruned
 
 
 def _bead_id_from(subject: str, trailer: str):

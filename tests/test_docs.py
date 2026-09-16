@@ -1,6 +1,9 @@
+import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
+from src import main
 from src.config import DEFAULT_EXCLUDED_PATHS
 
 CONFIGURATION_MD = (
@@ -35,3 +38,34 @@ def test_dest_s3_variables_are_documented():
     text = CONFIGURATION_MD.read_text()
     for name in names:
         assert f"`{name}`" in text, f"{name} missing from docs/notes/configuration.md"
+
+
+def test_documented_meta_keys_match_builder():
+    section = CONFIGURATION_MD.parent / "output-schema.md"
+    text = section.read_text()
+    _, _, meta_section = text.partition("## `meta.json`")
+    assert meta_section, "output-schema.md lost the meta.json section"
+    fence = re.search(r"```json\n(.*?)```", meta_section, re.DOTALL)
+    assert fence, "meta.json must have a JSON example"
+    documented = json.loads(fence.group(1))
+
+    cfg = SimpleNamespace(
+        version="test",
+        window_days=90,
+        git_timeout_seconds=600,
+        trim_max_lines=5000,
+        trim_max_files=200,
+        excluded_path_patterns=[],
+    )
+    stats = {
+        "repos_total": 1,
+        "repos_scanned": 1,
+        "repos_failed": [],
+        "repo_errors": {},
+        "repos_stale": [],
+        "mirrors_pruned": [],
+        "repos_with_bead_data": 0,
+        "bulk_bead_cells": 0,
+    }
+    built = main.build_meta(cfg, stats, "2026-09-16T00:00:00Z", 1.0, [], [])
+    assert set(built) == set(documented)

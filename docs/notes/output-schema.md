@@ -111,9 +111,14 @@ change.
   "generated_at": "2026-09-06T05:00:00Z",
   "window_days": 90,
   "repos_total": 112,
-  "repos_scanned": 110,
-  "repos_failed": ["one-repo"],
+  "repos_scanned": 111,
+  "repos_failed": ["another-repo"],
+  "repo_errors": {"another-repo": "git clone ... timed out after 600s"},
+  "repos_stale": ["one-repo"],
+  "mirrors_pruned": ["a-renamed-repo"],
   "repos_with_bead_data": 64,
+  "git_timeout_seconds": 600,
+  "cycle_seconds": 148.6,
   "bead_epoch_utc": "2026-08-14T16:42:03Z",
   "bulk_bead_cells": 12,
   "unassigned_repos": [],
@@ -126,8 +131,30 @@ change.
 `generated_at` is the collection heartbeat: a cycle that fails its
 publish guard leaves the previous objects and their `generated_at` in place,
 so a stalled exporter is visible as an aging timestamp rather than as a
-quiet fleet. `repos_failed` lists the repos missing from this cycle; a cycle
-over `MAX_FAILURE_RATE` is withheld entirely instead of published partial.
+quiet fleet. `repos_failed` lists the repos missing from this cycle and
+`repo_errors` says why each one is missing (reason truncated to 200 chars,
+credential-scrubbed upstream) — so a repo failing every cycle is visible by
+comparing cycles without trawling pod logs. The behavior behind these fields
+is specified in [data-sources.md](data-sources.md#failure-semantics); the
+short version:
+
+- `repos_stale` — scanned this cycle but from a mirror whose fetch timed out.
+  After the first timeout the copy is normally at most one poll interval old;
+  repeated timeouts can make it older. Deliberately not counted as failure:
+  the data is present, merely not newest.
+- `mirrors_pruned` — mirrors deleted this cycle because their repo was
+  deleted, renamed, denylisted or emptied on the forge; recorded so a
+  deletion is auditable rather than silent.
+- `git_timeout_seconds` — the per-invocation bound these semantics were
+  defined against, echoed so a consumer diagnosing timeouts sees what the
+  exporter was actually given.
+- `cycle_seconds` — wall-clock cost of the cycle; a value approaching
+  `POLL_INTERVAL_SECONDS` is degradation even when every repo succeeded.
+
+A cycle over `MAX_FAILURE_RATE` is withheld entirely instead of published
+partial — none of these fields updates when that happens, because nothing
+was published. The key set of this example is drift-tested against
+`main.build_meta` in `tests/test_docs.py`.
 
 ## Join keys
 

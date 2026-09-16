@@ -3,6 +3,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -47,18 +48,33 @@ def _now() -> str:
 
 
 def _collect(cfg, family_map):
+    """One enumeration + scan pass. Returns (repos, commits, events, stats).
+
+    A per-repo failure never aborts the cycle: the repo is skipped, counted
+    into stats, and the publish guard in _run_cycle decides whether the
+    partial result may publish. The full semantics -- timeout vs corruption,
+    stale mirrors, orphan pruning, persistent failure -- are specified in
+    docs/notes/data-sources.md "Failure semantics"; this function is where
+    they are applied.
+    """
     repos = forge.list_repos(
         cfg.forge_base_url, cfg.forge_token, cfg.forge_owner,
         cfg.http_timeout_seconds, cfg.repo_denylist,
     )
 
+    # Orphan hygiene runs against the fresh listing: deleted, renamed,
+    # denylisted or emptied repos stop costing PVC this cycle. Names pruned
+    # are surfaced in meta.json so a deletion is auditable.
+    mirrors_pruned = gitscan.prune_orphans(cfg.clone_root, [r["name"] for r in repos])
+
     all_commits, all_events = [], []
-    scanned, failed, with_beads = 0, [], 0
+    scanned, failed, stale, with_beads = 0, [], [], 0
+    repo_errors = {}
 
     for repo in repos:
         name = repo["name"]
         try:
-            path = gitscan.ensure_mirror(
+            path, refreshed = gitscan.ensure_mirror(
                 repo, cfg.clone_root, cfg.forge_token, cfg.shallow_since_days, cfg.git_timeout_seconds
             )
             commits = gitscan.scan_commits(
@@ -69,32 +85,94 @@ def _collect(cfg, family_map):
             # One unreachable or corrupt repo must not cost the whole cycle;
             # the failure is counted into meta.json so a repo silently
             # dropping out of the charts is visible rather than inferred.
-            log.warning("repo %s failed, excluding from this cycle: %s", name, e)
+            # The reason travels too (truncated; scrubbed of credentials
+            # upstream in gitscan._run) so persistence is legible without
+            # trawling pod logs.
+            error = gitscan._scrub(str(e))
+            log.warning("repo %s failed, excluding from this cycle: %s", name, error)
             failed.append(name)
+            # Git errors are scrubbed at their source, but sanitize once more
+            # at the metadata boundary so a future per-repo error source
+            # cannot write a credential into the durable public object.
+            repo_errors[name] = error[:200]
             continue
 
         scanned += 1
+        if not refreshed:
+            stale.append(name)
         if events:
             with_beads += 1
         all_commits.extend(commits)
         all_events.extend(events)
 
-    return repos, all_commits, all_events, scanned, failed, with_beads
+    return repos, all_commits, all_events, {
+        "repos_total": len(repos),
+        "repos_scanned": scanned,
+        "repos_failed": failed,
+        "repo_errors": repo_errors,
+        # Scanned from a mirror this cycle could not refresh. Deliberately
+        # NOT counted as failure: the data is present, merely not newest.
+        "repos_stale": stale,
+        "mirrors_pruned": mirrors_pruned,
+        "repos_with_bead_data": with_beads,
+    }
+
+
+def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hourly) -> dict:
+    """meta.json's exact key set. Extracted from _run_cycle as a pure
+    function so tests/test_docs.py can drift-test it against the documented
+    example in docs/notes/output-schema.md, the way DEFAULT_EXCLUDED_PATHS
+    is drift-tested against configuration.md."""
+    bead_epoch = min((e["ts"] for e in events), default=None)
+    unassigned = sorted({r["repo"] for r in hourly if r["family"] == families.UNASSIGNED})
+    return {
+        "version": cfg.version,
+        "generated_at": generated_at,
+        "window_days": cfg.window_days,
+        "repos_total": stats["repos_total"],
+        "repos_scanned": stats["repos_scanned"],
+        "repos_failed": stats["repos_failed"],
+        "repo_errors": stats["repo_errors"],
+        "repos_stale": stats["repos_stale"],
+        "mirrors_pruned": stats["mirrors_pruned"],
+        "repos_with_bead_data": stats["repos_with_bead_data"],
+        # The bound the failure semantics are defined against, so a consumer
+        # diagnosing timeouts can see what the exporter was actually given.
+        "git_timeout_seconds": cfg.git_timeout_seconds,
+        # Wall-clock health: a cycle that overruns its poll interval is
+        # degrading even when every repo in it succeeded.
+        "cycle_seconds": round(cycle_seconds, 1),
+        # The panel needs this to caption the bead charts honestly: git
+        # backfills the full window on first run, beads only exist from the
+        # bead-rs migration forward and cannot be reconstructed.
+        "bead_epoch_utc": (
+            datetime.fromtimestamp(bead_epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if bead_epoch else None
+        ),
+        "bulk_bead_cells": stats["bulk_bead_cells"],
+        "unassigned_repos": unassigned,
+        "trim_max_lines": cfg.trim_max_lines,
+        "trim_max_files": cfg.trim_max_files,
+        "excluded_path_patterns": cfg.excluded_path_patterns,
+    }
 
 
 def _run_cycle(cfg, s3, family_map):
+    started = time.monotonic()
     generated_at = _now()
-    repos, commits, events, scanned, failed, with_beads = _collect(cfg, family_map)
+    repos, commits, events, stats = _collect(cfg, family_map)
 
     gitscan.mark_bulk(commits, cfg.trim_max_lines, cfg.trim_max_files)
     events, bulk_cells = beads.mark_bulk_hours(
         events, cfg.bead_bulk_close_threshold, cfg.bead_bulk_hour_share
     )
+    stats["bulk_bead_cells"] = len(bulk_cells)
 
     hourly = aggregate.build_hourly(commits, events, family_map)
     log.info(
-        "cycle: %d/%d repos scanned (%d failed), %d commits, %d bead events, %d hourly cells",
-        scanned, len(repos), len(failed), len(commits), len(events), len(hourly),
+        "cycle: %d/%d repos scanned (%d failed, %d stale), %d commits, %d bead events, %d hourly cells",
+        stats["repos_scanned"], stats["repos_total"], len(stats["repos_failed"]),
+        len(stats["repos_stale"]), len(commits), len(events), len(hourly),
     )
 
     # REFUSE TO PUBLISH A BADLY DEGRADED CYCLE.
@@ -111,18 +189,20 @@ def _run_cycle(cfg, s3, family_map):
     # quiet, and a 6,588-cell dataset was replaced by a 1,580-cell one. The
     # threshold is a fraction for that reason -- partial failure is the
     # dangerous case, not total failure.
-    if repos:
-        failure_rate = len(failed) / len(repos)
+    if stats["repos_total"]:
+        failed = stats["repos_failed"]
+        total = stats["repos_total"]
+        failure_rate = len(failed) / total
         if failure_rate > cfg.max_failure_rate:
             raise RuntimeError(
-                f"{len(failed)}/{len(repos)} repo(s) failed this cycle "
+                f"{len(failed)}/{total} repo(s) failed this cycle "
                 f"({failure_rate:.0%} > {cfg.max_failure_rate:.0%} limit); refusing to "
                 f"publish over the previous cycle's data. First failures: {failed[:3]}"
             )
         if failed:
             log.warning(
                 "publishing with %d/%d repo(s) missing (%.0f%%, under the %.0f%% limit)",
-                len(failed), len(repos), failure_rate * 100, cfg.max_failure_rate * 100,
+                len(failed), total, failure_rate * 100, cfg.max_failure_rate * 100,
             )
 
     for key, rows, schema in (
@@ -135,29 +215,7 @@ def _run_cycle(cfg, s3, family_map):
             parquet_io.table_to_parquet_bytes(rows, schema), "application/octet-stream",
         )
 
-    bead_epoch = min((e["ts"] for e in events), default=None)
-    unassigned = sorted({r["repo"] for r in hourly if r["family"] == families.UNASSIGNED})
-    meta = {
-        "version": cfg.version,
-        "generated_at": generated_at,
-        "window_days": cfg.window_days,
-        "repos_total": len(repos),
-        "repos_scanned": scanned,
-        "repos_failed": failed,
-        "repos_with_bead_data": with_beads,
-        # The panel needs this to caption the bead charts honestly: git
-        # backfills the full window on first run, beads only exist from the
-        # bead-rs migration forward and cannot be reconstructed.
-        "bead_epoch_utc": (
-            datetime.fromtimestamp(bead_epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if bead_epoch else None
-        ),
-        "bulk_bead_cells": len(bulk_cells),
-        "unassigned_repos": unassigned,
-        "trim_max_lines": cfg.trim_max_lines,
-        "trim_max_files": cfg.trim_max_files,
-        "excluded_path_patterns": cfg.excluded_path_patterns,
-    }
+    meta = build_meta(cfg, stats, generated_at, time.monotonic() - started, events, hourly)
     s3io.upload_bytes(
         s3, cfg.dest.bucket, f"{cfg.dest_prefix}/meta.json",
         json.dumps(meta, indent=2).encode(), "application/json",
