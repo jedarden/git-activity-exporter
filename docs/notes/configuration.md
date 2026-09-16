@@ -1,7 +1,9 @@
 # Configuration
 
-All configuration is environment variables. Only `FORGE_TOKEN` and the
-`DEST_S3_*` credential trio are required; everything else has a default.
+All configuration is environment variables. Only `FORGE_TOKEN` and the four
+destination values `DEST_S3_ENDPOINT`, `DEST_S3_BUCKET`,
+`DEST_S3_ACCESS_KEY_ID` and `DEST_S3_SECRET_ACCESS_KEY` are required;
+everything else has a default.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -16,10 +18,22 @@ All configuration is environment variables. Only `FORGE_TOKEN` and the
 | `TRIM_MAX_FILES` | `200` | above this a commit is flagged bulk |
 | `EXCLUDED_PATH_PATTERNS` | [the four defaults](#default-excluded-path-patterns) | regexes, comma-separated; replaces the default list wholesale |
 | `BEAD_BULK_CLOSE_THRESHOLD` | `150` | closures per `(repo, hour)` above which the cell is flagged |
+| `BEAD_BULK_HOUR_SHARE` | `0.5` | share of an hour's fleet-wide closures already flagged before the whole hour is treated as bulk |
+| `MAX_FAILURE_RATE` | `0.2` | fraction of repos that may fail before the cycle is withheld instead of published |
 | `FAMILIES_FILE` | `families.yaml` | repo → family map |
+| `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
 | `POLL_INTERVAL_SECONDS` | `3600` | |
 | `GIT_TIMEOUT_SECONDS` | `600` | per git invocation |
-| `DEST_S3_PREFIX` | `git-activity/data` | |
+| `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API call (repo enumeration only) |
+| `HEALTH_PORT` | `8080` | `/health` liveness, `/ready` readiness |
+| `LOG_LEVEL` | `INFO` | |
+| `DEST_S3_ENDPOINT` | *(required)* | S3-compatible endpoint URL |
+| `DEST_S3_BUCKET` | *(required)* | destination bucket |
+| `DEST_S3_ACCESS_KEY_ID` | *(required)* | destination access key |
+| `DEST_S3_SECRET_ACCESS_KEY` | *(required)* | destination secret key |
+| `DEST_S3_REGION` | `us-east-1` | botocore region; most S3-compatible stores ignore it |
+| `DEST_S3_ADDRESSING_STYLE` | `virtual` | `path` wherever the store has no per-bucket virtual-host DNS — see [Destination credentials](#destination-credentials-dest_s3_) |
+| `DEST_S3_PREFIX` | `git-activity/data` | key prefix under the bucket; trailing slash stripped |
 
 ## Why `SHALLOW_SINCE_DAYS` must exceed `WINDOW_DAYS`
 
@@ -60,3 +74,69 @@ filter is why `lines_*` tracks work rather than checkpoint churn, and why
 
 The list lives in `config.DEFAULT_EXCLUDED_PATHS`; `tests/test_docs.py`
 fails if this block and the code drift apart.
+
+## Destination credentials (`DEST_S3_*`)
+
+`config.load()` reads the four required values straight from the process
+environment and nothing else — it never opens a Secret, a file, or a store.
+So the deployment's only job is to land those values in the pod env by some
+secrets-by-reference means. The values must exist in as few places as
+possible and never in git, a ConfigMap, or a log.
+
+The author's deployment (manifests in the `declarative-config` repo,
+`k8s/ardenone-cluster/git-activity-exporter/`) wires them like this, as the
+reference for reusers:
+
+| Variable | Provisioned from |
+|---|---|
+| `DEST_S3_ENDPOINT` | `secretKeyRef` → Secret `dashboard-s3-credentials`, key `S3_ENDPOINT` |
+| `DEST_S3_ACCESS_KEY_ID` | `secretKeyRef` → Secret `dashboard-s3-credentials`, key `ACCESS_KEY_ID` |
+| `DEST_S3_SECRET_ACCESS_KEY` | `secretKeyRef` → Secret `dashboard-s3-credentials`, key `SECRET_ACCESS_KEY` |
+| `DEST_S3_BUCKET` | literal `dashboard-site` in the Deployment — not a credential |
+| `DEST_S3_PREFIX` | literal `git-activity/data` in the Deployment — not a credential |
+| `DEST_S3_ADDRESSING_STYLE` | literal `path` in the Deployment — see below |
+
+`dashboard-s3-credentials` is generated in-cluster by the garage-operator:
+the `GarageKey` custom resource `dashboard-write-key`
+(`k8s/ardenone-cluster/garage-operator/keys.yml`) mints the key inside the
+cluster, and the operator writes the resulting Secret; Reflector then mirrors
+it from the `garage-operator` namespace into `git-activity-exporter`. No
+value ever passes through a manifest. The key is scoped read+write to the
+`dashboard-site` bucket and nothing else. `FORGE_TOKEN` is the one value that
+does come from OpenBao: ExternalSecret `git-activity-exporter-forge`
+(ClusterSecretStore `openbao-v2`, `refreshInterval: 1h`) mirrors KV v2 path
+`ardenone-cluster/git-activity-exporter/forge`, field `forgejo-token`.
+
+Two details a reuser will otherwise hit:
+
+- `DEST_S3_ADDRESSING_STYLE` defaults to `virtual` (botocore's default), but
+  the author's deployment sets `path` because Garage — like most
+  self-hosted S3 stores — has no per-bucket virtual-host DNS. A bare run
+  against Garage with only the four required values set will fail signature
+  or DNS resolution until this is set to `path`.
+- The reflected Secret is shared: every `dashboard-site` writer
+  (`b2-usage-exporter`, `cluster-status`, `argo-workflows-exporter`, …) uses
+  the same key. A reuser with a different destination needs only their own
+  bucket's credentials; any mechanism that puts the four values in the env —
+  a plain Secret, or an ExternalSecret against their own store — works.
+
+## Rotation
+
+**S3 access key.** Rotate at the source, never by hand-editing the reflected
+Secret: update or re-mint the `dashboard-write-key` GarageKey, and the
+operator rewrites `dashboard-s3-credentials`, Reflector re-mirrors it, and
+Reloader (`reloader.stakater.com/auto: "true"` on the Deployment) restarts
+the pod — no manifest change needed. Because the key is shared by every
+`dashboard-site` writer, this rotation restarts all of them at once; if that
+blast radius is unwanted, mint a dedicated GarageKey scoped to `dashboard-site`
+and reflect it into this namespace alone. Verify by property, not by value:
+the pod restarts and the next cycle publishes, or it doesn't.
+
+**`FORGE_TOKEN`.** Write a new KV v2 version at
+`ardenone-cluster/git-activity-exporter/forge` (field `forgejo-token`) — an
+update, never a delete; version history is the rollback. The ExternalSecret
+picks the new version up within its 1h `refreshInterval` and rewrites the
+K8s Secret, Reloader restarts the pod, and the next cycle proves it. To
+verify without reading the value:
+`kubectl get externalsecret git-activity-exporter-forge -n git-activity-exporter`
+shows `SecretSynced`, and `meta.json`'s freshness advances.

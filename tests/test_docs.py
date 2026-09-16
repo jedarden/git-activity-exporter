@@ -22,3 +22,16 @@ def test_documented_exclusions_match_code():
     # holds if the pattern list is readable from the docs. Either side edited
     # without the other fails here instead of drifting silently.
     assert _documented_exclusions() == list(DEFAULT_EXCLUDED_PATHS)
+
+
+def test_dest_s3_variables_are_documented():
+    # The README tells reusers to bring DEST_S3_* credentials, but the exact
+    # variable names exist only as _require/_optional calls in config.py.
+    # Every name the code reads must appear in configuration.md, or a reuser
+    # cannot deploy from the documentation alone.
+    config_py = Path(__file__).resolve().parent.parent / "src" / "config.py"
+    names = sorted(set(re.findall(r'"(DEST_S3_[A-Z_]+)"', config_py.read_text())))
+    assert names, "no DEST_S3_* variables found in src/config.py"
+    text = CONFIGURATION_MD.read_text()
+    for name in names:
+        assert f"`{name}`" in text, f"{name} missing from docs/notes/configuration.md"
