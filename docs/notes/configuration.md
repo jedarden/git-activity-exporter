@@ -22,7 +22,7 @@ everything else has a default.
 | `MAX_FAILURE_RATE` | `0.2` | fraction of repos that may fail before the cycle is withheld instead of published |
 | `FAMILIES_FILE` | `families.yaml` | repo → family map |
 | `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
-| `POLL_INTERVAL_SECONDS` | `3600` | |
+| `POLL_INTERVAL_SECONDS` | `3600` | sleep from one cycle attempt's end to the next cycle's start — [Poll-cycle lifecycle](#poll-cycle-lifecycle) |
 | `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
 | `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API call (repo enumeration only) |
 | `HEALTH_PORT` | `8080` | port for the [health endpoints](#health-endpoints) |
@@ -87,6 +87,66 @@ traffic before its first local publication, while `/health` prevents a long or
 repeatedly failing collection from causing a restart loop. A sticky readiness
 latch does not claim that later cycles are fresh; consumers diagnose that from
 the published metadata.
+
+## Poll-cycle lifecycle
+
+The exporter is one sequential loop: run a complete collection-and-publication
+cycle, sleep `POLL_INTERVAL_SECONDS`, repeat. Every timing property below
+follows from that shape; each is pinned behaviorally against the real loop in
+`tests/test_poll_lifecycle.py`.
+
+**The first poll starts immediately.** Startup loads configuration, the family
+map, and the S3 client, binds the [health server](#health-endpoints), and then
+begins the first cycle with no initial delay — the first interval sleep happens
+only after the first cycle attempt has finished. A fresh deployment therefore
+lands its first publication one cycle-duration after start, not
+`POLL_INTERVAL_SECONDS` plus one cycle-duration, and `/ready` stays `503` until
+that publication commits.
+
+**`POLL_INTERVAL_SECONDS` is a sleep, not a schedule.** It is measured from
+the end of one cycle attempt — success, failure, or withheld publication — to
+the start of the next. It is never measured cycle-start to cycle-start and
+never against wall-clock boundaries, so the effective period is always
+`cycle_seconds + POLL_INTERVAL_SECONDS`. That is why `meta.json` records
+`cycle_seconds` at all: a cycle approaching the interval in duration is
+degrading even when every repo in it succeeded, because the fleet's actual
+refresh rate has fallen to roughly half what the interval alone suggests.
+Three consequences are deliberate:
+
+- **Slow cycles delay later cycles, and nothing catches up.** Time spent
+  collecting is not debited against the following interval, and an overrun is
+  never compensated by a shortened one. Cadence drifts forward monotonically;
+  a run of overruns cannot bunch into back-to-back cycles.
+- **A failed cycle waits the full interval before retrying.** No backoff, no
+  in-cycle retry — as in [failure semantics](data-sources.md#failure-semantics),
+  the next poll *is* the retry.
+- **The sleep is interruptible.** It is an event wait, not a busy `time.sleep`,
+  so a shutdown signal arriving mid-sleep exits immediately rather than after
+  the remaining interval.
+
+**Cycles never overlap.** The loop is single-threaded and sequential: the next
+cycle cannot begin until the previous attempt has returned — published,
+withheld, or failed — and the full interval has elapsed. Overlap prevention is
+structural, not enforced with locks or a scheduler: a cycle that overruns its
+interval is merely late, never concurrent with its successor.
+
+**Shutdown does not interrupt a cycle.** `SIGTERM` and `SIGINT` set the stop
+event and nothing else. A cycle in progress runs to completion — it publishes
+fully or fails per the [publication protocol](output-schema.md#publication-protocol)
+— and the process then exits without waiting out the interval and without
+starting another cycle. There is deliberately no mid-cycle abort: a graceful
+shutdown can never publish a partial cycle, and the hard-death case (SIGKILL,
+OOM, node loss) is covered by the protocol instead — the pointer keeps naming
+the previous complete cycle, and any staging it orphaned is inert until a
+later cycle's retention prune sweeps it.
+
+**A restart re-polls immediately and starts from scratch.** No schedule state
+persists across processes. The new process begins its first cycle right away,
+starts unready even when S3 already holds a valid publication, and owes its
+`/ready` transition to its own first success. Missed intervals are not
+replayed: a restart costs the outage duration plus one cycle of freshness, and
+because mirrors persist on `CLONE_ROOT`, that first post-restart cycle is a
+fetch pass over warm mirrors, not a fleet-wide cold clone.
 
 ## Why `SHALLOW_SINCE_DAYS` must exceed `WINDOW_DAYS`
 
