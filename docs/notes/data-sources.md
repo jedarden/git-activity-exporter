@@ -230,13 +230,13 @@ Three limits the panel must respect:
 2. **Partial coverage.** 64 of the 97 repos that committed in a 30-day sample
    carry a forensic log. Absence is normal for a third of the fleet, not an
    error.
-3. **Attribution is claim-only.** `claimed` events carry a real worker
-   identity (measured: 2,683 of 2,683 attributable). `closed`, `released`,
-   `updated` and `reopened` are all actor `system` — 0% attributable.
-   Inferring who *closed* a bead means joining claim→close on `issue_id`,
-   which is wrong whenever a bead is released and re-claimed by another
-   worker. `workers_active` therefore counts distinct claimers, and no
-   closure is ever attributed to a worker.
+3. **Attribution is epoch-bounded.** A repository's `attribution_epoch` is
+   its first `closed` event with a non-`system` actor. Events at or after that
+   instant can be partitioned by their recorded actor; earlier events and
+   remaining `system` events are labelled `inferential` and are excluded from
+   worker counts by default. The repository rollup remains complete. No
+   claim-to-close inference is performed, so a release and re-claim cannot
+   silently assign a closure to the wrong worker.
 
 ## Why the three measures all ship
 

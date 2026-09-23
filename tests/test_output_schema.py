@@ -243,6 +243,39 @@ def test_quiet_repos_publish_empty_tables_and_stay_out_of_unassigned(monkeypatch
 # --- join keys, nullability and UTC on a sparse cycle ------------------------
 
 
+def test_worker_partitions_and_epoch_round_trip(monkeypatch):
+    events = [
+        _event("worker-repo", _ts(17, 1), "gitact-old", "closed", actor="system"),
+        _event("worker-repo", _ts(17, 2), "gitact-old", "claimed", actor="old-worker"),
+        _event("worker-repo", _ts(18, 1), "gitact-new", "closed", actor="new-worker"),
+        _event("worker-repo", _ts(18, 2), "gitact-new", "closed", actor="system"),
+    ]
+    landed = _publish(
+        monkeypatch,
+        [{"name": "worker-repo"}],
+        [],
+        events,
+        _stats(1, 1, 1),
+    )
+
+    hourly = _read_parquet(landed["staged"]["hourly.parquet"]).to_pylist()
+    meta = json.loads(landed["staged"]["meta.json"])
+    base = [row for row in hourly if row["worker"] is None]
+    named = [row for row in hourly if row["worker"] == "new-worker"]
+    inferential = [row for row in hourly if row["worker"] == "inferential"]
+
+    assert len(base) == 2
+    assert len(named) == 1
+    assert named[0]["beads_closed"] == 1
+    assert {row["hour_utc"] for row in inferential} == {
+        "2026-09-15T17:00:00Z", "2026-09-15T18:00:00Z"}
+    assert not any(row["worker"] == "old-worker" for row in hourly)
+    assert meta["attribution_epoch"] == {
+        "worker-repo": "2026-09-15T18:01:00Z",
+    }
+    assert validate_meta(meta) == []
+
+
 def test_join_keys_nullability_and_utc_hold_on_a_sparse_cycle(monkeypatch):
     # One repo with commits, one with bead events, neither at full density:
     # the properties the attempt ledger and the panel rely on must hold on
@@ -277,7 +310,7 @@ def test_join_keys_nullability_and_utc_hold_on_a_sparse_cycle(monkeypatch):
 
     # UTC formatting: every timestamp carries an explicit Z, every hour
     # bucket is hour-grained, and hour_epoch is the numeric form of hour_utc.
-    cells = {(row["repo"], row["hour_utc"]): row for row in hourly}
+    cells = {(row["repo"], row["hour_utc"]): row for row in hourly if row["worker"] is None}
     for row in hourly:
         assert RFC3339_Z.match(row["hour_utc"])
         assert row["hour_utc"].endswith(":00:00Z")
@@ -295,8 +328,8 @@ def test_join_keys_nullability_and_utc_hold_on_a_sparse_cycle(monkeypatch):
     assert set(cells) == {("ledger-repo", HOUR_18), ("bead-repo", HOUR_18)}
     assert cells[("ledger-repo", HOUR_18)]["commits"] == len(commit_rows)
     closed_rows = [r for r in event_rows if r["kind"] == "closed"]
-    assert sum(r["beads_closed"] for r in hourly) \
-        + sum(r["beads_closed_bulk"] for r in hourly) == len(closed_rows)
+    assert sum(r["beads_closed"] for r in hourly if r["worker"] is None) \
+        + sum(r["beads_closed_bulk"] for r in hourly if r["worker"] is None) == len(closed_rows)
     assert ("bead-repo", HOUR_19) not in cells
     assert {r["kind"] for r in event_rows if r["hour_utc"] == HOUR_19} \
         == {"updated", "workspace_created"}
@@ -338,5 +371,6 @@ def test_join_keys_nullability_and_utc_hold_on_a_sparse_cycle(monkeypatch):
     # event, and only the repo with activity can be unassigned.
     assert validate_meta(meta) == []
     assert meta["bead_epoch_utc"] == "2026-09-15T18:10:00Z"
+    assert meta["attribution_epoch"] == {}
     assert meta["repos_with_bead_data"] == 1
     assert meta["unassigned_repos"] == ["bead-repo"]

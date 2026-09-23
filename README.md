@@ -13,7 +13,7 @@ on a PVC, and publishes each cycle to an S3 prefix behind an atomic pointer:
 | Object | Grain | Purpose |
 |---|---|---|
 | `current.json` | — | pointer to the committed cycle; the atomic commit of each publication |
-| `cycles/<cycle_id>/hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
+| `cycles/<cycle_id>/hourly.parquet` | `(repo, hour, worker)` | repository aggregates plus optional worker partitions |
 | `cycles/<cycle_id>/commits.parquet` | commit | drill-down detail |
 | `cycles/<cycle_id>/bead_events.parquet` | forensic event | bead lifecycle detail; a join source of the factory attempt ledger |
 | `cycles/<cycle_id>/meta.json` | — | freshness, coverage, and the caveats the panel must display |
@@ -31,9 +31,11 @@ Column types, nullability, and the join keys the attempt ledger uses against
 
 ## Three axes of granularity
 
-- **Scope** — ecosystem → family → repo. All three are sums over
-  `hourly.parquet`, computed in the browser. There are no per-tier files,
-  so tiers cannot disagree with each other.
+- **Scope** — ecosystem → family → repo, with an optional worker partition
+  after each repository's attribution epoch. All tiers are sums over
+  `hourly.parquet`; pre-epoch worker activity is labelled `inferential` and
+  is not included in default worker counts. There are no per-tier files, so
+  tiers cannot disagree with each other.
 - **Measure** — commits · lines of code · beads.
 - **Time** — hour → day → week, rolled up client-side.
 
@@ -56,8 +58,9 @@ begins 2026-08-14, the bead-rs migration, and three hours that day hold 87%
 of all closure events. Nothing is deleted: closures in dense `(repo, hour)`
 cells carry `is_bulk_import` on `bead_events.parquet`, and `hourly.parquet`
 splits the count into `beads_closed` / `beads_closed_bulk`. `meta.json`
-carries `bead_epoch_utc` so the panel can caption the bead charts honestly
-instead of drawing an empty left half.
+carries `bead_epoch_utc` and the per-repo `attribution_epoch` map so the
+panel can caption the bead and worker boundaries honestly instead of drawing
+an empty or falsely attributed left half.
 
 ## Why mirrors instead of the API
 

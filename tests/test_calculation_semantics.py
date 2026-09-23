@@ -250,8 +250,8 @@ def test_every_counted_kind_lands_in_its_own_measure():
     events = [_ev("NEEDLE", 100, kind, actor="w1") for kind in
               ("closed", "claimed", "released", "reopened")]
     rows = aggregate.build_hourly([], events, {})
-    assert len(rows) == 1
-    r = rows[0]
+    assert len(rows) == 2
+    r = next(row for row in rows if row["worker"] is None)
     assert (r["beads_closed"], r["beads_claimed"],
             r["beads_released"], r["beads_reopened"]) == (1, 1, 1, 1)
     assert r["beads_closed_bulk"] == 0
@@ -297,12 +297,17 @@ def test_closure_split_survives_into_the_rollup_reconcilably():
     )
     events, _cells = beads.mark_bulk_hours(events, 150)
     rows = aggregate.build_hourly([], events, {})
-    by_hour = {r["hour_epoch"]: r for r in rows}
+    by_hour = {
+        r["hour_epoch"]: r for r in rows if r["worker"] is None
+    }
     assert by_hour[100]["beads_closed_bulk"] == 200
     assert by_hour[100]["beads_closed"] == 0
     assert by_hour[101]["beads_closed"] == 3
     assert by_hour[101]["beads_closed_bulk"] == 0
-    assert sum(r["beads_closed"] + r["beads_closed_bulk"] for r in rows) == 203
+    assert sum(
+        r["beads_closed"] + r["beads_closed_bulk"]
+        for r in rows if r["worker"] is None
+    ) == 203
 
 
 def test_claims_inside_a_bulk_hour_are_never_flagged_but_still_count():

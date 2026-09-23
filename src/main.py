@@ -140,13 +140,19 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
 
 
 def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hourly,
-               cycle_id: str) -> dict:
+               cycle_id: str, attribution_epochs=None) -> dict:
     """meta.json's exact key set. Extracted from _run_cycle as a pure
     function so tests/test_docs.py can drift-test it against the documented
     example in docs/notes/output-schema.md, the way DEFAULT_EXCLUDED_PATHS
     is drift-tested against configuration.md."""
     bead_epoch = min((e["ts"] for e in events), default=None)
+    if attribution_epochs is None:
+        attribution_epochs = beads.attribution_epochs(events)
     unassigned = sorted({r["repo"] for r in hourly if r["family"] == families.UNASSIGNED})
+    attribution_epoch = {
+        repo: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for repo, ts in sorted(attribution_epochs.items())
+    }
     return {
         "version": cfg.version,
         # The publication this object belongs to, echoed by current.json's
@@ -173,8 +179,9 @@ def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hour
         # bead-rs migration forward and cannot be reconstructed.
         "bead_epoch_utc": (
             datetime.fromtimestamp(bead_epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if bead_epoch else None
+            if bead_epoch is not None else None
         ),
+        "attribution_epoch": attribution_epoch,
         "bulk_bead_cells": stats["bulk_bead_cells"],
         "unassigned_repos": unassigned,
         "trim_max_lines": cfg.trim_max_lines,
@@ -198,8 +205,9 @@ def _run_cycle(cfg, s3, family_map):
         events, cfg.bead_bulk_close_threshold, cfg.bead_bulk_hour_share
     )
     stats["bulk_bead_cells"] = len(bulk_cells)
+    attribution_epochs = beads.attribution_epochs(events)
 
-    hourly = aggregate.build_hourly(commits, events, family_map)
+    hourly = aggregate.build_hourly(commits, events, family_map, attribution_epochs)
     log.info(
         "cycle: %d/%d repos scanned (%d failed, %d stale), %d commits, %d bead events, %d hourly cells",
         stats["repos_scanned"], stats["repos_total"], len(stats["repos_failed"]),
@@ -259,7 +267,7 @@ def _run_cycle(cfg, s3, family_map):
          "application/octet-stream"),
     ]
     meta = build_meta(cfg, stats, generated_at, time.monotonic() - started, events, hourly,
-                      cycle_id=cycle_id)
+                       cycle_id=cycle_id, attribution_epochs=attribution_epochs)
     payloads.append(("meta.json", json.dumps(meta, indent=2).encode(), "application/json"))
 
     publish.publish_cycle(s3, cfg.dest.bucket, cfg.dest_prefix, payloads,

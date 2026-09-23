@@ -10,7 +10,7 @@ detail behind it and the two join sources of the factory attempt ledger
 | Object | Grain | Purpose |
 |---|---|---|
 | `current.json` | — | the pointer: names the committed cycle; the atomic commit of every publication |
-| `cycles/<cycle_id>/hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
+| `cycles/<cycle_id>/hourly.parquet` | `(repo, hour, worker)` | repository aggregates plus optional worker partitions |
 | `cycles/<cycle_id>/commits.parquet` | commit | drill-down detail; the commit side of the ledger's run join |
 | `cycles/<cycle_id>/bead_events.parquet` | forensic event | bead lifecycle detail; the ledger's bead-side join source |
 | `cycles/<cycle_id>/meta.json` | — | freshness, coverage, and the caveats a consumer must display |
@@ -76,9 +76,12 @@ partial bucket. The full boundary, timezone, and DST contract is in
 
 ## `hourly.parquet`
 
-One row per `(repo, hour)` that saw counted activity. Ecosystem, family and
-repo tiers are sums over these rows computed client-side; there are no
-per-tier files, so tiers cannot drift apart.
+One row per `(repo, hour, worker)` partition that saw counted activity. The
+`worker` value is null for the repository aggregate, the actor for a
+post-epoch event, or `inferential` for activity before that repository's
+attribution epoch. Ecosystem, family and repo tiers use the null-worker rows;
+worker views use the named rows and should exclude `inferential` by default.
+There are no per-tier files, so tiers cannot drift apart.
 
 | Column | Type | Null when | Notes |
 |---|---|---|---|
@@ -86,6 +89,7 @@ per-tier files, so tiers cannot drift apart.
 | `hour_epoch` | int64 | never | hours since the epoch; the numeric form of `hour_utc` |
 | `repo` | string | never | Forgejo repo name |
 | `family` | string | never | from `families.yaml`; `unassigned` when unmapped |
+| `worker` | string | repository rows | null for the repo aggregate, the attributed actor for post-epoch rows, or `inferential` before the repo epoch |
 | `commits` | int64 | never, may be 0 | |
 | `bulk_commits` | int64 | never, may be 0 | commits flagged bulk (see the LOC filter below) |
 | `lines_added` / `lines_deleted` | int64 | never | excluded-path-filtered totals; bulk commits contribute 0 |
@@ -96,7 +100,13 @@ per-tier files, so tiers cannot drift apart.
 | `beads_claimed` | int64 | never | |
 | `beads_released` | int64 | never | |
 | `beads_reopened` | int64 | never | |
-| `workers_active` | int64 | never | distinct `claimed` actors in the cell |
+| `workers_active` | int64 | never | distinct claimers in a repository row; a named worker row has 1 when it claimed in the cell, and an `inferential` row has 0 |
+
+The repository row remains the complete `(repo, hour)` rollup, including
+activity before the attribution epoch. Named and `inferential` rows are
+additive event partitions: a worker view sums only its selected `worker`, while
+the default worker-count view omits `inferential`. Commits and lines have no
+worker identity, so they appear only on repository rows.
 
 ## `commits.parquet`
 
@@ -129,7 +139,7 @@ are noise for a chart and exactly what a per-bead timeline needs.
 | Column | Type | Null when | Notes |
 |---|---|---|---|
 | `ts_utc` | string | never | the forensic event's `time`, second-grained; sub-second order within one second is not recoverable from this file |
-| `hour_utc` | string | never | joins `hourly.parquet` |
+| `hour_utc` | string | never | joins the repository row in `hourly.parquet`; named/inferential worker rows share the same hour |
 | `repo` | string | never | the repo whose mirror carried the forensic log |
 | `family` | string | never | |
 | `workspace_uuid` | string | never (measured) | the forensic log's `origin_store_uuid`: the bead workspace the event happened in |
@@ -142,11 +152,12 @@ are noise for a chart and exactly what a per-bead timeline needs.
 Two properties a consumer must not get wrong:
 
 **The row count reconciles with `hourly.parquet` only per kind.** A closure
-row is one `beads_closed`/`beads_closed_bulk` unit, so
-`sum(hourly.beads_closed) + sum(hourly.beads_closed_bulk)` always equals the
-count of `kind = 'closed'` rows. The total row count matches no hourly
-column, because `updated` and label/dependency events are published here and
-counted nowhere.
+row is one `beads_closed`/`beads_closed_bulk` unit, so the sum over
+`hourly` rows with `worker IS NULL` always equals the count of
+`kind = 'closed'` rows. Named and `inferential` rows are additional
+partitions, not a second copy of the repository total. The total row count
+matches no hourly column, because `updated` and label/dependency events are
+published here and counted nowhere.
 
 **`resulting_status` is stated, not inferred.** `claimed`, `released` and
 `reopened` record it themselves in the event's `detail.resulting_base_status`
@@ -175,6 +186,9 @@ change.
   "git_timeout_seconds": 600,
   "cycle_seconds": 148.6,
   "bead_epoch_utc": "2026-08-14T16:42:03Z",
+  "attribution_epoch": {
+    "gitact-repo": "2026-09-06T05:12:09Z"
+  },
   "bulk_bead_cells": 12,
   "unassigned_repos": [],
   "trim_max_lines": 5000,
@@ -208,6 +222,7 @@ change type, or lose one of the relations in the table without failing CI.
 | `git_timeout_seconds` | int | never | The per-invocation bound the failure semantics are defined against, echoed so a consumer diagnosing timeouts sees what the exporter was actually given. |
 | `cycle_seconds` | number | never | Wall-clock cost of the cycle at 0.1 s resolution. A value approaching `POLL_INTERVAL_SECONDS` is degradation even when every repo succeeded. |
 | `bead_epoch_utc` | string | no scanned repo produced a bead event in the window | Earliest bead event of any kind in this cycle's window; see below. |
+| `attribution_epoch` | map string→string | never (may be empty) | Per-repo UTC timestamp of the first `closed` event with a non-`system` actor in this cycle's window. A missing repo has no observed attribution epoch. |
 | `bulk_bead_cells` | int | never | `(repo, hour)` cells flagged as bulk imports; their closures carry `is_bulk_import` on `bead_events.parquet` and are counted into `beads_closed_bulk`, so excluding them stays reconcilable. |
 | `unassigned_repos` | list[string] | never (may be empty) | Sorted and unique. Repos with activity in the window whose `families.yaml` mapping is missing; a scanned repo with no window activity cannot appear. |
 | `trim_max_lines` | int | never | The bulk-commit LOC bound behind `is_bulk`. |
@@ -253,15 +268,11 @@ moves forward to the window's first event. `null` means this cycle's
 Parquet files contain no bead rows at all: suppress the bead charts rather
 than chart emptiness.
 
-Two things it is not:
-
-- **Not the attribution epoch.** The per-repo date from which actors on
-  non-claim kinds become attributable is a different bound, is not published
-  yet (Phase 4 of the plan adds it), and must for now be derived from
-  `bead_events.parquet` — see "The attribution epoch caveat" below.
-- **Not stable under failure.** If the repo holding the oldest event fails
-  a cycle, the epoch moves forward for that cycle. It is a property of this
-  cycle's coverage, not of history.
+`attribution_epoch` is a separate per-repo bound: it is the first
+`closed` event with a non-`system` actor in this cycle's window. A repository
+absent from that map has no observed attribution epoch. The map is a property
+of the events present in this cycle, so it can move when the window or repo
+coverage changes.
 
 ### Consumer caveats
 
@@ -335,26 +346,21 @@ and carries a repo, the run↔commit join must be made in the sink, and
 
 ### The attribution epoch caveat
 
-Until bead-rs BR-T12 (actor on every mutating command) and NEEDLE N-T17
-(worker identity passed through) ship and are installed fleet-wide, only
-`claimed` events carry a real worker. Measured 2026-08-17 and re-measured
-2026-09-06 across the fleet: 100% of `claimed` events are attributable,
-0% of `closed`, `released` and `reopened` — those read `system`, because the
-mutation was performed by the CLI on the worker's behalf.
+`meta.json`'s `attribution_epoch` map is the per-repo boundary for worker
+scope. For each repository it is the timestamp of the first `closed` event
+whose `actor` is neither empty nor `system`. The boundary is inclusive: the
+close that establishes the epoch is itself a named worker row. Events before
+that timestamp, and events whose actor remains `system`, are published in the
+`worker = "inferential"` partition instead. The repository row remains the
+complete rollup, so filtering named rows does not remove pre-epoch activity
+from the existing repo/family/ecosystem views.
 
-Consequences for a join:
-
-- Any join condition requiring a non-`system` actor on a close returns
-  nothing before the epoch. That is the data being honest, not a gap in the
-  join.
-- **The epoch is per repo**, and the natural definition is the earliest
-  event in a repo whose `actor` is not `system`. This file does not flag it;
-  Phase 4 of the plan adds a per-repo `attribution_epoch` to `meta.json`.
-  Until that ships, derive it (`min(ts_utc)` over that repo's non-`system`
-  rows) or treat every actor on a non-claim kind as unknown.
-- Nothing can be attributed retroactively. A join that back-fills pre-epoch
-  closes from the claim→close inference must label the result, and the plan
-  deliberately leans against mixing an inference into the same column.
+The epoch is observed per cycle, not a fleet-wide constant. A repo with no
+qualifying close is absent from the map and contributes no named worker rows.
+No claim-to-close inference is performed: a pre-epoch close is not backfilled
+from an earlier claim, because a release and re-claim can change the actor.
+Consumers should exclude `inferential` from worker counts unless they
+explicitly want an inferred bucket.
 
 ## The two filters that are visible, not silent
 

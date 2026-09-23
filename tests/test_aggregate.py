@@ -1,4 +1,4 @@
-from src import aggregate, families
+from src import aggregate, beads, families
 
 
 def _commit(repo, ts, added=10, deleted=5, files=2, bulk=False, raw=None):
@@ -111,5 +111,43 @@ def test_hourly_counts_stay_reconcilable_with_the_event_grain_file():
         for i in range(7)
     ]
     rows = aggregate.build_hourly([], events, FAMILY_MAP)
-    assert sum(r["beads_closed"] for r in rows) == 3
-    assert sum(r["commits"] for r in rows) == 0
+    base_rows = [r for r in rows if r["worker"] is None]
+    assert sum(r["beads_closed"] for r in base_rows) == 3
+    assert sum(r["commits"] for r in base_rows) == 0
+
+
+def test_worker_rows_start_at_the_first_attributed_close():
+    events = [
+        {"repo": "NEEDLE", "ts": 3600 * 9, "issue_id": "old", "kind": "closed", "actor": "system"},
+        {"repo": "NEEDLE", "ts": 3600 * 9 + 1, "issue_id": "old", "kind": "claimed", "actor": "before"},
+        {"repo": "NEEDLE", "ts": 3600 * 10, "issue_id": "new", "kind": "closed", "actor": "after"},
+        {"repo": "NEEDLE", "ts": 3600 * 10 + 1, "issue_id": "new", "kind": "claimed", "actor": "after"},
+    ]
+
+    rows = aggregate.build_hourly([], events, FAMILY_MAP)
+    base = next(r for r in rows if r["worker"] is None and r["hour_epoch"] == 9)
+    inferential = next(r for r in rows if r["worker"] == "inferential" and r["hour_epoch"] == 9)
+    worker = next(r for r in rows if r["worker"] == "after")
+
+    assert base["beads_closed"] == 1
+    assert base["beads_claimed"] == 1
+    assert inferential["beads_closed"] == 1
+    assert inferential["beads_claimed"] == 1
+    assert worker["beads_closed"] == 1
+    assert worker["beads_claimed"] == 1
+    assert not any(r["worker"] == "before" for r in rows)
+
+
+def test_worker_epoch_is_computed_per_repo():
+    events = [
+        {"repo": "NEEDLE", "ts": 200, "issue_id": "a", "kind": "closed", "actor": "worker"},
+        {"repo": "FABRIC", "ts": 100, "issue_id": "b", "kind": "closed", "actor": "system"},
+        {"repo": "FABRIC", "ts": 300, "issue_id": "c", "kind": "closed", "actor": "other"},
+    ]
+
+    assert beads.attribution_epochs(events) == {"NEEDLE": 200, "FABRIC": 300}
+    rows = aggregate.build_hourly([], events, FAMILY_MAP)
+    assert {
+        r["worker"] for r in rows if r["worker"] not in (None, "inferential")
+    } == {"worker", "other"}
+    assert any(r["worker"] == "inferential" for r in rows)

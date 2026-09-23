@@ -8,6 +8,7 @@ HOURLY_SCHEMA = pa.schema([
     ("hour_epoch", pa.int64()),
     ("repo", pa.string()),
     ("family", pa.string()),
+    ("worker", pa.string()),
     ("commits", pa.int64()),
     ("bulk_commits", pa.int64()),
     ("lines_added", pa.int64()),

@@ -7,9 +7,8 @@ Publish fleet git and bead activity as Parquet for a
 independent axes: scope (ecosystem / family / repo), measure (commits / lines
 of code / beads), and time (hour / day / week).
 
-Out of scope: per-worker attribution as a first-class tier (see Phase 4), any
-write path back into a repo, and any claim about *quality* of work — this
-measures volume and rhythm only.
+Out of scope: any write path back into a repo, and any claim about *quality* of
+work — this measures volume and rhythm only.
 
 ## The question it answers
 
@@ -50,8 +49,9 @@ Forgejo  --(enumerate repos only)-->  exporter pod (ardenone-cluster)
                      dashboard.ardenone.com/git-activity/ (static, hyparquet)
 ```
 
-One fact table at `(repo, hour)` grain carries every measure. Ecosystem and
-family tiers are sums over it computed in the browser — no per-tier files, so
+One fact table at `(repo, hour, worker)` grain carries every measure. Ecosystem
+and family tiers are sums over its null-worker rows computed in the browser;
+named worker partitions carry post-epoch bead activity. No per-tier files, so
 tiers cannot drift apart. Affordable because the grid is 1.7% dense.
 
 ## Phases
@@ -63,15 +63,12 @@ tiers cannot drift apart. Affordable because the grid is 1.7% dense.
 - [x] **Phase 3 — Panel.** `public/git-activity/` with scope/measure/time
       selectors, burst timeline, punchcard, and honest captions for the bead
       epoch and the LOC filter.
-- [ ] **Phase 4 — Worker tier.** A fourth scope level from bead-event
-      actors. Was deferred because closures are 0% attributable (every
-      `closed`/`released`/`reopened` event carries actor `system`). That is
-      being fixed upstream: bead-rs BR-T12 adds `--actor` to every mutating
-      command and NEEDLE N-T17 passes the worker identity. Once those ship,
-      the actor column on bead events is real for the post-fix epoch and the
-      worker tier can be computed without a claim→close join. Events from
-      before the fix stay labelled inferential; the panel must show the epoch
-      boundary the same way it shows the bead epoch today.
+- [x] **Phase 4 — Worker tier.** A fourth scope level from bead-event
+      actors. Events after each repository's attribution epoch (its first
+      `closed` event with a non-`system` actor) are partitioned by actor;
+      earlier events remain labelled `inferential` and are excluded from
+      worker counts by default. `meta.json` carries the per-repo epoch. The
+      panel update is tracked separately.
 - [ ] **Phase 5 — Factory ledger join.** This exporter is one of the three
       join sources for the factory attempt ledger (NEEDLE plan section 4.4;
       sink and joins owned by declarative-config). Publish bead events at
@@ -114,9 +111,9 @@ that silently removes rows is indistinguishable from missing data.
 
 ## Open questions
 
-- Attribution epoch: once BR-T12/N-T17 land, should pre-fix `closed` rows be
-  back-filled from the claim→close inference (labelled), or left `system`?
-  Leaning: leave them; a labelled inference in the same column invites misuse.
+- Pre-epoch closures are not back-filled from claim-to-close inference. They
+  remain in the `inferential` partition; a release and re-claim can change the
+  actor, so an inferred closure would be misleading.
 - Does lab's fleet need distinguishing from ex44's? Git carries no host
   attribution and every commit is authored `jedarden <github@jedarden.com>`,
   so host-level slicing is not available from this data at all.

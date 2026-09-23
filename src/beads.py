@@ -18,11 +18,10 @@ THREE PROPERTIES OF THIS DATA THAT THE CHARTS MUST RESPECT.
    spike and 47.9 without. Cells above bead_bulk_close_threshold are flagged,
    not deleted, so the UI can toggle them and the total stays reconcilable.
 
-3. Attribution has an epoch, not a history. Until bead-rs BR-T12 and NEEDLE
-   N-T17 ship, only `claimed` carries a real worker identity and every other
-   kind reads actor `system`, so no event predating that fix can be
-   attributed retroactively. Join semantics live in
-   docs/notes/output-schema.md.
+3. Attribution has an epoch, not a history. A repository's attribution epoch
+   is its first `closed` event with a non-`system` actor. Events before that
+   instant are not back-filled from a claim: a release and re-claim can change
+   the actor. Join semantics live in docs/notes/output-schema.md.
 """
 import json
 import logging
@@ -48,6 +47,21 @@ COUNTED_KINDS = ("closed", "claimed", "released", "reopened")
 # either states its own result in detail.resulting_base_status or is not a
 # status transition at all.
 KIND_RESULTING_STATUS = {"closed": "closed"}
+
+
+def attribution_epochs(events):
+    epochs = {}
+    for e in events:
+        if e.get("kind") != "closed":
+            continue
+        actor = e.get("actor")
+        if not isinstance(actor, str) or not actor or actor == "system":
+            continue
+        repo = e["repo"]
+        ts = e["ts"]
+        if repo not in epochs or ts < epochs[repo]:
+            epochs[repo] = ts
+    return epochs
 
 
 def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int,
@@ -134,12 +148,6 @@ def parse_events(text: str, repo_name: str, cutoff: datetime,
             "workspace_uuid": e.get("origin_store_uuid"),
             "issue_id": e.get("issue_id"),
             "kind": kind,
-            # Only `claimed` carries a real worker identity; closed/released/
-            # updated/reopened are all actor "system" (measured 2026-08-17:
-            # claimed 2683/2683 attributable, every other kind 0%). Worker
-            # attribution therefore exists on claims alone -- inferring who
-            # closed a bead means joining claim->close on issue_id, which is
-            # wrong whenever a bead is released and re-claimed.
             "actor": e.get("actor"),
             "resulting_status": _resulting_status(kind, e.get("detail")),
         })

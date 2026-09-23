@@ -1,8 +1,9 @@
-"""Roll commits and bead events into one (repo, hour) fact table.
+"""Roll commits and bead events into one (repo, hour, worker) fact table.
 
 THE WHOLE SCOPE HIERARCHY DERIVES FROM THIS ONE GRAIN. Ecosystem, family and
-repo tiers are all sums over the same rows, computed in the browser -- there
-are no per-tier files to drift out of agreement with each other. It is
+repo tiers are sums over the null-worker rows, while named worker partitions
+are available after each repository's attribution epoch -- all in the browser.
+There are no per-tier files to drift out of agreement with each other. It is
 affordable because the grid is overwhelmingly sparse: measured 2026-08-17,
 3,432 non-empty cells out of 202,439 possible over 30 days (1.7%), because a
 median hour sees only 4 repos active at once.
@@ -10,7 +11,10 @@ median hour sees only 4 repos active at once.
 from datetime import datetime, timezone
 
 from .beads import COUNTED_KINDS
+from .beads import attribution_epochs as event_attribution_epochs
 from .families import family_of
+
+INFERENTIAL_WORKER = "inferential"
 
 _EMPTY = {
     "commits": 0, "bulk_commits": 0,
@@ -26,15 +30,56 @@ def _hour_iso(hour_epoch: int) -> str:
     return datetime.fromtimestamp(hour_epoch * 3600, timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
 
 
-def build_hourly(commits, events, family_map):
+def _add_event(agg, event):
+    kind = event["kind"]
+    if kind == "closed":
+        if event.get("is_bulk_import"):
+            agg["beads_closed_bulk"] += 1
+        else:
+            agg["beads_closed"] += 1
+    elif kind == "claimed":
+        agg["beads_claimed"] += 1
+    elif kind == "released":
+        agg["beads_released"] += 1
+    elif kind == "reopened":
+        agg["beads_reopened"] += 1
+
+
+def _worker_label(event, epoch_by_repo):
+    epoch = epoch_by_repo.get(event["repo"])
+    actor = event.get("actor")
+    if (
+        epoch is not None
+        and event["ts"] >= epoch
+        and isinstance(actor, str)
+        and actor
+        and actor != "system"
+    ):
+        return actor
+    return INFERENTIAL_WORKER
+
+
+def build_hourly(commits, events, family_map, attribution_epochs=None):
+    events = list(events)
+    if attribution_epochs is None:
+        attribution_epochs = event_attribution_epochs(events)
+
     cells = {}
-    workers = {}
+    worker_cells = {}
+    claimers = {}
+    worker_claimers = set()
 
     def cell(repo, hour):
         key = (repo, hour)
         if key not in cells:
             cells[key] = dict(_EMPTY)
         return cells[key]
+
+    def worker_cell(repo, hour, worker):
+        key = (repo, hour, worker)
+        if key not in worker_cells:
+            worker_cells[key] = dict(_EMPTY)
+        return worker_cells[key]
 
     for c in commits:
         h = c["ts"] // 3600
@@ -45,9 +90,6 @@ def build_hourly(commits, events, family_map):
         if c["is_bulk"]:
             cur["bulk_commits"] += 1
         else:
-            # A bulk commit contributes its raw lines (so raw stays a true
-            # total) but no filtered lines -- that is the entire point of the
-            # flag.
             cur["lines_added"] += c["lines_added"]
             cur["lines_deleted"] += c["lines_deleted"]
             cur["files_changed"] += c["files_changed"]
@@ -55,35 +97,38 @@ def build_hourly(commits, events, family_map):
     for e in events:
         kind = e["kind"]
         if kind not in COUNTED_KINDS:
-            # bead_events.parquet publishes every forensic kind; only these
-            # four have ever been counted, and letting the rest through would
-            # mint zero-valued (repo, hour) cells that hourly.parquet never
-            # had.
             continue
         h = e["ts"] // 3600
         cur = cell(e["repo"], h)
-        if kind == "closed":
-            if e.get("is_bulk_import"):
-                cur["beads_closed_bulk"] += 1
-            else:
-                cur["beads_closed"] += 1
-        elif kind == "claimed":
-            cur["beads_claimed"] += 1
-            if e.get("actor"):
-                workers.setdefault((e["repo"], h), set()).add(e["actor"])
-        elif kind == "released":
-            cur["beads_released"] += 1
-        elif kind == "reopened":
-            cur["beads_reopened"] += 1
+        worker = _worker_label(e, attribution_epochs)
+        worker_agg = worker_cell(e["repo"], h, worker)
+        _add_event(cur, e)
+        _add_event(worker_agg, e)
+        if kind == "claimed" and e.get("actor"):
+            claimers.setdefault((e["repo"], h), set()).add(e["actor"])
+            if worker != INFERENTIAL_WORKER:
+                worker_claimers.add((e["repo"], h, worker))
+
+    row_specs = []
+    for (repo, hour), agg in cells.items():
+        row_specs.append((hour, repo, 0, "", None, agg))
+    for (repo, hour, worker), agg in worker_cells.items():
+        order = 1 if worker == INFERENTIAL_WORKER else 2
+        row_specs.append((hour, repo, order, worker, worker, agg))
 
     rows = []
-    for (repo, hour), agg in sorted(cells.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+    for hour, repo, _, _, worker, agg in sorted(row_specs):
+        if worker is None:
+            active = len(claimers.get((repo, hour), ()))
+        else:
+            active = int((repo, hour, worker) in worker_claimers)
         rows.append({
             "hour_utc": _hour_iso(hour),
             "hour_epoch": hour,
             "repo": repo,
             "family": family_of(family_map, repo),
-            "workers_active": len(workers.get((repo, hour), ())),
+            "worker": worker,
+            "workers_active": active,
             **agg,
         })
     return rows
