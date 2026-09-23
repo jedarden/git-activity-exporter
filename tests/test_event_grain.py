@@ -98,6 +98,25 @@ def _mirror_with_forensic(tmp_path, text=FORENSIC_FIXTURE):
     return str(tmp_path)
 
 
+def test_a_repo_without_a_forensic_log_reads_as_empty_not_an_error(tmp_path):
+    # Only 64 of 97 repos that committed in the last 30 days carry a forensic
+    # log (measured 2026-08-17): absence is the normal case for a third of
+    # the fleet and must read as "no bead events", never as a failed repo.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "README.md").write_text("a repo that never used beads\n")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "commit.gpgsign=false",
+                    "add", "README.md"], check=True, env=env)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "commit.gpgsign=false",
+                    "commit", "-q", "--no-verify", "-m", "no beads"], check=True, env=env)
+
+    assert beads.read_events(str(tmp_path), "quiet-repo", window_days=90, timeout=60) == []
+
+
 def test_five_fixture_events_round_trip_with_every_column(tmp_path):
     # The acceptance case: the fixture goes forensic log -> events -> rows ->
     # Parquet -> read back, and every documented column survives.
