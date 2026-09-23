@@ -27,9 +27,11 @@ THREE PROPERTIES OF THIS DATA THAT THE CHARTS MUST RESPECT.
 import json
 import logging
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import Optional
 
 from . import gitscan
+from .window import ReportingWindow, as_utc
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +50,8 @@ COUNTED_KINDS = ("closed", "claimed", "released", "reopened")
 KIND_RESULTING_STATUS = {"closed": "closed"}
 
 
-def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int):
+def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int,
+                reporting_window: Optional[ReportingWindow] = None):
     """Bead events in the window, or [] if this repo has no forensic log.
 
     Only 64 of 97 repos that committed in the last 30 days carry one
@@ -59,6 +62,10 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
     file is one join source of the factory attempt ledger, which reads it at
     event grain (docs/notes/output-schema.md). The rollup filters by
     COUNTED_KINDS downstream."""
+    if reporting_window is None:
+        reporting_window = ReportingWindow.from_anchor(
+            datetime.now(timezone.utc), window_days
+        )
     args = ["git", "-C", mirror_path, "show", f"HEAD:{FORENSIC_PATH}"]
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -71,13 +78,28 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
     if proc.returncode != 0:
         return []
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-    return parse_events(proc.stdout, repo_name, cutoff)
+    return parse_events(
+        proc.stdout, repo_name, reporting_window.start, window_end=reporting_window.end
+    )
 
 
-def parse_events(text: str, repo_name: str, cutoff: datetime):
+def parse_events(text: str, repo_name: str, cutoff: datetime,
+                 window_end: Optional[datetime] = None):
     """Forensic JSONL -> event dicts. Split from read_events so the fixture
     tests exercise the real parse without a git mirror."""
+    if isinstance(cutoff, ReportingWindow):
+        if window_end is not None:
+            raise ValueError("pass either a ReportingWindow or cutoff and window_end")
+        reporting_window = cutoff
+    else:
+        start = as_utc(cutoff)
+        end = (
+            as_utc(window_end)
+            if window_end is not None
+            else datetime.max.replace(tzinfo=timezone.utc)
+        )
+        reporting_window = ReportingWindow(start, end)
+
     events, malformed = [], 0
     for line in text.splitlines():
         if not line.strip():
@@ -92,15 +114,15 @@ def parse_events(text: str, repo_name: str, cutoff: datetime):
         e = record.get("event") or {}
         kind = e.get("kind")
         raw_time = e.get("time")
-        if not kind or not raw_time:
+        if not kind or not raw_time or not isinstance(raw_time, str):
             malformed += 1
             continue
         try:
             ts = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-        except ValueError:
+            if not reporting_window.contains(ts):
+                continue
+        except (TypeError, ValueError):
             malformed += 1
-            continue
-        if ts < cutoff:
             continue
         events.append({
             "repo": repo_name,

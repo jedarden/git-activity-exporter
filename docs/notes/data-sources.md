@@ -65,6 +65,40 @@ would add commit rows that can never carry lines.
 Binary files report `-`/`-` in numstat. They count as a touched file and
 contribute zero lines.
 
+## Reporting-window boundary contract
+
+A cycle captures `generated_at` once, before collection, and that timestamp is
+the sole anchor for every repository and both data sources. The reporting
+window is the half-open UTC interval
+
+```text
+[generated_at - WINDOW_DAYS, generated_at)
+```
+
+The lower bound is inclusive and the upper bound is exclusive. An observation
+exactly at the start is published; one exactly at the cycle anchor is deferred
+to the next cycle. This makes adjacent cycles disjoint and makes the anchor,
+rather than when an individual repository happens to be scanned, determine the
+result.
+
+The current UTC hour is included as a partial bucket: activity before the
+anchor in the hour containing the anchor is published, but the exporter does
+not extend the window to the end of that hour or admit observations at or after
+the anchor. A bucket is therefore complete or partial according to where the
+cycle anchor falls.
+
+`WINDOW_DAYS` is an elapsed duration of `N × 24` UTC hours, not a local
+calendar-day calculation. Offset-bearing timestamps are normalized to UTC
+before comparison, so equivalent instants written with different offsets are
+one observation. A daylight-saving transition therefore does not make a
+reporting day 23 or 25 hours long. Bead timestamps are compared as
+timezone-aware instants before publication reduces them to seconds (a
+ timestamp without an offset is malformed and skipped); published event
+ timestamps remain second-grained.
+Commit rows use the Git author timestamp from `%at` and are filtered in Python
+against the same interval, so the published timestamp and the boundary test
+use the same clock.
+
 ## Failure semantics
 
 Specified here because every one of these used to be an accident of

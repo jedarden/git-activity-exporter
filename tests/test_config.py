@@ -107,6 +107,14 @@ def test_invalid_numeric_values_are_rejected(isolated_env, monkeypatch, name):
         config.load()
 
 
+@pytest.mark.parametrize("window_days", [0, -1])
+def test_window_must_be_positive(isolated_env, monkeypatch, window_days):
+    monkeypatch.setenv("WINDOW_DAYS", str(window_days))
+
+    with pytest.raises(config.ConfigError, match="WINDOW_DAYS must be a positive integer"):
+        config.load()
+
+
 def test_shallow_window_default_follows_custom_window(isolated_env, monkeypatch):
     monkeypatch.setenv("WINDOW_DAYS", "14")
 

@@ -12,6 +12,9 @@ import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from .window import ReportingWindow, as_utc
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +103,8 @@ def mirror_path(clone_root: str, repo_name: str) -> str:
     return os.path.join(clone_root, f"{repo_name}.git")
 
 
-def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, timeout: int):
+def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, timeout: int,
+                  window_start: Optional[datetime] = None):
     """Clone or refresh one bare mirror. Returns (path, refreshed).
 
     refreshed is False when the mirror is served stale -- currently only a
@@ -111,7 +115,10 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     docs/notes/data-sources.md "Failure semantics".
     """
     path = mirror_path(clone_root, repo["name"])
-    since = (datetime.now(timezone.utc) - timedelta(days=shallow_since_days)).strftime("%Y-%m-%d")
+    reference = (
+        as_utc(window_start) if window_start is not None else datetime.now(timezone.utc)
+    )
+    since = (reference - timedelta(days=shallow_since_days)).strftime("%Y-%m-%d")
     url = repo["clone_url"]
     env = _credential_env(token)
 
@@ -215,14 +222,18 @@ def _bead_id_from(subject: str, trailer: str):
     return None
 
 
-def scan_commits(path: str, repo_name: str, window_days: int, excluded, timeout: int):
+def scan_commits(path: str, repo_name: str, window_days: int, excluded, timeout: int,
+                 reporting_window: Optional[ReportingWindow] = None):
     """One dict per commit in the window, with both raw and filtered line
     counts. Merges are excluded: git reports no numstat for them, so counting
     them would inflate commit counts with rows that can never carry lines."""
-    since = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    if reporting_window is None:
+        reporting_window = ReportingWindow.from_anchor(
+            datetime.now(timezone.utc), window_days
+        )
     out = _run(
         ["git", "-C", path, "log", "--all", "--no-merges", "--numstat",
-         f"--since={since}", f"--pretty=format:{_PRETTY}"],
+         f"--pretty=format:{_PRETTY}"],
         timeout,
     )
 
@@ -231,6 +242,9 @@ def scan_commits(path: str, repo_name: str, window_days: int, excluded, timeout:
     for line in out.splitlines():
         if line.startswith("C" + _FIELD_SEP):
             _, sha, ts, email, trailer, subject = line.split(_FIELD_SEP, 5)
+            cur = None
+            if not reporting_window.contains_epoch(int(ts)):
+                continue
             cur = {
                 "sha": sha, "repo": repo_name, "ts": int(ts), "author_email": email,
                 "subject": subject, "bead_id": _bead_id_from(subject, trailer),

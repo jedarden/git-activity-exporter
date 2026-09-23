@@ -4,14 +4,18 @@ import signal
 import sys
 import threading
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 
 from . import aggregate, beads, config, families, forge, gitscan, parquet_io, publish, s3io
+from .window import ReportingWindow
 
 log = logging.getLogger(__name__)
 
 _published = threading.Event()
+_current_reporting_window = ContextVar("reporting_window", default=None)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -47,7 +51,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _collect(cfg, family_map):
+def _reporting_window(generated_at: str, window_days: int) -> ReportingWindow:
+    anchor = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    return ReportingWindow.from_anchor(anchor, window_days)
+
+
+def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None):
     """One enumeration + scan pass. Returns (repos, commits, events, stats).
 
     A per-repo failure never aborts the cycle: the repo is skipped, counted
@@ -57,6 +66,13 @@ def _collect(cfg, family_map):
     docs/notes/data-sources.md "Failure semantics"; this function is where
     they are applied.
     """
+    if reporting_window is None:
+        reporting_window = _current_reporting_window.get()
+    if reporting_window is None:
+        reporting_window = ReportingWindow.from_anchor(
+            datetime.now(timezone.utc), cfg.window_days
+        )
+
     repos = forge.list_repos(
         cfg.forge_base_url, cfg.forge_token, cfg.forge_owner,
         cfg.http_timeout_seconds, cfg.repo_denylist,
@@ -75,12 +91,17 @@ def _collect(cfg, family_map):
         name = repo["name"]
         try:
             path, refreshed = gitscan.ensure_mirror(
-                repo, cfg.clone_root, cfg.forge_token, cfg.shallow_since_days, cfg.git_timeout_seconds
+                repo, cfg.clone_root, cfg.forge_token, cfg.shallow_since_days,
+                cfg.git_timeout_seconds, reporting_window.start
             )
             commits = gitscan.scan_commits(
-                path, name, cfg.window_days, cfg.excluded_path_patterns, cfg.git_timeout_seconds
+                path, name, cfg.window_days, cfg.excluded_path_patterns,
+                cfg.git_timeout_seconds, reporting_window
             )
-            events = beads.read_events(path, name, cfg.window_days, cfg.git_timeout_seconds)
+            events = beads.read_events(
+                path, name, cfg.window_days, cfg.git_timeout_seconds,
+                reporting_window
+            )
         except Exception as e:
             # One unreachable or corrupt repo must not cost the whole cycle;
             # the failure is counted into meta.json so a repo silently
@@ -165,7 +186,12 @@ def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hour
 def _run_cycle(cfg, s3, family_map):
     started = time.monotonic()
     generated_at = _now()
-    repos, commits, events, stats = _collect(cfg, family_map)
+    reporting_window = _reporting_window(generated_at, cfg.window_days)
+    token = _current_reporting_window.set(reporting_window)
+    try:
+        repos, commits, events, stats = _collect(cfg, family_map)
+    finally:
+        _current_reporting_window.reset(token)
 
     gitscan.mark_bulk(commits, cfg.trim_max_lines, cfg.trim_max_files)
     events, bulk_cells = beads.mark_bulk_hours(

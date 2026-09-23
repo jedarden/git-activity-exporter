@@ -12,7 +12,7 @@ everything else has a default.
 | `FORGE_TOKEN` | *(required)* | read scope is sufficient |
 | `REPO_DENYLIST` | *(empty)* | comma-separated repo names to skip |
 | `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
-| `WINDOW_DAYS` | `90` | reporting window |
+| `WINDOW_DAYS` | `90` | positive reporting-window length in elapsed 24-hour UTC days; [boundary contract](data-sources.md#reporting-window-boundary-contract) |
 | `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | clone depth bound |
 | `TRIM_MAX_LINES` | `5000` | above this a commit is flagged bulk |
 | `TRIM_MAX_FILES` | `200` | above this a commit is flagged bulk |

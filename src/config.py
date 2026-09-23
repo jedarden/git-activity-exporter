@@ -118,6 +118,8 @@ def load() -> Config:
     )
 
     window_days = int(_optional("WINDOW_DAYS", "90"))
+    if window_days < 1:
+        raise ConfigError("WINDOW_DAYS must be a positive integer")
     shallow_since_days = int(_optional("SHALLOW_SINCE_DAYS", str(window_days + 10)))
     if shallow_since_days < window_days:
         raise ConfigError(

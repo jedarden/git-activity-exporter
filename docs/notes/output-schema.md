@@ -68,7 +68,11 @@ values actually seen; nothing in this file is a `NaN` or a sentinel string.
 
 All three Parquet files hold only the reporting window (`WINDOW_DAYS`, 90 by
 default), and every timestamp is UTC with an explicit `Z` — a naive isoformat
-gets read as browser-local time and shifts every chart.
+gets read as browser-local time and shifts every chart. The window is
+`[generated_at - WINDOW_DAYS, generated_at)`: the start is inclusive, the cycle
+anchor is exclusive, and the UTC hour containing the anchor is retained as a
+partial bucket. The full boundary, timezone, and DST contract is in
+[data-sources.md](data-sources.md#reporting-window-boundary-contract).
 
 ## `hourly.parquet`
 
