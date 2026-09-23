@@ -1,5 +1,57 @@
 # Data sources and their limits
 
+## Forgejo repo enumeration
+
+One endpoint answers "which repos exist": `GET
+{FORGE_BASE_URL}/api/v1/repos/search`, called with `Authorization: token
+<FORGE_TOKEN>` and query parameters `owner` (pinned to `FORGE_OWNER`),
+`limit` (fixed at 50) and `page` (1-based), each request bounded by
+`HTTP_TIMEOUT_SECONDS`. It is discovery only — commit data deliberately
+does not come from the API, where a page of 50 commits costs ~1s without
+stats and ~13s with and the same numbers come free from `git log` against
+the local mirror.
+
+**Pagination walks until a short page, and completeness is the point.**
+The walker fetches page 1, 2, 3, … and stops after the first page holding
+fewer than 50 repos, or an empty one. A full page cannot be known to be
+last, so a fleet numbering an exact multiple of 50 always pays one extra
+request that comes back empty — the walk errs toward asking again rather
+than missing a page. What reaches the cycle is the concatenation of every
+page, in page order: a repo on page 7 is exactly as enumerated as one on
+page 1. That is load-bearing, not incidental — the mirror prune deletes
+anything its live set omits, so a walk that stopped at page 1 would make
+every later page look deleted upstream. `REPO_DENYLIST` is applied to the
+completed listing, never used to cut the walk short.
+
+**Visibility is what the token can see; there is no client-side filter.**
+The search endpoint applies Forgejo's own access rules, so the enumerated
+fleet is "repos owned by `FORGE_OWNER` that `FORGE_TOKEN` may read" —
+private and public alike, processed identically. Listing visibility and
+mirror reachability are different token capabilities, though: in the
+token-rotation incident the listing still returned all 112 repos while
+clone authentication failed for 97 of them. The failure-rate guard below
+is what catches that case; nothing about a shrinking listing is itself an
+alarm.
+
+**Two different things are called "empty", handled in two different
+places.** A repo whose API payload carries `"empty": true` — created but
+never pushed, so it has no HEAD — is dropped during enumeration, before
+any clone is attempted. It is equally absent from the prune's live set, so
+a mirror left over from before the repo was emptied is deleted the same
+cycle, and the repo re-enters the fleet as a cold clone the day it gains a
+commit. A *successful enumeration returning zero repos* is the other kind:
+it is never accepted as proof the fleet shrank to zero, because a listing
+fault (wrong `FORGE_OWNER`, an API change) is indistinguishable from it.
+Pruning is skipped for that cycle and the empty result is otherwise
+handled as the enumerated fleet — the misconfiguration case heals one
+cycle after a fix, while the wrong-deletion case would cost every mirror a
+full cold re-clone.
+
+An enumeration that *errors* — an HTTP failure or a timeout — fails the
+cycle before any repo is scanned, prunes nothing and publishes nothing;
+that rule sits with the other cycle-fatal faults in Failure semantics
+below.
+
 ## Git — full window, best-effort coverage
 
 `git log --numstat` against a bare shallow mirror. Backfills the entire
