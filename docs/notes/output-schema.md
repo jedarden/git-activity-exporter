@@ -179,35 +179,102 @@ change.
 }
 ```
 
-`generated_at` is the collection heartbeat: a cycle that fails its
-publish guard leaves the previous objects and their `generated_at` in place,
-so a stalled exporter is visible as an aging timestamp rather than as a
-quiet fleet. `cycle_id` is the same cycle's identity in `current.json`; on
-the fixed legacy keys a mismatch between the two means the reader crossed a
-publication boundary mid-read. `repos_failed` lists the repos missing from this cycle and
-`repo_errors` says why each one is missing (reason truncated to 200 chars,
-credential-scrubbed upstream) — so a repo failing every cycle is visible by
-comparing cycles without trawling pod logs. The behavior behind these fields
-is specified in [data-sources.md](data-sources.md#failure-semantics); the
-short version:
+Every field is required and present in every published object;
+`bead_epoch_utc` is the only one that can be null. There is no
+`schema_version` on this object — the pointer has one. This file's stability
+is enforced the other way round: the key set is drift-tested against
+`main.build_meta` in `tests/test_docs.py`, and `tests/test_meta_schema.py`
+validates the example, the table below and the builder against one
+executable contract, fixtures included. A field cannot appear, vanish,
+change type, or lose one of the relations in the table without failing CI.
 
-- `repos_stale` — scanned this cycle but from a mirror whose fetch timed out.
-  After the first timeout the copy is normally at most one poll interval old;
-  repeated timeouts can make it older. Deliberately not counted as failure:
-  the data is present, merely not newest.
-- `mirrors_pruned` — mirrors deleted this cycle because their repo was
-  deleted, renamed, denylisted or emptied on the forge; recorded so a
-  deletion is auditable rather than silent.
-- `git_timeout_seconds` — the per-invocation bound these semantics were
-  defined against, echoed so a consumer diagnosing timeouts sees what the
-  exporter was actually given.
-- `cycle_seconds` — wall-clock cost of the cycle; a value approaching
-  `POLL_INTERVAL_SECONDS` is degradation even when every repo succeeded.
+| Field | Type | Null when | Notes |
+|---|---|---|---|
+| `version` | string | never | The exporter's own version (`VERSION_FILE`), `"unknown"` if unreadable. Identifies the writer, not the document format. |
+| `cycle_id` | string | never | `generated_at` compacted (`2026-09-06T05:00:00Z` → `20260906T050000Z`) plus a short random suffix; identical to `current.json`'s `cycle_id`, and lexicographic order is cycle order. |
+| `generated_at` | string | never | RFC 3339 UTC with an explicit `Z`. When collection *began* — it can trail the pointer's landing by up to `cycle_seconds`. |
+| `window_days` | int | never | The window every Parquet file of the same cycle was cut to. |
+| `repos_total` | int | never | Repos enumerated this cycle: denylist applied, forge-empty repos already dropped. |
+| `repos_scanned` | int | never | Repos that contributed data. `repos_scanned + len(repos_failed) == repos_total` holds in every cycle. |
+| `repos_failed` | list[string] | never (may be empty) | Repos absent from this cycle — clone, fetch, `log` or `show` failed — in enumeration order. Why each one failed is in `repo_errors`. |
+| `repo_errors` | map string→string | never (may be empty) | Keys are exactly `repos_failed`; values are human-readable reasons, credential-scrubbed at the source and truncated to 200 chars. |
+| `repos_stale` | list[string] | never (may be empty) | Scanned this cycle from a mirror whose fetch timed out — present, merely not newest. Disjoint from `repos_failed`, a subset of the scanned set, and deliberately not counted as failure. The first timeout costs at most one poll interval of freshness; repeated timeouts can cost more. |
+| `mirrors_pruned` | list[string] | never (may be empty) | Mirrors deleted this cycle because their repo was deleted, renamed, denylisted or emptied on the forge; recorded so a deletion is auditable rather than silent. |
+| `repos_with_bead_data` | int | never | Scanned repos whose forensic log produced at least one event in the window; never above `repos_scanned`. Absence is the normal case for roughly a third of the fleet. |
+| `git_timeout_seconds` | int | never | The per-invocation bound the failure semantics are defined against, echoed so a consumer diagnosing timeouts sees what the exporter was actually given. |
+| `cycle_seconds` | number | never | Wall-clock cost of the cycle at 0.1 s resolution. A value approaching `POLL_INTERVAL_SECONDS` is degradation even when every repo succeeded. |
+| `bead_epoch_utc` | string | no scanned repo produced a bead event in the window | Earliest bead event of any kind in this cycle's window; see below. |
+| `bulk_bead_cells` | int | never | `(repo, hour)` cells flagged as bulk imports; their closures carry `is_bulk_import` on `bead_events.parquet` and are counted into `beads_closed_bulk`, so excluding them stays reconcilable. |
+| `unassigned_repos` | list[string] | never (may be empty) | Sorted and unique. Repos with activity in the window whose `families.yaml` mapping is missing; a scanned repo with no window activity cannot appear. |
+| `trim_max_lines` | int | never | The bulk-commit LOC bound behind `is_bulk`. |
+| `trim_max_files` | int | never | The bulk-commit file-count bound behind `is_bulk`. |
+| `excluded_path_patterns` | list[string] | never | The `re.search` patterns separating `lines_*` from `lines_*_raw`, as configured (defaults in [configuration.md](configuration.md#default-excluded-path-patterns)). |
 
-A cycle over `MAX_FAILURE_RATE` is withheld entirely instead of published
-partial — none of these fields updates when that happens, because nothing
-was published. The key set of this example is drift-tested against
-`main.build_meta` in `tests/test_docs.py`.
+### Freshness, coverage, and withheld cycles
+
+`generated_at` is how a consumer tells a stalled exporter from a quiet
+fleet. It is stamped when the cycle begins, and a cycle that fails — a
+generation fault, a staging upload, the publish guard — publishes nothing,
+so the previous cycle's objects and their `generated_at` stay in place and
+the timestamp ages while the data does not. A `generated_at` older than a
+couple of poll intervals is an alarm, not a lull.
+
+Coverage reads straight off the fields: `repos_total` splits into
+`repos_scanned` plus `repos_failed`, and `repos_scanned` further splits into
+fresh and `repos_stale`. A healthy cycle has `repos_failed`, `repos_stale`
+and `mirrors_pruned` all empty; anything else is stated here rather than
+inferred from missing rows.
+
+A cycle whose failure rate exceeds `MAX_FAILURE_RATE` (default 0.2) is
+withheld entirely instead of published partial. **None of these fields
+updates when that happens, because nothing was published** — there is no
+partial `meta.json`, ever. The live object keeps describing the last
+*published* cycle; comparing successive published cycles is exactly how
+persistent failure is meant to become visible
+([data-sources.md](data-sources.md#failure-semantics)).
+
+### `bead_epoch_utc`
+
+Bead data has an epoch, not a history: every forensic log in the fleet
+begins at the 2026-08-14 bead-rs migration, and nothing before it can be
+reconstructed. Git backfills the whole window on day one; beads cannot. The
+panel needs the epoch to caption the bead charts honestly instead of
+drawing an empty left half.
+
+The field is the earliest bead event of any kind in *this cycle's window*,
+minimum over every scanned repo — a measurement of this cycle's data, not a
+constant. With the default `WINDOW_DAYS` of 90 it currently coincides with
+the migration instant; shrink the window below the age of bead data and it
+moves forward to the window's first event. `null` means this cycle's
+Parquet files contain no bead rows at all: suppress the bead charts rather
+than chart emptiness.
+
+Two things it is not:
+
+- **Not the attribution epoch.** The per-repo date from which actors on
+  non-claim kinds become attributable is a different bound, is not published
+  yet (Phase 4 of the plan adds it), and must for now be derived from
+  `bead_events.parquet` — see "The attribution epoch caveat" below.
+- **Not stable under failure.** If the repo holding the oldest event fails
+  a cycle, the epoch moves forward for that cycle. It is a property of this
+  cycle's coverage, not of history.
+
+### Consumer caveats
+
+- **Read pointer-first.** On the fixed legacy keys, compare `cycle_id` with
+  `current.json`'s: a mismatch means the read crossed a publication
+  boundary, and the four fixed keys may interleave two cycles.
+- **`meta.json` is the fixed keys' completion marker.** The mirror writes
+  it last (publish.py `_meta_last`), so a fixed-key reader that sees a new
+  `generated_at` knows the other three fixed keys were already replaced.
+- **`repo_errors` is prose, not an interface.** Reasons are truncated and
+  formatted for humans; match repos on `repos_failed`, never on the shape
+  of an error string.
+- **The example's values are illustrative.** What is contracted is the key
+  set, the types, and the relations in the table — coverage arithmetic,
+  failed/stale disjointness, `repo_errors` keys = `repos_failed`,
+  `cycle_id` naming `generated_at`. All of it is enforced on fixtures and
+  on the builder's real output by `tests/test_meta_schema.py`.
 
 ## Join keys
 
