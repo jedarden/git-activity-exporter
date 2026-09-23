@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import aggregate, beads, config, families, forge, gitscan, parquet_io, s3io
+from . import aggregate, beads, config, families, forge, gitscan, parquet_io, publish, s3io
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +118,8 @@ def _collect(cfg, family_map):
     }
 
 
-def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hourly) -> dict:
+def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hourly,
+               cycle_id: str) -> dict:
     """meta.json's exact key set. Extracted from _run_cycle as a pure
     function so tests/test_docs.py can drift-test it against the documented
     example in docs/notes/output-schema.md, the way DEFAULT_EXCLUDED_PATHS
@@ -127,6 +128,10 @@ def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hour
     unassigned = sorted({r["repo"] for r in hourly if r["family"] == families.UNASSIGNED})
     return {
         "version": cfg.version,
+        # The publication this object belongs to, echoed by current.json's
+        # cycle_id. A fixed-key consumer can compare the two to notice it is
+        # reading across a publication boundary.
+        "cycle_id": cycle_id,
         "generated_at": generated_at,
         "window_days": cfg.window_days,
         "repos_total": stats["repos_total"],
@@ -205,21 +210,34 @@ def _run_cycle(cfg, s3, family_map):
                 len(failed), total, failure_rate * 100, cfg.max_failure_rate * 100,
             )
 
-    for key, rows, schema in (
-        ("hourly.parquet", hourly, parquet_io.HOURLY_SCHEMA),
-        ("commits.parquet", aggregate.commit_rows(commits, family_map), parquet_io.COMMITS_SCHEMA),
-        ("bead_events.parquet", aggregate.bead_event_rows(events, family_map), parquet_io.BEAD_EVENTS_SCHEMA),
-    ):
-        s3io.upload_bytes(
-            s3, cfg.dest.bucket, f"{cfg.dest_prefix}/{key}",
-            parquet_io.table_to_parquet_bytes(rows, schema), "application/octet-stream",
-        )
+    # GENERATE EVERY PAYLOAD BEFORE ANYTHING IS UPLOADED. The pre-protocol
+    # loop serialized each table straight into its upload, so a generation
+    # failure after the first upload had already replaced one live object
+    # with its new-cycle counterpart. Building all four payloads in memory
+    # first (a few MiB) means a Parquet or meta failure raises with nothing
+    # on S3 touched, and publish.publish_cycle owns the upload-ordering and
+    # commit rules (see its docstring for the protocol and why each step is
+    # where it is).
+    cycle_id = publish.new_cycle_id(generated_at)
+    payloads = [
+        ("hourly.parquet",
+         parquet_io.table_to_parquet_bytes(hourly, parquet_io.HOURLY_SCHEMA),
+         "application/octet-stream"),
+        ("commits.parquet",
+         parquet_io.table_to_parquet_bytes(aggregate.commit_rows(commits, family_map),
+                                           parquet_io.COMMITS_SCHEMA),
+         "application/octet-stream"),
+        ("bead_events.parquet",
+         parquet_io.table_to_parquet_bytes(aggregate.bead_event_rows(events, family_map),
+                                           parquet_io.BEAD_EVENTS_SCHEMA),
+         "application/octet-stream"),
+    ]
+    meta = build_meta(cfg, stats, generated_at, time.monotonic() - started, events, hourly,
+                      cycle_id=cycle_id)
+    payloads.append(("meta.json", json.dumps(meta, indent=2).encode(), "application/json"))
 
-    meta = build_meta(cfg, stats, generated_at, time.monotonic() - started, events, hourly)
-    s3io.upload_bytes(
-        s3, cfg.dest.bucket, f"{cfg.dest_prefix}/meta.json",
-        json.dumps(meta, indent=2).encode(), "application/json",
-    )
+    publish.publish_cycle(s3, cfg.dest.bucket, cfg.dest_prefix, payloads,
+                          cycle_id=cycle_id, generated_at=generated_at)
 
 
 def main():

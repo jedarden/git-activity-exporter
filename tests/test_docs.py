@@ -67,5 +67,6 @@ def test_documented_meta_keys_match_builder():
         "repos_with_bead_data": 0,
         "bulk_bead_cells": 0,
     }
-    built = main.build_meta(cfg, stats, "2026-09-16T00:00:00Z", 1.0, [], [])
+    built = main.build_meta(cfg, stats, "2026-09-16T00:00:00Z", 1.0, [], [],
+                            cycle_id="20260916T000000Z-test")
     assert set(built) == set(documented)

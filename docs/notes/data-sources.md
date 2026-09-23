@@ -84,6 +84,52 @@ auditable. The prune refuses to run against an empty enumeration — a listing
 fault (wrong owner, API change) must not be able to delete the whole mirror
 farm — and re-including a pruned repo simply costs one cold clone.
 
+## Publication semantics
+
+Specified alongside the failure semantics above because they are the same
+discipline applied to the S3 side: a failed or degraded cycle must never be
+able to destroy or blur the last good dataset. The full protocol lives in
+[output-schema.md](output-schema.md#publication-protocol); this is the
+failure behavior each step defines:
+
+**A Parquet or `meta.json` generation failure uploads nothing.** All four
+payloads are built in memory before the first S3 write, so a serialization
+failure — a schema drift, an unrepresentable value — fails the cycle with
+the previous cycle live everywhere. The pre-protocol loop serialized each
+table inside its upload, so the same failure had already overwritten
+`hourly.parquet` by the time it fired.
+
+**A staging upload failure leaves the previous cycle committed.** The
+payloads land under `cycles/<cycle_id>/` before anything consumer-visible
+changes; the first failure aborts there. The orphaned prefix is inert —
+nothing points at it — and is swept by the retention prune of a later
+cycle.
+
+**A fixed-key mirror or pointer failure rolls the fixed keys back.** The
+fixed keys are snapshotted in memory before they are overwritten; any
+failure from the first mirror PUT through the commit PUT restores that
+snapshot before the cycle fails. After any failed publication, the pointer
+and the fixed keys both name the previous complete cycle — never a mixture
+of two cycles, never a half-written set. Rollback is best-effort: if the
+rollback itself fails (the same outage that broke the publish usually
+breaks the restore), the failure is logged and the original cause is what
+the cycle reports.
+
+**The commit is one PUT.** `current.json` is written with a single
+`put_object`, which is the only atomic operation S3 offers; the cycle
+becomes published at exactly that instant and not before. The staged
+objects the pointer names are immutable — written once before the commit,
+never rewritten — so a consumer reading pointer-then-objects always
+assembles one whole cycle regardless of where a concurrent publication
+has gotten to.
+
+**Pruning is retention-bounded and never fatal.** Three cycle prefixes are
+kept (the committed one plus the two newest), so a consumer that resolved
+the previous pointer has roughly three poll intervals to finish reading.
+Older prefixes are deleted after the commit; a deletion failure is logged
+and left for the next cycle. The committed cycle is protected explicitly,
+so no prune can ever delete the cycle the pointer names.
+
 ## Beads — epoch-bounded, two-thirds coverage
 
 `.beads/checkpoint/forensic.jsonl`, read straight out of the bare mirror with

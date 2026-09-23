@@ -1,17 +1,67 @@
 # Output schema
 
-Four objects under `DEST_S3_PREFIX` each cycle. `hourly.parquet` is what the
-panel loads; `commits.parquet` and `bead_events.parquet` are the event-grain
+Four data objects under `DEST_S3_PREFIX` each cycle, plus the publication
+pointer that makes reading them atomic. `hourly.parquet` is what the panel
+loads; `commits.parquet` and `bead_events.parquet` are the event-grain
 detail behind it and the two join sources of the factory attempt ledger
 (NEEDLE plan section 4.4; the sink and the joins themselves are owned by
 `declarative-config`).
 
 | Object | Grain | Purpose |
 |---|---|---|
-| `hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
-| `commits.parquet` | commit | drill-down detail; the commit side of the ledger's run join |
-| `bead_events.parquet` | forensic event | bead lifecycle detail; the ledger's bead-side join source |
-| `meta.json` | — | freshness, coverage, and the caveats a consumer must display |
+| `current.json` | — | the pointer: names the committed cycle; the atomic commit of every publication |
+| `cycles/<cycle_id>/hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
+| `cycles/<cycle_id>/commits.parquet` | commit | drill-down detail; the commit side of the ledger's run join |
+| `cycles/<cycle_id>/bead_events.parquet` | forensic event | bead lifecycle detail; the ledger's bead-side join source |
+| `cycles/<cycle_id>/meta.json` | — | freshness, coverage, and the caveats a consumer must display |
+| `hourly.parquet`, `commits.parquet`, `bead_events.parquet`, `meta.json` (prefix root) | — | legacy fixed keys, kept in sync for consumers that have not moved to the pointer |
+
+## Publication protocol
+
+S3 has exactly one atomic primitive — a single-object PUT — and no
+multi-object transaction. The protocol turns that into a whole-cycle
+commit:
+
+1. **Generate.** All four payloads are built in memory before any S3 write.
+   A Parquet or `meta.json` generation failure raises with nothing
+   uploaded; the previous cycle stays live everywhere.
+2. **Stage.** The payloads are uploaded to `cycles/<cycle_id>/`, a prefix no
+   consumer reads until it is pointed at. A staged cycle's objects are
+   **immutable**: they are written once, before the commit, and never
+   rewritten. An upload failure here aborts with the previous cycle still
+   live; the orphaned prefix is swept by a later cycle's prune.
+3. **Mirror.** The staged payloads are copied to the fixed keys at the
+   prefix root — `hourly.parquet`, `commits.parquet`, `bead_events.parquet`,
+   then `meta.json` **last** — for consumers that predate the pointer. A
+   mirror failure rolls the fixed keys back to their previous state before
+   the cycle fails, so a failed publication never leaves a half-mirrored
+   set behind.
+4. **Commit.** One atomic PUT of `current.json`:
+   `{"schema_version", "cycle_id", "generated_at", "objects": {name → key}}`,
+   where keys are relative to the prefix. This PUT is the only instant at
+   which the published dataset changes. A failure rolls the mirror back too
+   and the cycle fails with the previous cycle still committed.
+5. **Prune.** The committed cycle and the newest two others are kept
+   (three cycles ≈ three poll intervals of grace for a reader that resolved
+   the previous pointer); older prefixes are deleted, best-effort.
+
+**Consumers should read pointer-first:** GET `current.json`, then the
+objects its `objects` mapping names, resolving keys against the prefix the
+pointer came from. Because a cycle's staged objects are immutable and the
+pointer swap is one atomic PUT, such a read always assembles exactly one
+whole cycle — whichever cycle it saw — even while a publication is in
+flight. Do not cache pointer-resolved URLs across polls: pruning will
+eventually delete the cycle they name.
+
+The fixed keys remain for consumers that have not moved to the pointer
+(the static panel reads `hourly.parquet` + `meta.json` directly). They
+carry the pre-protocol guarantee plus the rollback rule; a reader landing
+between the mirror's PUTs can still interleave, exactly as it always
+could. `meta.json`'s `cycle_id` vs `current.json`'s tells such a reader it
+crossed a publication boundary. The pointer is the migration target.
+
+Publication is single-writer by deployment: one exporter replica owns the
+prefix.
 
 Column types are the Parquet types as written. "Null when" describes the
 values actually seen; nothing in this file is a `NaN` or a sentinel string.
@@ -108,6 +158,7 @@ change.
 ```json
 {
   "version": "0.1.5",
+  "cycle_id": "20260906T050000Z-9f2c1a4b",
   "generated_at": "2026-09-06T05:00:00Z",
   "window_days": 90,
   "repos_total": 112,
@@ -131,7 +182,9 @@ change.
 `generated_at` is the collection heartbeat: a cycle that fails its
 publish guard leaves the previous objects and their `generated_at` in place,
 so a stalled exporter is visible as an aging timestamp rather than as a
-quiet fleet. `repos_failed` lists the repos missing from this cycle and
+quiet fleet. `cycle_id` is the same cycle's identity in `current.json`; on
+the fixed legacy keys a mismatch between the two means the reader crossed a
+publication boundary mid-read. `repos_failed` lists the repos missing from this cycle and
 `repo_errors` says why each one is missing (reason truncated to 200 chars,
 credential-scrubbed upstream) — so a repo failing every cycle is visible by
 comparing cycles without trawling pod logs. The behavior behind these fields

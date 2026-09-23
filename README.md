@@ -8,14 +8,22 @@ Exports fleet git and bead activity as Parquet for the
 `dashboard.ardenone.com/git-activity/` panel.
 
 Polls every repo owned by a Forgejo user, keeps a bare shallow mirror of each
-on a PVC, and publishes four objects to an S3 prefix each cycle:
+on a PVC, and publishes each cycle to an S3 prefix behind an atomic pointer:
 
 | Object | Grain | Purpose |
 |---|---|---|
-| `hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
-| `commits.parquet` | commit | drill-down detail |
-| `bead_events.parquet` | forensic event | bead lifecycle detail; a join source of the factory attempt ledger |
-| `meta.json` | — | freshness, coverage, and the caveats the panel must display |
+| `current.json` | — | pointer to the committed cycle; the atomic commit of each publication |
+| `cycles/<cycle_id>/hourly.parquet` | `(repo, hour)` | every scope tier derives from this one table |
+| `cycles/<cycle_id>/commits.parquet` | commit | drill-down detail |
+| `cycles/<cycle_id>/bead_events.parquet` | forensic event | bead lifecycle detail; a join source of the factory attempt ledger |
+| `cycles/<cycle_id>/meta.json` | — | freshness, coverage, and the caveats the panel must display |
+
+The same four data objects are mirrored to the prefix root (fixed keys,
+`meta.json` last) for consumers that have not moved to the pointer.
+Pointer-resolved reads are atomic — one whole cycle, never a mix of two —
+while a failed publication leaves the previous complete dataset live
+everywhere. The protocol and its failure semantics are specified in
+[`docs/notes/output-schema.md`](docs/notes/output-schema.md#publication-protocol).
 
 Column types, nullability, and the join keys the attempt ledger uses against
 `commits.parquet` and `bead_events.parquet` are documented in
