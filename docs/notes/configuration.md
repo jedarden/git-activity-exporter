@@ -25,7 +25,7 @@ everything else has a default.
 | `POLL_INTERVAL_SECONDS` | `3600` | |
 | `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
 | `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API call (repo enumeration only) |
-| `HEALTH_PORT` | `8080` | `/health` liveness, `/ready` readiness |
+| `HEALTH_PORT` | `8080` | port for the [health endpoints](#health-endpoints) |
 | `LOG_LEVEL` | `INFO` | |
 | `DEST_S3_ENDPOINT` | *(required)* | S3-compatible endpoint URL |
 | `DEST_S3_BUCKET` | *(required)* | destination bucket |
@@ -34,6 +34,59 @@ everything else has a default.
 | `DEST_S3_REGION` | `us-east-1` | botocore region; most S3-compatible stores ignore it |
 | `DEST_S3_ADDRESSING_STYLE` | `virtual` | `path` wherever the store has no per-bucket virtual-host DNS — see [Destination credentials](#destination-credentials-dest_s3_) |
 | `DEST_S3_PREFIX` | `git-activity/data` | key prefix under the bucket; trailing slash stripped |
+
+## Health endpoints
+
+The health server binds `0.0.0.0:HEALTH_PORT` after configuration, the family
+map, and the S3 client have loaded, and before the first collection cycle. A
+probe made before that point receives a connection failure rather than an HTTP
+response. Once the server is bound, these are the complete contracts:
+
+| Request | Status | Payload | Meaning |
+|---|---:|---|---|
+| `GET /health` | `200` | empty, zero-byte body | The process is alive. This does not depend on collection or publication success. |
+| `GET /ready`, before the first successful cycle | `503` | empty, zero-byte body | The process has not yet completed a publication cycle in this process lifetime. |
+| `GET /ready`, after the first successful cycle | `200` | empty, zero-byte body | A cycle has completed in this process lifetime. |
+| `GET` any other path | `404` | empty, zero-byte body | Not an exporter endpoint. |
+
+There is no JSON payload and no `Content-Type` header on these responses. The
+status code is the entire application contract. These are exact GET paths; a
+trailing slash or query string is a different path and therefore returns
+`404`.
+
+### Readiness transitions
+
+Readiness is a process-lifetime latch, not a report on the newest cycle:
+
+1. **Startup:** after the health server binds and before any successful cycle,
+   `/health` is `200` and `/ready` is `503`. This deliberately allows a cold
+   fleet-wide clone to finish without making liveness fail.
+2. **Failed cycle before first success:** enumeration failures, payload
+   generation failures, publication failures, and other exceptions leave
+   `/ready` at `503`. The next poll retries; `/health` remains `200`.
+3. **Withheld publication before first success:** a cycle rejected by the
+   `MAX_FAILURE_RATE` guard raises before publication and also leaves
+   `/ready` at `503`. A cycle at or below the threshold is a successful
+   publication even when it contains the permitted partial coverage.
+4. **First successful cycle:** only a cycle that returns without an exception
+   flips `/ready` from `503` to `200`.
+5. **Later failure or withheld publication:** after readiness has been
+   achieved, a later failed or withheld cycle does not clear it. `/ready`
+   stays `200` and `/health` stays `200`; the previous complete publication
+   remains live. Use `meta.json`'s `generated_at`, `repos_failed`, and
+   `repos_stale` to assess current publication freshness and coverage.
+6. **Recovery:** a successful cycle after pre-readiness failures transitions
+   `/ready` from `503` to `200`. Recovery after readiness has already been
+   achieved has no observable endpoint transition; it remains `200`.
+7. **Restart:** every process starts unready again, even if S3 already contains
+   a valid publication. Readiness is not restored from remote state; this
+   process must complete another cycle.
+
+The distinction is intentional: `/ready` prevents a cold start from receiving
+traffic before its first local publication, while `/health` prevents a long or
+repeatedly failing collection from causing a restart loop. A sticky readiness
+latch does not claim that later cycles are fresh; consumers diagnose that from
+the published metadata.
 
 ## Why `SHALLOW_SINCE_DAYS` must exceed `WINDOW_DAYS`
 
