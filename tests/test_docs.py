@@ -63,6 +63,7 @@ def test_documented_meta_keys_match_builder():
         "repos_failed": [],
         "repo_errors": {},
         "repos_stale": [],
+        "repos_partial_history": [],
         "mirrors_pruned": [],
         "repos_with_bead_data": 0,
         "bulk_bead_cells": 0,

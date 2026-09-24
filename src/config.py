@@ -52,7 +52,8 @@ class Config:
     repo_denylist: list
     clone_root: str
     window_days: int
-    # Clones are bounded by --shallow-since so the mirror set stays small.
+    # Clones are bounded by --shallow-since; existing mirrors deepen in place
+    # when a wider window requests an older cutoff, keeping the mirror set small.
     # Full mirrors of every repo measured 14.04 GiB on 2026-08-17, dominated
     # by a handful of artifact-heavy repos (agent-transcript-archive 3.4 GiB,
     # domain-check 2.4 GiB). The dashboard only ever reads a rolling window,

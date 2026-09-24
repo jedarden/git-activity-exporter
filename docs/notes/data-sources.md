@@ -52,12 +52,34 @@ cycle before any repo is scanned, prunes nothing and publishes nothing;
 that rule sits with the other cycle-fatal faults in Failure semantics
 below.
 
-## Git — full window, best-effort coverage
+## Git — bounded window, explicit coverage
 
-`git log --numstat` against a bare shallow mirror. Backfills the entire
-window on first run. A healthy cycle covers every non-empty repo the token can
-read; failure and stale coverage are explicit in `meta.json` as described
-below.
+`git log --numstat` against a bare shallow mirror. A healthy cycle covers
+every non-empty repo the token can read; failure, stale, and incomplete-history
+coverage are explicit in `meta.json` as described below.
+
+`SHALLOW_SINCE_DAYS` is a date bound, not a commit count. The cutoff for a
+cycle is the UTC date `generated_at - WINDOW_DAYS - SHALLOW_SINCE_DAYS`. A
+new mirror is cloned with that bound. On every later cycle the collector fetches
+existing mirrors with the recomputed `--shallow-since` date. When a window
+grows and that date moves older—or, equivalently, the computed `SHALLOW_SINCE_DAYS`
+cutoff is older than the mirror's existing boundary—the collector then issues
+bounded `--deepen` fetches while the existing shallow boundary is still newer
+than the requested cutoff.
+It does not use `--unshallow` and does not re-clone merely because the bound
+grew. This preserves the storage bound while making the widened window's
+history available.
+
+After the fetch, the collector checks the mirror's actual shallow boundary. A
+full mirror, or a shallow boundary at or before the computed cutoff, is
+complete for the requested bound. If the boundary remains newer than that
+cutoff, the repository is still scanned and published with the available data,
+but its name is recorded in `repos_partial_history` in `meta.json`. The
+consumer must treat the lower edge of that repository's history as incomplete;
+the marker is separate from `repos_stale` and may overlap it when a timed-out
+fetch left the old boundary in place. A partial-history repository is not
+silently counted as a fresh, complete mirror and does not become a fetch
+failure merely because the bounded deepen could not reach the cutoff.
 
 Merge commits are excluded: git reports no numstat for them, so counting them
 would add commit rows that can never carry lines.
@@ -115,7 +137,9 @@ published cycle; the earlier behavior was strictly worse — a fetch timeout
 escalated into deleting the mirror and re-cloning, a longer network operation
 that usually timed out too, costing the repo both its fresh data and its
 mirror. Stale repos do not count toward the publish guard: their data is
-present, merely not newest.
+present, merely not newest. A stale repo can also appear in
+`repos_partial_history` when its existing shallow boundary is newer than the
+recomputed cutoff; the two fields describe independent coverage dimensions.
 
 **Any other fetch failure is treated as corruption and re-clones.** A killed
 clone can leave a partial pack that would silently serve wrong numbers, and
@@ -134,6 +158,15 @@ coverage, so the repo is not partially published. Its existing mirror is
 kept, and the repo is listed in `repos_failed`/`repo_errors`; a later cycle
 tries again. A missing `.beads/checkpoint/forensic.jsonl` is not a failure —
 that file is optional and produces an empty bead-event result.
+
+**An incomplete shallow boundary is a coverage warning, not a scan failure.**
+After either a successful bounded deepen or a stale fetch, the collector checks
+that the mirror reaches `generated_at - WINDOW_DAYS - SHALLOW_SINCE_DAYS`. A
+repo whose boundary is still newer is scanned from the data it has and listed
+in `repos_partial_history`. It remains in `repos_scanned` and may also be in
+`repos_stale`; it is disjoint from `repos_failed` and does not count toward the
+failure-rate guard. This preserves useful data while making the truncated
+lower edge visible to consumers.
 
 **A repo failing does not fail the cycle.** Each failing repo is skipped, the
 cycle continues, and the publish guard decides: above `MAX_FAILURE_RATE`

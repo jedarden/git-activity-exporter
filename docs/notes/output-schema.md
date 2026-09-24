@@ -157,7 +157,9 @@ default), and every timestamp is UTC with an explicit `Z` — a naive isoformat
 gets read as browser-local time and shifts every chart. The window is
 `[generated_at - WINDOW_DAYS, generated_at)`: the start is inclusive, the cycle
 anchor is exclusive, and the UTC hour containing the anchor is retained as a
-partial bucket. The full boundary, timezone, and DST contract is in
+partial bucket. When a shallow mirror cannot be deepened far enough,
+`repos_partial_history` identifies the repositories whose lower edge is
+incomplete. The full boundary, timezone, and DST contract is in
 [data-sources.md](data-sources.md#reporting-window-boundary-contract).
 
 ## `hourly.parquet`
@@ -267,6 +269,7 @@ change.
   "repos_failed": ["another-repo"],
   "repo_errors": {"another-repo": "git clone ... timed out after 600s"},
   "repos_stale": ["one-repo"],
+  "repos_partial_history": ["one-repo"],
   "mirrors_pruned": ["a-renamed-repo"],
   "repos_with_bead_data": 64,
   "git_timeout_seconds": 600,
@@ -303,6 +306,7 @@ change type, or lose one of the relations in the table without failing CI.
 | `repos_failed` | list[string] | never (may be empty) | Repos absent from this cycle — clone, fetch, `log` or `show` failed — in enumeration order. Why each one failed is in `repo_errors`. |
 | `repo_errors` | map string→string | never (may be empty) | Keys are exactly `repos_failed`; values are human-readable reasons, credential-scrubbed at the source and truncated to 200 chars. |
 | `repos_stale` | list[string] | never (may be empty) | Scanned this cycle from a mirror whose fetch timed out — present, merely not newest. Disjoint from `repos_failed`, a subset of the scanned set, and deliberately not counted as failure. The first timeout costs at most one poll interval of freshness; repeated timeouts can cost more. |
+| `repos_partial_history` | list[string] | never (may be empty) | Scanned repos whose shallow boundary remains newer than the computed UTC-date `generated_at - WINDOW_DAYS - SHALLOW_SINCE_DAYS` cutoff. A repo may also be in `repos_stale`; the field is disjoint from `repos_failed`, is a subset of `repos_scanned`, and is not counted as failure. Consumers must treat the lower edge as incomplete. |
 | `mirrors_pruned` | list[string] | never (may be empty) | Mirrors deleted this cycle because their repo was deleted, renamed, denylisted or emptied on the forge; recorded so a deletion is auditable rather than silent. |
 | `repos_with_bead_data` | int | never | Scanned repos whose forensic log produced at least one event in the window; never above `repos_scanned`. Absence is the normal case for roughly a third of the fleet. |
 | `git_timeout_seconds` | int | never | The per-invocation bound the failure semantics are defined against, echoed so a consumer diagnosing timeouts sees what the exporter was actually given. |
@@ -326,9 +330,12 @@ couple of poll intervals is an alarm, not a lull.
 
 Coverage reads straight off the fields: `repos_total` splits into
 `repos_scanned` plus `repos_failed`, and `repos_scanned` further splits into
-fresh and `repos_stale`. A healthy cycle has `repos_failed`, `repos_stale`
-and `mirrors_pruned` all empty; anything else is stated here rather than
-inferred from missing rows.
+fresh and `repos_stale`. `repos_partial_history` is a separate coverage warning
+within the scanned set: it names repos whose shallow boundary is still newer
+than the configured date bound, and can overlap `repos_stale`. A healthy cycle
+has `repos_failed`, `repos_stale`, `repos_partial_history`, and
+`mirrors_pruned` all empty; anything else is stated here rather than inferred
+from missing rows.
 
 A cycle whose failure rate exceeds `MAX_FAILURE_RATE` (default 0.2) is
 withheld entirely instead of published partial. **None of these fields

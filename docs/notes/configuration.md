@@ -13,7 +13,7 @@ everything else has a default.
 | `REPO_DENYLIST` | *(empty)* | comma-separated repo names to skip |
 | `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
 | `WINDOW_DAYS` | `90` | positive reporting-window length in elapsed 24-hour UTC days; [boundary contract](data-sources.md#reporting-window-boundary-contract) |
-| `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | clone depth bound |
+| `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | date-based history bound; existing mirrors deepen on fetch when a wider window is requested — [shallow-mirror behavior](data-sources.md#git--bounded-window-explicit-coverage) |
 | `TRIM_MAX_LINES` | `5000` | above this a commit is flagged bulk |
 | `TRIM_MAX_FILES` | `200` | above this a commit is flagged bulk |
 | `EXCLUDED_PATH_PATTERNS` | [the four defaults](#default-excluded-path-patterns) | regexes, comma-separated; replaces the default list wholesale |
@@ -73,8 +73,9 @@ Readiness is a process-lifetime latch, not a report on the newest cycle:
 5. **Later failure or withheld publication:** after readiness has been
    achieved, a later failed or withheld cycle does not clear it. `/ready`
    stays `200` and `/health` stays `200`; the previous complete publication
-   remains live. Use `meta.json`'s `generated_at`, `repos_failed`, and
-   `repos_stale` to assess current publication freshness and coverage.
+   remains live. Use `meta.json`'s `generated_at`, `repos_failed`, `repos_stale`,
+   and `repos_partial_history` to assess current publication freshness and
+   coverage.
 6. **Recovery:** a successful cycle after pre-readiness failures transitions
    `/ready` from `503` to `200`. Recovery after readiness has already been
    achieved has no observable endpoint transition; it remains `200`.
@@ -148,11 +149,20 @@ replayed: a restart costs the outage duration plus one cycle of freshness, and
 because mirrors persist on `CLONE_ROOT`, that first post-restart cycle is a
 fetch pass over warm mirrors, not a fleet-wide cold clone.
 
-## Why `SHALLOW_SINCE_DAYS` must exceed `WINDOW_DAYS`
+## Why `SHALLOW_SINCE_DAYS` must cover `WINDOW_DAYS`
 
-A clone shallower than the reporting window truncates the oldest hours of
-every chart with no error — the data simply is not there to find. `config.load()`
-rejects that combination rather than letting it publish quietly wrong numbers.
+`SHALLOW_SINCE_DAYS` is a date/history duration applied before the reporting
+window's start, not a commit count. It defaults to ten days beyond the window
+so a normal small bump still has margin. `config.load()` rejects a bound
+shorter than the reporting window because a clone shallower than the window
+truncates the oldest hours of every chart with no error.
+
+When a mirror already exists, widening `WINDOW_DAYS` recomputes its cutoff on
+the next fetch. Git deepens the mirror in place with the date bound; the
+collector records any repository whose shallow boundary still truncates the
+requested bound in `meta.json`'s `repos_partial_history`. See
+[data-sources.md](data-sources.md#failure-semantics) for the exact coverage and
+stale-mirror semantics.
 
 ## Chosen thresholds are measurements, not guesses
 

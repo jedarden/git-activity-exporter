@@ -4,9 +4,10 @@ docs/notes/output-schema.md states the contract in prose and a table; this
 module is the same contract in a form CI can enforce. The documented example,
 the documented field table and main.build_meta's real output are all checked
 against it, alongside fixtures pinning the guarantees a consumer is told to
-rely on: coverage arithmetic, failed/stale disjointness, repo_errors keying,
-the null bead_epoch_utc case. A field cannot appear, vanish, change type, or
-lose one of those guarantees without failing here first.
+rely on: coverage arithmetic, failed/stale disjointness, partial-history
+coverage, repo_errors keying, the null bead_epoch_utc case. A field cannot
+appear, vanish, change type, or lose one of those guarantees without failing
+here first.
 """
 import json
 import re
@@ -52,6 +53,7 @@ META_CONTRACT = {
     "repos_failed": Field("string list", False),
     "repo_errors": Field("string map", False),
     "repos_stale": Field("string list", False),
+    "repos_partial_history": Field("string list", False),
     "mirrors_pruned": Field("string list", False),
     "repos_with_bead_data": Field("int", False),
     "git_timeout_seconds": Field("int", False),
@@ -66,7 +68,10 @@ META_CONTRACT = {
 }
 
 _POSITIVE_INTS = ("window_days", "git_timeout_seconds", "trim_max_lines", "trim_max_files")
-_REPO_LISTS = ("repos_failed", "repos_stale", "mirrors_pruned", "excluded_path_patterns")
+_REPO_LISTS = (
+    "repos_failed", "repos_stale", "repos_partial_history", "mirrors_pruned",
+    "excluded_path_patterns",
+)
 
 
 def _type_ok(value, kind):
@@ -128,6 +133,7 @@ def validate_meta(meta):
 
     total, scanned = meta.get("repos_total"), meta.get("repos_scanned")
     failed, stale = meta.get("repos_failed"), meta.get("repos_stale")
+    partial = meta.get("repos_partial_history")
     errors = meta.get("repo_errors")
     if isinstance(total, int) and isinstance(scanned, int):
         if min(total, scanned) < 0:
@@ -142,6 +148,12 @@ def validate_meta(meta):
             bad.append(f"repos_stale must be disjoint from repos_failed: {sorted(overlap)}")
     if isinstance(scanned, int) and isinstance(stale, list) and len(stale) > scanned:
         bad.append("repos_stale cannot be larger than the scanned set")
+    if isinstance(failed, list) and isinstance(partial, list):
+        overlap = set(failed) & set(partial)
+        if overlap:
+            bad.append(f"repos_partial_history must be disjoint from repos_failed: {sorted(overlap)}")
+    if isinstance(scanned, int) and isinstance(partial, list) and len(partial) > scanned:
+        bad.append("repos_partial_history cannot be larger than the scanned set")
     if isinstance(errors, dict) and isinstance(failed, list):
         if set(errors) != set(failed):
             bad.append("repo_errors keys must be exactly repos_failed")
@@ -193,6 +205,7 @@ def _full_fleet():
         "repos_failed": ["another-repo"],
         "repo_errors": {"another-repo": "git clone ... timed out after 600s"},
         "repos_stale": ["one-repo"],
+        "repos_partial_history": ["one-repo"],
         "mirrors_pruned": ["a-renamed-repo"],
         "repos_with_bead_data": 64,
         "git_timeout_seconds": 600,
@@ -221,7 +234,7 @@ def _empty_fleet():
     meta.update({
         "repos_total": 0, "repos_scanned": 0,
         "repos_failed": [], "repo_errors": {},
-        "repos_stale": [], "mirrors_pruned": [],
+        "repos_stale": [], "repos_partial_history": [], "mirrors_pruned": [],
         "repos_with_bead_data": 0, "bead_epoch_utc": None,
         "attribution_epoch": {},
         "bulk_bead_cells": 0, "unassigned_repos": [],
@@ -268,6 +281,9 @@ def _invalid_fixtures():
         ("stale exceeds the scanned set",
          set_("repos_stale", [f"repo-{i}" for i in range(112)]),
          "larger than the scanned set"),
+        ("partial history overlaps failed",
+         set_("repos_partial_history", ["another-repo"]),
+         "disjoint from repos_failed"),
         ("bead coverage exceeds scanned", set_("repos_with_bead_data", 200),
          "cannot exceed repos_scanned"),
         ("negative cycle_seconds", set_("cycle_seconds", -1.0),
@@ -299,15 +315,17 @@ def _documented_table_fields():
     return re.findall(r"^\| `([a-z_]+)` \|", table, re.MULTILINE)
 
 
-def _built_meta(event_ts=(1789327200,), events=None):
+def _built_meta(event_ts=(1789327200,), events=None, partial_history=()):
     cfg = SimpleNamespace(
         version="test", window_days=90, git_timeout_seconds=600,
         trim_max_lines=5000, trim_max_files=200,
         excluded_path_patterns=[r"(^|/)\.beads/"],
     )
     stats = {
-        "repos_total": 2, "repos_scanned": 1, "repos_failed": ["another-repo"],
+        "repos_total": 2, "repos_scanned": 1,
+        "repos_failed": ["another-repo"],
         "repo_errors": {"another-repo": "timed out"}, "repos_stale": [],
+        "repos_partial_history": list(partial_history),
         "mirrors_pruned": [], "repos_with_bead_data": 1, "bulk_bead_cells": 0,
     }
     if events is None:
@@ -330,6 +348,12 @@ def test_contract_matches_builder_and_documented_table():
 
 def test_builder_output_validates():
     assert validate_meta(_built_meta()) == []
+
+
+def test_builder_surfaces_partial_history():
+    built = _built_meta(partial_history=["some-repo"])
+    assert built["repos_partial_history"] == ["some-repo"]
+    assert validate_meta(built) == []
 
 
 def test_builder_null_epoch_without_bead_events():

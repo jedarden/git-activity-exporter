@@ -29,6 +29,8 @@ _SCOPE_CAPTURE_RE = re.compile(r"^\w+\(([^)]+)\)!?:")
 
 _FIELD_SEP = "\x1f"
 _PRETTY = f"C{_FIELD_SEP}%H{_FIELD_SEP}%at{_FIELD_SEP}%aE{_FIELD_SEP}%(trailers:key=Bead-Id,valueonly,separator=){_FIELD_SEP}%s"
+_DEEPEN_MIN_COMMITS = 100
+_DEEPEN_MAX_ATTEMPTS = 8
 
 
 class GitError(Exception):
@@ -113,6 +115,11 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     forge degrades (repos_stale in meta.json) instead of escalating. Failure
     semantics are specified in
     docs/notes/data-sources.md "Failure semantics".
+
+    Existing mirrors are always fetched with the recomputed date bound. If the
+    shallow boundary is still newer than that bound, bounded --deepen fetches
+    extend it until the cutoff is reached or the attempt budget is exhausted;
+    widening the reporting window does not require --unshallow or a re-clone.
     """
     path = mirror_path(clone_root, repo["name"])
     reference = (
@@ -124,8 +131,16 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
 
     if os.path.exists(os.path.join(path, "HEAD")):
         try:
+            refspec = "+refs/heads/*:refs/heads/*"
             _run(["git", "-C", path, "fetch", "--quiet", "--prune", f"--shallow-since={since}",
-                  url, "+refs/heads/*:refs/heads/*"], timeout, env=env)
+                  url, refspec], timeout, env=env)
+            depth = max(_DEEPEN_MIN_COMMITS, shallow_since_days)
+            for _ in range(_DEEPEN_MAX_ATTEMPTS):
+                if mirror_history_complete(path, reference, shallow_since_days, timeout):
+                    break
+                _run(["git", "-C", path, "fetch", "--quiet", "--prune",
+                      f"--deepen={depth}", url, refspec], timeout, env=env)
+                depth *= 2
             return path, True
         except GitTimeout as e:
             # A timeout means the mirror is fine and the forge is slow. The
@@ -165,6 +180,35 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
         # PVC -- before this finally, an interrupted clone left <name>.git.tmp
         # behind until the next clone of the SAME repo, which might be never.
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def mirror_history_complete(path: str, window_start: datetime,
+                            shallow_since_days: int, timeout: int) -> bool:
+    """Whether a mirror reaches the requested date bound for the window."""
+    cutoff = (as_utc(window_start) - timedelta(days=shallow_since_days)).date()
+    shallow_path = os.path.join(path, "shallow")
+    if not os.path.isfile(shallow_path):
+        return True
+
+    try:
+        with open(shallow_path) as shallow:
+            boundaries = [line.strip() for line in shallow if line.strip()]
+        if not boundaries:
+            return False
+        output = _run(
+            ["git", "-C", path, "log", "--no-walk", "--format=%cI", *boundaries],
+            timeout,
+        )
+        boundary_dates = [line.strip() for line in output.splitlines() if line.strip()]
+        if len(boundary_dates) != len(boundaries):
+            return False
+        parsed = [
+            datetime.fromisoformat(value.replace("Z", "+00:00")) for value in boundary_dates
+        ]
+        return all(as_utc(value).date() <= cutoff for value in parsed)
+    except (OSError, GitError, TypeError, ValueError) as error:
+        log.warning("could not establish mirror history coverage for %s: %s", path, error)
+        return False
 
 
 def prune_orphans(clone_root: str, live_names) -> list:

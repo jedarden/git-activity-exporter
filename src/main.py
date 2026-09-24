@@ -62,9 +62,9 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
     A per-repo failure never aborts the cycle: the repo is skipped, counted
     into stats, and the publish guard in _run_cycle decides whether the
     partial result may publish. The full semantics -- timeout vs corruption,
-    stale mirrors, orphan pruning, persistent failure -- are specified in
-    docs/notes/data-sources.md "Failure semantics"; this function is where
-    they are applied.
+    stale mirrors, partial history, orphan pruning, persistent failure -- are
+    specified in docs/notes/data-sources.md "Failure semantics"; this function
+    is where they are applied.
     """
     if reporting_window is None:
         reporting_window = _current_reporting_window.get()
@@ -84,7 +84,7 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
     mirrors_pruned = gitscan.prune_orphans(cfg.clone_root, [r["name"] for r in repos])
 
     all_commits, all_events = [], []
-    scanned, failed, stale, with_beads = 0, [], [], 0
+    scanned, failed, stale, partial_history, with_beads = 0, [], [], [], 0
     repo_errors = {}
 
     for repo in repos:
@@ -93,6 +93,10 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
             path, refreshed = gitscan.ensure_mirror(
                 repo, cfg.clone_root, cfg.forge_token, cfg.shallow_since_days,
                 cfg.git_timeout_seconds, reporting_window.start
+            )
+            history_complete = gitscan.mirror_history_complete(
+                path, reporting_window.start, cfg.shallow_since_days,
+                cfg.git_timeout_seconds
             )
             commits = gitscan.scan_commits(
                 path, name, cfg.window_days, cfg.excluded_path_patterns,
@@ -121,6 +125,8 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
         scanned += 1
         if not refreshed:
             stale.append(name)
+        if not history_complete:
+            partial_history.append(name)
         if events:
             with_beads += 1
         all_commits.extend(commits)
@@ -134,6 +140,7 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
         # Scanned from a mirror this cycle could not refresh. Deliberately
         # NOT counted as failure: the data is present, merely not newest.
         "repos_stale": stale,
+        "repos_partial_history": partial_history,
         "mirrors_pruned": mirrors_pruned,
         "repos_with_bead_data": with_beads,
     }
@@ -166,6 +173,7 @@ def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hour
         "repos_failed": stats["repos_failed"],
         "repo_errors": stats["repo_errors"],
         "repos_stale": stats["repos_stale"],
+        "repos_partial_history": stats.get("repos_partial_history", []),
         "mirrors_pruned": stats["mirrors_pruned"],
         "repos_with_bead_data": stats["repos_with_bead_data"],
         # The bound the failure semantics are defined against, so a consumer
@@ -209,9 +217,10 @@ def _run_cycle(cfg, s3, family_map):
 
     hourly = aggregate.build_hourly(commits, events, family_map, attribution_epochs)
     log.info(
-        "cycle: %d/%d repos scanned (%d failed, %d stale), %d commits, %d bead events, %d hourly cells",
+        "cycle: %d/%d repos scanned (%d failed, %d stale, %d partial history), %d commits, %d bead events, %d hourly cells",
         stats["repos_scanned"], stats["repos_total"], len(stats["repos_failed"]),
-        len(stats["repos_stale"]), len(commits), len(events), len(hourly),
+        len(stats["repos_stale"]), len(stats.get("repos_partial_history", [])),
+        len(commits), len(events), len(hourly),
     )
 
     # REFUSE TO PUBLISH A BADLY DEGRADED CYCLE.

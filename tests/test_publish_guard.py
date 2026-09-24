@@ -84,6 +84,7 @@ def _cycle_result(total, failed):
         "repos_failed": failed_names,
         "repo_errors": {name: "authentication failed" for name in failed_names},
         "repos_stale": [],
+        "repos_partial_history": [],
         "mirrors_pruned": [],
         "repos_with_bead_data": 0,
     }

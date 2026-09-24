@@ -86,7 +86,7 @@ def _stats(total, scanned, with_beads):
     return {
         "repos_total": total, "repos_scanned": scanned,
         "repos_failed": [], "repo_errors": {},
-        "repos_stale": [], "mirrors_pruned": [],
+        "repos_stale": [], "repos_partial_history": [], "mirrors_pruned": [],
         "repos_with_bead_data": with_beads,
     }
 

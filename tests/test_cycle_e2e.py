@@ -282,6 +282,7 @@ def test_local_fixture_cycle_reuses_mirrors_and_publishes_coverage(local_cycle):
     assert meta["repos_failed"] == ["broken-repo"]
     assert set(meta["repo_errors"]) == {"broken-repo"}
     assert meta["repo_errors"]["broken-repo"]
+    assert meta["repos_partial_history"] == []
     assert meta["repos_with_bead_data"] == 1
     assert meta["unassigned_repos"] == ["quiet-repo"]
     assert meta["bead_epoch_utc"] == "2026-09-23T09:05:00Z"

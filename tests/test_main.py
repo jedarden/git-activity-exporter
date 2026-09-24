@@ -27,6 +27,11 @@ def test_collect_keeps_going_and_records_failed_and_stale_repos(monkeypatch, tmp
 
     monkeypatch.setattr(main.forge, "list_repos", lambda *args: repos)
     monkeypatch.setattr(main.gitscan, "prune_orphans", lambda *args: ["old-name"])
+    monkeypatch.setattr(
+        main.gitscan,
+        "mirror_history_complete",
+        lambda path, *args: path != "/data/mirrors/slow.git",
+    )
 
     def fake_ensure(repo, *args):
         if repo["name"] == "timeout":
@@ -48,6 +53,7 @@ def test_collect_keeps_going_and_records_failed_and_stale_repos(monkeypatch, tmp
         "repos_failed": ["timeout"],
         "repo_errors": {"timeout": "git clone timed out after 17s"},
         "repos_stale": ["slow"],
+        "repos_partial_history": ["slow"],
         "mirrors_pruned": ["old-name"],
         "repos_with_bead_data": 0,
     }
@@ -76,6 +82,7 @@ def _cycle_stats():
         "repos_failed": [],
         "repo_errors": {},
         "repos_stale": [],
+        "repos_partial_history": [],
         "mirrors_pruned": [],
         "repos_with_bead_data": 0,
         "bulk_bead_cells": 0,

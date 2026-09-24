@@ -1,11 +1,13 @@
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 
 import pytest
 
 from src import beads, gitscan
 from src.config import DEFAULT_EXCLUDED_PATHS
+from src.window import ReportingWindow
 
 
 def test_bead_id_prefers_trailer_over_scope():
@@ -105,6 +107,80 @@ def _fake_clone(target):
     os.makedirs(target, exist_ok=True)
     with open(os.path.join(target, "HEAD"), "w") as f:
         f.write("ref: refs/heads/main\n")
+
+
+def _git(path, *args, date=None):
+    env = os.environ.copy()
+    env.update({
+        "GIT_AUTHOR_NAME": "fixture",
+        "GIT_AUTHOR_EMAIL": "fixture@example.com",
+        "GIT_COMMITTER_NAME": "fixture",
+        "GIT_COMMITTER_EMAIL": "fixture@example.com",
+    })
+    if date is not None:
+        env["GIT_AUTHOR_DATE"] = date
+        env["GIT_COMMITTER_DATE"] = date
+    return subprocess.run(
+        ["git", "-C", str(path), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+
+
+def _commit_fixture(path, name, content, date, subject):
+    (path / name).write_text(content)
+    _git(path, "add", "-A")
+    _git(path, "commit", "-q", "--no-verify", "-m", subject, date=date)
+
+
+def test_existing_shallow_mirror_is_deepened_for_wider_window(tmp_path):
+    source = tmp_path / "source"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+    _git(source, "config", "user.name", "fixture")
+    _git(source, "config", "user.email", "fixture@example.com")
+    _commit_fixture(source, "old.txt", "old\n", "2020-01-01T00:00:00+00:00", "old")
+    _commit_fixture(
+        source, "middle.txt", "middle\n", "2026-08-30T00:00:00+00:00", "middle"
+    )
+    _commit_fixture(source, "new.txt", "new\n", "2026-09-20T00:00:00+00:00", "new")
+    middle_sha = _git(source, "rev-parse", "HEAD~1")
+
+    mirror = tmp_path / "history.git"
+    subprocess.run(
+        [
+            "git", "clone", "-q", "--mirror", "--shallow-since=2026-09-01",
+            source.as_uri(), str(mirror),
+        ],
+        check=True,
+    )
+    window_start = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+    assert not gitscan.mirror_history_complete(str(mirror), window_start, 100, 60)
+    assert subprocess.run(
+        ["git", "-C", str(mirror), "cat-file", "-e", f"{middle_sha}^{{commit}}"],
+        capture_output=True,
+    ).returncode != 0
+
+    inode = os.stat(mirror).st_ino
+    path, refreshed = gitscan.ensure_mirror(
+        {"name": "history", "clone_url": source.as_uri()},
+        str(tmp_path), "token", 100, 60, window_start,
+    )
+
+    assert path == str(mirror)
+    assert refreshed is True
+    assert os.stat(mirror).st_ino == inode
+    assert gitscan.mirror_history_complete(str(mirror), window_start, 100, 60)
+    assert subprocess.run(
+        ["git", "-C", str(mirror), "cat-file", "-e", f"{middle_sha}^{{commit}}"],
+        capture_output=True,
+    ).returncode == 0
+    window = ReportingWindow.from_anchor(
+        datetime(2026, 9, 23, 12, tzinfo=timezone.utc), 30
+    )
+    commits = gitscan.scan_commits(str(mirror), "history", 30, [], 60, window)
+    assert {commit["subject"] for commit in commits} == {"middle", "new"}
 
 
 def test_run_timeout_raises_git_timeout_not_plain_giterror(monkeypatch):
