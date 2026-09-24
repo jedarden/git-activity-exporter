@@ -59,6 +59,74 @@ def test_collect_keeps_going_and_records_failed_and_stale_repos(monkeypatch, tmp
     }
 
 
+def test_forensic_integrity_failure_excludes_the_whole_repository(monkeypatch, tmp_path):
+    repos = [
+        {"name": "corrupt", "clone_url": "https://forge/corrupt.git"},
+        {"name": "healthy", "clone_url": "https://forge/healthy.git"},
+    ]
+    cfg = SimpleNamespace(
+        forge_base_url="https://forge",
+        forge_token="token",
+        forge_owner="owner",
+        http_timeout_seconds=30,
+        repo_denylist=[],
+        clone_root=str(tmp_path),
+        shallow_since_days=100,
+        window_days=90,
+        excluded_path_patterns=[],
+        git_timeout_seconds=17,
+    )
+
+    monkeypatch.setattr(main.forge, "list_repos", lambda *args: repos)
+    monkeypatch.setattr(main.gitscan, "prune_orphans", lambda *args: [])
+    monkeypatch.setattr(
+        main.gitscan, "ensure_mirror", lambda repo, *args: (f"/mirror/{repo['name']}", True)
+    )
+    monkeypatch.setattr(main.gitscan, "mirror_history_complete", lambda *args: True)
+    monkeypatch.setattr(
+        main.gitscan, "scan_commits", lambda path, name, *args: [{"repo": name, "sha": name}]
+    )
+
+    def fake_read(path, name, *args):
+        if name == "corrupt":
+            raise main.beads.ForensicParseError(
+                "corrupt: duplicate forensic event identity at line 8"
+            )
+        return [{"repo": "healthy", "ts": 1, "kind": "closed", "actor": "system"}]
+
+    monkeypatch.setattr(main.beads, "read_events", fake_read)
+
+    found, commits, events, stats = main._collect(cfg, {})
+
+    assert found == repos
+    assert commits == [{"repo": "healthy", "sha": "healthy"}]
+    assert events == [{"repo": "healthy", "ts": 1, "kind": "closed", "actor": "system"}]
+    assert stats["repos_scanned"] == 1
+    assert stats["repos_failed"] == ["corrupt"]
+    assert stats["repo_errors"] == {
+        "corrupt": "corrupt: duplicate forensic event identity at line 8"
+    }
+    assert stats["repos_with_bead_data"] == 1
+
+    meta_cfg = SimpleNamespace(
+        version="test",
+        window_days=90,
+        git_timeout_seconds=17,
+        trim_max_lines=5000,
+        trim_max_files=200,
+        excluded_path_patterns=[],
+    )
+    meta_stats = dict(stats, bulk_bead_cells=0)
+    meta = main.build_meta(
+        meta_cfg, meta_stats, "2026-09-24T00:00:00Z", 1.0, events, [],
+        cycle_id="20260924T000000Z-01234567",
+    )
+    assert meta["repos_failed"] == ["corrupt"]
+    assert meta["repo_errors"] == stats["repo_errors"]
+    assert meta["repos_with_bead_data"] == 1
+    assert "corrupt" not in meta["attribution_epoch"]
+
+
 def _cycle_cfg(dest_prefix="git-activity/data"):
     return SimpleNamespace(
         version="test",

@@ -60,11 +60,12 @@ def _commit(path, date, subject):
     _git(path, "commit", "-q", "--no-verify", "-m", subject, date=date)
 
 
-def _event(issue_id, kind, timestamp, actor, detail):
+def _event(sequence, issue_id, kind, timestamp, actor, detail):
     return json.dumps({
         "record_type": "event",
         "event": {
             "origin_store_uuid": "fixture-workspace",
+            "origin_event_sequence": sequence,
             "issue_id": issue_id,
             "kind": kind,
             "actor": actor,
@@ -94,11 +95,11 @@ def _make_cycle_fixture(tmp_path, monkeypatch):
                 "src/app.py": "print('bead')\n",
                 ".beads/checkpoint/forensic.jsonl": "\n".join([
                     _event(
-                        "gitact-0abc123", "claimed", "2026-09-23T09:05:00Z",
+                        1, "gitact-0abc123", "claimed", "2026-09-23T09:05:00Z",
                         "fixture-worker", {"resulting_base_status": "in_progress"},
                     ),
                     _event(
-                        "gitact-0abc123", "closed", "2026-09-23T09:10:00Z",
+                        2, "gitact-0abc123", "closed", "2026-09-23T09:10:00Z",
                         "system", {"prior_base_status": "in_progress", "reason": "done"},
                     ),
                 ]) + "\n",

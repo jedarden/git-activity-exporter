@@ -222,7 +222,14 @@ lines.
 One row per forensic event in the window — **every** kind the forensic log
 records, not only the four the hourly rollup counts. This file is a join
 source, not a chart source: `created`, `updated`, label and dependency edits
-are noise for a chart and exactly what a per-bead timeline needs.
+are noise for a chart and exactly what a per-bead timeline needs. A missing
+forensic path contributes no rows. A present but malformed, unreadable, or
+detectably truncated file, or one with duplicate event identities, contributes
+no rows from that repo: the repo fails the cycle's coverage check instead of
+publishing a valid prefix. When `current.json` is present, its record count
+and active-root checksum must also match the complete forensic file, which
+makes truncation on a record boundary detectable
+([data-sources.md](data-sources.md#failure-semantics)).
 
 | Column | Type | Null when | Notes |
 |---|---|---|---|
@@ -353,12 +360,12 @@ change type, or lose one of the relations in the table without failing CI.
 | `window_days` | int | never | The window every Parquet file of the same cycle was cut to. |
 | `repos_total` | int | never | Repos enumerated this cycle: denylist applied, forge-empty repos already dropped. |
 | `repos_scanned` | int | never | Repos that contributed data. `repos_scanned + len(repos_failed) == repos_total` holds in every cycle. |
-| `repos_failed` | list[string] | never (may be empty) | Repos absent from this cycle — clone, fetch, `log` or `show` failed — in enumeration order. Why each one failed is in `repo_errors`. |
+| `repos_failed` | list[string] | never (may be empty) | Repos absent from this cycle — clone, fetch, `log`, forensic/manifest lookup, forensic/manifest `show`, or forensic validation failed — in enumeration order. Why each one failed is in `repo_errors`. |
 | `repo_errors` | map string→string | never (may be empty) | Keys are exactly `repos_failed`; values are human-readable reasons, credential-scrubbed at the source and truncated to 200 chars. |
 | `repos_stale` | list[string] | never (may be empty) | Scanned this cycle from a mirror whose fetch timed out — present, merely not newest. Disjoint from `repos_failed`, a subset of the scanned set, and deliberately not counted as failure. The first timeout costs at most one poll interval of freshness; repeated timeouts can cost more. |
 | `repos_partial_history` | list[string] | never (may be empty) | Scanned repos whose shallow boundary remains newer than the computed UTC-date `generated_at - WINDOW_DAYS - SHALLOW_SINCE_DAYS` cutoff. A repo may also be in `repos_stale`; the field is disjoint from `repos_failed`, is a subset of `repos_scanned`, and is not counted as failure. Consumers must treat the lower edge as incomplete. |
 | `mirrors_pruned` | list[string] | never (may be empty) | Mirrors deleted this cycle because their repo was deleted, renamed, denylisted or emptied on the forge; recorded so a deletion is auditable rather than silent. |
-| `repos_with_bead_data` | int | never | Scanned repos whose forensic log produced at least one event in the window; never above `repos_scanned`. Absence is the normal case for roughly a third of the fleet. |
+| `repos_with_bead_data` | int | never | Scanned repos whose present forensic log passed whole-file validation and produced at least one event in the window; never above `repos_scanned`. A missing, empty, or out-of-window-only valid log does not count. Absence is the normal case for roughly a third of the fleet. |
 | `git_timeout_seconds` | int | never | The per-invocation bound the failure semantics are defined against, echoed so a consumer diagnosing timeouts sees what the exporter was actually given. |
 | `cycle_seconds` | number | never | Wall-clock cost of the cycle at 0.1 s resolution. A value approaching `POLL_INTERVAL_SECONDS` is degradation even when every repo succeeded. |
 | `bead_epoch_utc` | string | no scanned repo produced a bead event in the window | Earliest bead event of any kind in this cycle's window; see below. |
@@ -380,9 +387,13 @@ couple of poll intervals is an alarm, not a lull.
 
 Coverage reads straight off the fields: `repos_total` splits into
 `repos_scanned` plus `repos_failed`, and `repos_scanned` further splits into
-fresh and `repos_stale`. `repos_partial_history` is a separate coverage warning
-within the scanned set: it names repos whose shallow boundary is still newer
-than the configured date bound, and can overlap `repos_stale`. A healthy cycle
+fresh and `repos_stale`. A malformed, detectably truncated, duplicated, or
+unreadable present forensic log, or an invalid present checkpoint manifest, is
+a repository failure, so that repo is named in `repos_failed`, has a reason in
+`repo_errors`, and contributes neither Git nor bead rows.
+`repos_partial_history` is a separate coverage warning within
+the scanned set: it names repos whose shallow boundary is still newer than the
+configured date bound, and can overlap `repos_stale`. A healthy cycle
 has `repos_failed`, `repos_stale`, `repos_partial_history`, and
 `mirrors_pruned` all empty; anything else is stated here rather than inferred
 from missing rows.

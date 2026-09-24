@@ -6,15 +6,18 @@ workspace rather than invented, because a schema guess that drifts from what
 bead-rs writes would break the factory ledger join silently, in the data
 stack, months later.
 """
+import hashlib
 import io
 import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
 
-from src import aggregate, beads, parquet_io
+from src import aggregate, beads, gitscan, parquet_io
 
 WORKSPACE_UUID = "3c213df4-b69d-fca5-1263-5950727cf636"
 WORKER = "claude-code-glm-5.3-flash-glm-vibe"
@@ -69,9 +72,22 @@ FORENSIC_FIXTURE = "\n".join([
                       "2026-09-06T06:45:10.207334889Z",
                       {"prior_base_status": "closed", "resulting_base_status": "open",
                        "prior_assignee": WORKER})),
-    # A truncated record: skipped and counted, never fatal.
-    '{"record_type": "event", "event": {"origin_store_uuid"',
 ]) + "\n"
+
+TRUNCATED_FIXTURE = FORENSIC_FIXTURE + '{"record_type":"event","event":{'
+
+
+def _manifest(text, total_records=None):
+    if total_records is None:
+        total_records = sum(1 for line in text.split("\n") if line.strip())
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return json.dumps({
+        "active_root": {
+            "path": f"objects/{digest}.jsonl",
+            "sha256": digest,
+        },
+        "total_record_count": total_records,
+    })
 
 
 def _parse(cutoff="2020-01-01T00:00:00+00:00"):
@@ -79,20 +95,24 @@ def _parse(cutoff="2020-01-01T00:00:00+00:00"):
         FORENSIC_FIXTURE, "fixture-repo", datetime.fromisoformat(cutoff))
 
 
-def _mirror_with_forensic(tmp_path, text=FORENSIC_FIXTURE):
+def _mirror_with_forensic(tmp_path, text=FORENSIC_FIXTURE, manifest=None):
     """A checkout that carries a forensic log the way a bare mirror does, so
     read_events' `git show HEAD:` path is exercised for real."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     path = tmp_path / ".beads" / "checkpoint"
     path.mkdir(parents=True)
     (path / "forensic.jsonl").write_text(text)
+    paths = [".beads/checkpoint/forensic.jsonl"]
+    if manifest is not None:
+        (path / "current.json").write_text(manifest)
+        paths.append(".beads/checkpoint/current.json")
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
     }
     subprocess.run(["git", "-C", str(tmp_path), "-c", "commit.gpgsign=false",
-                    "add", ".beads/checkpoint/forensic.jsonl"], check=True, env=env)
+                    "add", *paths], check=True, env=env)
     subprocess.run(["git", "-C", str(tmp_path), "-c", "commit.gpgsign=false",
                     "commit", "-q", "--no-verify", "-m", "forensic"], check=True, env=env)
     return str(tmp_path)
@@ -117,12 +137,225 @@ def test_a_repo_without_a_forensic_log_reads_as_empty_not_an_error(tmp_path):
     assert beads.read_events(str(tmp_path), "quiet-repo", window_days=90, timeout=60) == []
 
 
+def test_an_empty_present_forensic_log_reads_as_empty(tmp_path):
+    mirror = _mirror_with_forensic(tmp_path, "")
+
+    assert beads.read_events(
+        mirror, "empty-forensic-repo", window_days=90, timeout=60
+    ) == []
+
+
+def test_a_manifest_matching_the_forensic_file_is_accepted(tmp_path):
+    mirror = _mirror_with_forensic(
+        tmp_path, FORENSIC_FIXTURE, _manifest(FORENSIC_FIXTURE)
+    )
+
+    assert len(beads.read_events(
+        mirror, "fixture-repo", window_days=3650, timeout=60
+    )) == 5
+
+
+def test_manifest_detects_truncation_on_a_record_boundary(tmp_path):
+    first = json.dumps(
+        _event(1, "gitact-0000000", "created", "system", EARLY, {})
+    )
+    second = json.dumps(
+        _event(2, "gitact-0000001", "closed", "system", EARLY, {})
+    )
+    complete = first + "\n" + second + "\n"
+    mirror = _mirror_with_forensic(
+        tmp_path, first + "\n", _manifest(complete)
+    )
+
+    with pytest.raises(beads.ForensicParseError, match="record count"):
+        beads.read_events(mirror, "truncated-repo", window_days=3650, timeout=60)
+
+
+def test_manifest_detects_forensic_content_changes_at_the_same_record_count(tmp_path):
+    manifest = json.loads(_manifest(FORENSIC_FIXTURE))
+    manifest["active_root"]["sha256"] = "0" * 64
+    mirror = _mirror_with_forensic(
+        tmp_path, FORENSIC_FIXTURE, json.dumps(manifest)
+    )
+
+    with pytest.raises(beads.ForensicParseError, match="checksum"):
+        beads.read_events(mirror, "changed-repo", window_days=3650, timeout=60)
+
+
+def test_malformed_checkpoint_manifest_fails_the_repository(tmp_path):
+    mirror = _mirror_with_forensic(tmp_path, FORENSIC_FIXTURE, "{")
+
+    with pytest.raises(beads.ForensicParseError, match="malformed forensic checkpoint manifest"):
+        beads.read_events(mirror, "manifest-repo", window_days=3650, timeout=60)
+
+
+def test_a_present_but_unreadable_forensic_log_is_an_error(tmp_path):
+    mirror = _mirror_with_forensic(tmp_path)
+    blob = subprocess.run(
+        ["git", "-C", mirror, "rev-parse", f"HEAD:{beads.FORENSIC_PATH}"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    object_path = Path(mirror) / ".git" / "objects" / blob[:2] / blob[2:]
+    unreadable_path = object_path.with_suffix(".unreadable")
+    object_path.rename(unreadable_path)
+
+    try:
+        with pytest.raises(gitscan.GitError, match=r"git .* show .* failed"):
+            beads.read_events(mirror, "broken-repo", window_days=90, timeout=60)
+    finally:
+        unreadable_path.rename(object_path)
+
+
+def test_a_git_tree_at_the_forensic_path_is_not_treated_as_missing(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    forensic_path = tmp_path / ".beads" / "checkpoint" / "forensic.jsonl"
+    forensic_path.mkdir(parents=True)
+    (forensic_path / "child").write_text("not a forensic file\n")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "commit.gpgsign=false",
+         "add", ".beads/checkpoint/forensic.jsonl/child"],
+        check=True, env=env,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "commit.gpgsign=false",
+         "commit", "-q", "--no-verify", "-m", "tree"],
+        check=True, env=env,
+    )
+
+    with pytest.raises(beads.ForensicParseError, match="not a regular Git blob"):
+        beads.read_events(
+            str(tmp_path), "tree-repo", window_days=90, timeout=60
+        )
+
+
+def test_unicode_line_separators_inside_json_strings_are_data():
+    text = json.dumps(
+        _event(1, "gitact-0000000", "created", "system", EARLY,
+               {"title": "before\u2028after"}),
+        ensure_ascii=False,
+    )
+
+    assert len(beads.parse_events(
+        text, "fixture-repo", datetime(1999, 1, 1, tzinfo=timezone.utc)
+    )) == 1
+
+
+def test_malformed_json_fails_the_whole_repository():
+    with pytest.raises(beads.ForensicParseError, match="malformed forensic JSON at line 7"):
+        beads.parse_events(
+            FORENSIC_FIXTURE + "not-json\n", "fixture-repo",
+            datetime.fromisoformat(EARLY),
+        )
+
+
+def test_a_truncated_final_record_fails_the_whole_repository():
+    with pytest.raises(beads.ForensicParseError, match="malformed forensic JSON at line 7"):
+        beads.parse_events(
+            TRUNCATED_FIXTURE, "fixture-repo", datetime.fromisoformat(EARLY)
+        )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "NaN",
+        "[]",
+        "null",
+        "{}",
+        '{"record_type":"issue"}',
+        '{"record_type":"evnet","event":{}}',
+        '{"record_type":"event","event":[]}',
+    ],
+)
+def test_a_malformed_record_fails_the_repository(record):
+    with pytest.raises(beads.ForensicParseError, match="line 1"):
+        beads.parse_events(
+            record, "fixture-repo", datetime.fromisoformat(EARLY)
+        )
+
+
+@pytest.mark.parametrize(
+    "record_type",
+    [
+        "issue",
+        "attempt_outcome",
+        "provenance_receipt",
+        "redaction_finding",
+        "redaction_acknowledgment",
+        "redaction_receipt",
+        "redaction_epoch",
+        "redaction_tombstone",
+    ],
+)
+def test_recognized_non_event_records_are_validated_and_ignored(record_type):
+    text = json.dumps({
+        "record_type": record_type,
+        record_type: {"id": "fixture"},
+    })
+
+    assert beads.parse_events(
+        text, "fixture-repo", datetime.fromisoformat(EARLY)
+    ) == []
+
+
+@pytest.mark.parametrize("detail", [None, [], "metadata", 1, True])
+def test_event_detail_accepts_any_json_value(detail):
+    text = json.dumps(
+        _event(1, "gitact-0000000", "updated", "system", EARLY, detail)
+    )
+
+    assert len(beads.parse_events(
+        text, "fixture-repo", datetime(1999, 1, 1, tzinfo=timezone.utc)
+    )) == 1
+
+
+def test_decimal_unix_second_timestamp_is_interpreted_as_utc():
+    timestamp = int(datetime(2026, 9, 6, 5, 0, tzinfo=timezone.utc).timestamp())
+    text = json.dumps(
+        _event(1, "gitact-0000000", "created", "system", str(timestamp), {})
+    )
+
+    events = beads.parse_events(
+        text, "fixture-repo", datetime.fromisoformat(EARLY)
+    )
+
+    assert events[0]["ts"] == timestamp
+
+
+def test_wrong_typed_stated_resulting_status_is_malformed():
+    text = json.dumps(
+        _event(1, "gitact-0000000", "claimed", "system", EARLY,
+               {"resulting_base_status": 0})
+    )
+
+    with pytest.raises(beads.ForensicParseError, match="invalid resulting_base_status"):
+        beads.parse_events(
+            text, "fixture-repo", datetime(1999, 1, 1, tzinfo=timezone.utc)
+        )
+
+
+def test_duplicate_event_identity_fails_even_outside_the_window():
+    duplicate = json.dumps(
+        _event(1, "gitact-65c81e6f", "created", "system", EARLY, {})
+    )
+    with pytest.raises(beads.ForensicParseError, match="duplicate forensic event identity"):
+        beads.parse_events(
+            duplicate + "\n" + duplicate, "fixture-repo",
+            datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
+
+
 def test_five_fixture_events_round_trip_with_every_column(tmp_path):
     # The acceptance case: the fixture goes forensic log -> events -> rows ->
     # Parquet -> read back, and every documented column survives.
     mirror = _mirror_with_forensic(tmp_path)
     events = beads.read_events(mirror, "fixture-repo", window_days=3650, timeout=60)
-    assert len(events) == 5, "the issue snapshot and the truncated line are not events"
+    assert len(events) == 5, "the issue snapshot is not an event"
 
     table = parquet_io.table_to_parquet_bytes(
         aggregate.bead_event_rows(events, {}), parquet_io.BEAD_EVENTS_SCHEMA)
@@ -182,19 +415,15 @@ def test_events_before_the_window_are_dropped():
     assert [e["kind"] for e in out] == ["closed", "released", "reopened"]
 
 
-def test_state_records_and_malformed_lines_are_skipped_not_fatal():
+def test_state_records_are_ignored_but_event_records_are_validated():
     assert len(_parse()) == 5
 
 
-def test_an_event_without_a_time_is_counted_as_malformed(caplog):
-    caplog.set_level("WARNING")
+def test_an_event_without_a_time_is_malformed():
     timeless = json.dumps(_event(9, "gitact-0000000", "updated", "system", None, {}))
-    good = json.dumps(_event(1, "gitact-65c81e6f", "created", "system", EARLY, {}))
 
-    out = beads.parse_events(
-        timeless + "\n" + good, "fixture-repo",
-        datetime(1999, 1, 1, tzinfo=timezone.utc),
-    )
-
-    assert [e["kind"] for e in out] == ["created"]
-    assert any("malformed" in r.getMessage() for r in caplog.records)
+    with pytest.raises(beads.ForensicParseError, match="invalid time"):
+        beads.parse_events(
+            timeless, "fixture-repo",
+            datetime(1999, 1, 1, tzinfo=timezone.utc),
+        )

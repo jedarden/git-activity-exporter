@@ -23,7 +23,7 @@ everything else has a default.
 | `FAMILIES_FILE` | `families.yaml` | repo → family map; a relative path resolves against the process working directory — [The families file](#the-families-file) |
 | `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
 | `POLL_INTERVAL_SECONDS` | `3600` | sleep from one cycle attempt's end to the next cycle's start — [Poll-cycle lifecycle](#poll-cycle-lifecycle) |
-| `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
+| `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `ls-tree`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
 | `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API call (repo enumeration only) |
 | `HEALTH_PORT` | `8080` | port for the [health endpoints](#health-endpoints) |
 | `LOG_LEVEL` | `INFO` | |

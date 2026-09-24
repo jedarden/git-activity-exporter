@@ -114,9 +114,11 @@ calendar-day calculation. Offset-bearing timestamps are normalized to UTC
 before comparison, so equivalent instants written with different offsets are
 one observation. A daylight-saving transition therefore does not make a
 reporting day 23 or 25 hours long. Bead timestamps are compared as
-timezone-aware instants before publication reduces them to seconds (a
- timestamp without an offset is malformed and skipped); published event
- timestamps remain second-grained.
+timezone-aware instants before publication reduces them to seconds. Producer
+timestamps may be offset-bearing ISO 8601 or a decimal Unix-second string;
+the latter is interpreted as UTC. An ISO 8601 timestamp without an offset is
+malformed and fails its repository. Published event timestamps remain
+second-grained.
 Commit rows use the Git author timestamp from `%at` and are filtered in Python
 against the same interval, so the published timestamp and the boundary test
 use the same clock.
@@ -125,7 +127,7 @@ use the same clock.
 
 Specified here because every one of these used to be an accident of
 implementation. `GIT_TIMEOUT_SECONDS` (default 600) bounds each git
-invocation individually — clone, fetch, `log`, `show` — not a cycle.
+invocation individually — clone, fetch, `log`, `ls-tree`, `show` — not a cycle.
 
 **A timed-out fetch keeps the mirror and serves it stale.** The repo still
 appears in the cycle, scanned from the previous cycle's copy, and is listed
@@ -149,15 +151,57 @@ trade.
 **A timed-out or failed clone excludes the repo from the cycle.** It is
 listed in `repos_failed` with the reason in `repo_errors`, and the partial
 `<name>.git.tmp` pack is removed from `CLONE_ROOT` rather than left to
-accumulate. Clone, fetch, `log` and `show` share the one bound; there is no
-separate cold-clone timeout.
+accumulate. Clone, fetch, `log`, `ls-tree` and `show` share the one bound;
+there is no separate cold-clone timeout.
 
-**A timed-out or failed `log`/`show` also excludes the repo.** A timeout while
-extracting commits or reading the forensic log cannot establish complete
-coverage, so the repo is not partially published. Its existing mirror is
-kept, and the repo is listed in `repos_failed`/`repo_errors`; a later cycle
-tries again. A missing `.beads/checkpoint/forensic.jsonl` is not a failure —
-that file is optional and produces an empty bead-event result.
+**A timed-out or failed `log` also excludes the repo.** A timeout while
+extracting commits cannot establish complete coverage, so the repo is not
+partially published. Its existing mirror is kept, and the repo is listed in
+`repos_failed`/`repo_errors`; a later cycle tries again.
+
+**A missing forensic path is an empty success, but a present file is
+all-or-nothing.** The exact `.beads/checkpoint/forensic.jsonl` path is first
+looked up in the mirror's `HEAD` tree. Only a successful lookup with no entry
+means the optional file is absent and produces an empty bead-event result. The
+entry must be a regular Git blob; a tree, submodule, or symlink at the path is
+a malformed file, not an absent one. A failed lookup, or a failure while
+reading a path the lookup found, excludes the repo rather than disguising an
+unreadable file as no bead data.
+
+A present forensic file is validated as a whole before the reporting-window
+filter is applied. Records are separated by LF, so Unicode line-separator
+characters inside JSON strings remain data. Blank lines and recognized
+non-event records (`issue`, `attempt_outcome`, `provenance_receipt`, and the
+`redaction_finding`, `redaction_acknowledgment`, `redaction_receipt`,
+`redaction_epoch`, and `redaction_tombstone` objects) are ignored; a known
+non-event record without its object payload, or an unknown `record_type`, is
+malformed. Event `detail` may be any JSON value; when it is an object, a
+non-null `resulting_base_status` must be a string. Any nonblank line that is
+not valid JSON, any non-object event record, any missing or invalid
+workspace/sequence, kind, or timestamp, any wrong-typed issue or actor, and any
+repeated `(origin_store_uuid, origin_event_sequence)` pair fails the repo.
+Sequence numbers must be non-negative integers. A torn final record is
+therefore a malformed file, and a valid prefix is never published. Integrity
+is checked for events outside the window too, so an old duplicate cannot hide
+from the current cycle.
+
+When `.beads/checkpoint/current.json` is present beside the forensic log, the
+exporter also requires its `total_record_count` to equal the number of
+nonblank forensic records and its `active_root.sha256` to equal the SHA-256 of
+the complete forensic bytes. This detects truncation exactly between two
+complete JSONL records as well as same-count replacement or reordering. A
+present but malformed, non-regular, or unreadable manifest fails the repo. For
+older repositories with no manifest, boundary truncation remains
+indistinguishable from a shorter complete file and cannot be detected.
+
+A forensic integrity or read failure drops both the repo's Git rows and its
+bead rows. It is absent from `repos_scanned`, appears in `repos_failed` with
+the reason in `repo_errors`, and does not increment
+`repos_with_bead_data`; `bead_epoch_utc`, `attribution_epoch`, and
+`bulk_bead_cells` are derived only from retained repos. These failures use the
+normal cycle-wide publish guard below: at or below `MAX_FAILURE_RATE` a new
+`meta.json` records the gap, and above it the cycle is withheld and the
+previous `meta.json` remains live.
 
 **An incomplete shallow boundary is a coverage warning, not a scan failure.**
 After either a successful bounded deepen or a stale fetch, the collector checks
@@ -180,8 +224,8 @@ by a 1,580-cell one.
 **Persistent failure has no in-cycle retry or circuit breaker.** The next poll
 is the retry, and there is no memory of past cycles across an exporter restart,
 deliberately: per-cycle truth is what `meta.json` can honestly state. A repo
-whose clone or `log`/`show` keeps failing appears in
-`repos_failed`/`repo_errors` of every cycle that publishes; a repo whose fetch
+whose clone, `log`, forensic lookup, or forensic `show` keeps failing appears
+in `repos_failed`/`repo_errors` of every cycle that publishes; a repo whose fetch
 keeps timing out appears in `repos_stale` instead. Comparing successive
 `meta.json` objects exposes either form of persistence without silently
 discarding the last usable mirror.
@@ -259,7 +303,8 @@ failure is logged and left for the next cycle.
 ## Beads — epoch-bounded, two-thirds coverage
 
 `.beads/checkpoint/forensic.jsonl`, read straight out of the bare mirror with
-`git show HEAD:<path>`. It is git-tracked, so it needs no second data source
+`git show HEAD:<path>`, plus `.beads/checkpoint/current.json` when that
+manifest is present. Both are git-tracked, so this needs no second data source
 and no access to any host's live SQLite store.
 
 Three limits the panel must respect:

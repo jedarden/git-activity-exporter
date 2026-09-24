@@ -304,9 +304,15 @@ def test_prune_missing_root_is_a_noop(tmp_path):
 
 
 def test_show_timeout_uses_git_timeout_semantics(monkeypatch):
-    def boom(args, **kwargs):
+    def fake_run(args, **kwargs):
+        if "ls-tree" in args:
+            return subprocess.CompletedProcess(
+                args, 0,
+                stdout=f"100644 blob deadbeef\t{beads.FORENSIC_PATH}\0",
+                stderr="",
+            )
         raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs["timeout"])
 
-    monkeypatch.setattr(beads.subprocess, "run", boom)
-    with pytest.raises(gitscan.GitTimeout, match=r"git show timed out after 17s"):
+    monkeypatch.setattr(gitscan.subprocess, "run", fake_run)
+    with pytest.raises(gitscan.GitTimeout, match=r"git .* show .* timed out after 17s"):
         beads.read_events("/data/mirrors/x.git", "x", 90, 17)

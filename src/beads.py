@@ -23,18 +23,26 @@ THREE PROPERTIES OF THIS DATA THAT THE CHARTS MUST RESPECT.
    instant are not back-filled from a claim: a release and re-claim can change
    the actor. Join semantics live in docs/notes/output-schema.md.
 """
+import hashlib
 import json
-import logging
-import subprocess
 from datetime import datetime, timezone
 from typing import Optional
 
 from . import gitscan
 from .window import ReportingWindow, as_utc
 
-log = logging.getLogger(__name__)
-
 FORENSIC_PATH = ".beads/checkpoint/forensic.jsonl"
+CURRENT_PATH = ".beads/checkpoint/current.json"
+NON_EVENT_RECORD_FIELDS = {
+    "issue": "issue",
+    "attempt_outcome": "attempt_outcome",
+    "provenance_receipt": "provenance_receipt",
+    "redaction_finding": "redaction_finding",
+    "redaction_acknowledgment": "redaction_acknowledgment",
+    "redaction_receipt": "redaction_receipt",
+    "redaction_epoch": "redaction_epoch",
+    "redaction_tombstone": "redaction_tombstone",
+}
 
 # The kinds the (repo, hour) rollup counts. bead_events.parquet is at event
 # grain and carries every kind the forensic log records; this filter pins the
@@ -64,6 +72,71 @@ def attribution_epochs(events):
     return epochs
 
 
+class ForensicParseError(ValueError):
+    pass
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"invalid JSON constant {value}")
+
+
+def _read_head_blob(mirror_path: str, path: str, timeout: int) -> Optional[str]:
+    tree = gitscan._run(
+        ["git", "-C", mirror_path, "ls-tree", "-z", "HEAD", "--", path], timeout
+    )
+    if not tree:
+        return None
+
+    metadata, separator, _ = tree.rstrip("\0").partition("\t")
+    fields = metadata.split()
+    if (
+        not separator
+        or len(fields) != 3
+        or fields[1] != "blob"
+        or fields[0] not in {"100644", "100755"}
+    ):
+        raise ForensicParseError(f"checkpoint path {path} is not a regular Git blob")
+
+    return gitscan._run(
+        ["git", "-C", mirror_path, "show", f"HEAD:{path}"], timeout
+    )
+
+
+def _validate_forensic_manifest(text: str, manifest_text: str, repo_name: str) -> None:
+    try:
+        manifest = json.loads(manifest_text, parse_constant=_reject_json_constant)
+    except ValueError as error:
+        raise ForensicParseError(
+            f"{repo_name}: malformed forensic checkpoint manifest"
+        ) from error
+    if not isinstance(manifest, dict):
+        raise ForensicParseError(
+            f"{repo_name}: forensic checkpoint manifest is not an object"
+        )
+
+    active_root = manifest.get("active_root")
+    total_records = manifest.get("total_record_count")
+    if not isinstance(active_root, dict) or not isinstance(active_root.get("sha256"), str):
+        raise ForensicParseError(
+            f"{repo_name}: forensic checkpoint manifest has invalid active_root"
+        )
+    if isinstance(total_records, bool) or not isinstance(total_records, int):
+        raise ForensicParseError(
+            f"{repo_name}: forensic checkpoint manifest has invalid total_record_count"
+        )
+
+    actual_records = sum(1 for line in text.split("\n") if line.strip())
+    if actual_records != total_records:
+        raise ForensicParseError(
+            f"{repo_name}: forensic record count does not match checkpoint manifest"
+        )
+    actual_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if actual_sha256 != active_root["sha256"]:
+        raise ForensicParseError(
+            f"{repo_name}: forensic checksum does not match checkpoint manifest"
+        )
+
+
 def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int,
                 reporting_window: Optional[ReportingWindow] = None):
     """Bead events in the window, or [] if this repo has no forensic log.
@@ -80,21 +153,23 @@ def read_events(mirror_path: str, repo_name: str, window_days: int, timeout: int
         reporting_window = ReportingWindow.from_anchor(
             datetime.now(timezone.utc), window_days
         )
-    args = ["git", "-C", mirror_path, "show", f"HEAD:{FORENSIC_PATH}"]
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Keep every git invocation on the same typed timeout path. A missing
-        # forensic file is normal and remains a successful empty result below;
-        # a timed-out show is different because we cannot tell whether the
-        # file was read completely, so the caller excludes the repo.
-        raise gitscan.GitTimeout(f"git show timed out after {timeout}s")
-    if proc.returncode != 0:
+    text = _read_head_blob(mirror_path, FORENSIC_PATH, timeout)
+    if text is None:
         return []
 
+    manifest_text = _read_head_blob(mirror_path, CURRENT_PATH, timeout)
+    if manifest_text is not None:
+        _validate_forensic_manifest(text, manifest_text, repo_name)
+
     return parse_events(
-        proc.stdout, repo_name, reporting_window.start, window_end=reporting_window.end
+        text, repo_name, reporting_window.start, window_end=reporting_window.end
     )
+
+
+def _event_timestamp(raw_time: str) -> datetime:
+    if raw_time.isascii() and raw_time.isdecimal():
+        return datetime.fromtimestamp(int(raw_time), timezone.utc)
+    return datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
 
 
 def parse_events(text: str, repo_name: str, cutoff: datetime,
@@ -114,46 +189,112 @@ def parse_events(text: str, repo_name: str, cutoff: datetime,
         )
         reporting_window = ReportingWindow(start, end)
 
-    events, malformed = [], 0
-    for line in text.splitlines():
+    events = []
+    seen = set()
+    for line_number, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            malformed += 1
+            record = json.loads(line, parse_constant=_reject_json_constant)
+        except ValueError as error:
+            raise ForensicParseError(
+                f"{repo_name}: malformed forensic JSON at line {line_number}"
+            ) from error
+        if not isinstance(record, dict):
+            raise ForensicParseError(
+                f"{repo_name}: forensic record at line {line_number} is not an object"
+            )
+        record_type = record.get("record_type")
+        if not isinstance(record_type, str) or not record_type:
+            raise ForensicParseError(
+                f"{repo_name}: forensic record at line {line_number} has invalid record_type"
+            )
+        if record_type != "event":
+            field = NON_EVENT_RECORD_FIELDS.get(record_type)
+            if field is None or not isinstance(record.get(field), dict):
+                raise ForensicParseError(
+                    f"{repo_name}: forensic record at line {line_number} has invalid or unsupported record_type"
+                )
             continue
-        if record.get("record_type") != "event":
-            continue  # issue snapshots are state, not an event to publish
-        e = record.get("event") or {}
-        kind = e.get("kind")
-        raw_time = e.get("time")
-        if not kind or not raw_time or not isinstance(raw_time, str):
-            malformed += 1
-            continue
+
+        event = record.get("event")
+        if not isinstance(event, dict):
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} is not an object"
+            )
+
+        workspace = event.get("origin_store_uuid")
+        sequence = event.get("origin_event_sequence")
+        issue_id = event.get("issue_id")
+        kind = event.get("kind")
+        raw_time = event.get("time")
+        actor = event.get("actor")
+        detail = event.get("detail")
+
+        if not isinstance(workspace, str) or not workspace:
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid origin_store_uuid"
+            )
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid origin_event_sequence"
+            )
+        if issue_id is not None and not isinstance(issue_id, str):
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid issue_id"
+            )
+        if not isinstance(kind, str) or not kind:
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid kind"
+            )
+        if not isinstance(raw_time, str) or not raw_time:
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid time"
+            )
+        if actor is not None and not isinstance(actor, str):
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid actor"
+            )
+        stated_status = detail.get("resulting_base_status") if isinstance(detail, dict) else None
+        if stated_status is not None and not isinstance(stated_status, str):
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid resulting_base_status"
+            )
+
+        identity = (workspace, sequence)
+        if identity in seen:
+            raise ForensicParseError(
+                f"{repo_name}: duplicate forensic event identity at line {line_number}"
+            )
+        seen.add(identity)
+
         try:
-            ts = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-            if not reporting_window.contains(ts):
-                continue
-        except (TypeError, ValueError):
-            malformed += 1
+            ts = _event_timestamp(raw_time)
+        except (OSError, OverflowError, ValueError) as error:
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid time"
+            ) from error
+        resulting_status = _resulting_status(kind, detail)
+
+        try:
+            in_window = reporting_window.contains(ts)
+        except (TypeError, ValueError) as error:
+            raise ForensicParseError(
+                f"{repo_name}: forensic event at line {line_number} has invalid time"
+            ) from error
+        if not in_window:
             continue
+
         events.append({
             "repo": repo_name,
             "ts": int(ts.timestamp()),
-            # Identity of the workspace the event happened in. The forensic
-            # log's own field is origin_store_uuid; a bead id is only unique
-            # inside one workspace, so this is what makes issue_id joinable
-            # when two workspaces could ever share a prefix.
-            "workspace_uuid": e.get("origin_store_uuid"),
-            "issue_id": e.get("issue_id"),
+            "workspace_uuid": workspace,
+            "issue_id": issue_id,
             "kind": kind,
-            "actor": e.get("actor"),
-            "resulting_status": _resulting_status(kind, e.get("detail")),
+            "actor": actor,
+            "resulting_status": resulting_status,
         })
 
-    if malformed:
-        log.warning("%s: skipped %d malformed forensic record(s)", repo_name, malformed)
     return events
 
 

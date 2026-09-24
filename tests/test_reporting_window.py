@@ -12,11 +12,12 @@ from src.window import ReportingWindow
 UTC = timezone.utc
 
 
-def _event(issue, timestamp):
+def _event(issue, timestamp, sequence):
     return json.dumps({
         "record_type": "event",
         "event": {
             "origin_store_uuid": "workspace",
+            "origin_event_sequence": sequence,
             "issue_id": issue,
             "kind": "closed",
             "time": timestamp,
@@ -50,9 +51,9 @@ def test_offset_timestamps_are_compared_as_utc_instants():
         datetime(2026, 9, 6, 5, 0, tzinfo=UTC), 1
     )
     text = "\n".join([
-        _event("before", "2026-09-05T06:59:59+02:00"),
-        _event("start", "2026-09-05T05:00:00Z"),
-        _event("end", "2026-09-06T07:00:00+02:00"),
+        _event("before", "2026-09-05T06:59:59+02:00", 1),
+        _event("start", "2026-09-05T05:00:00Z", 2),
+        _event("end", "2026-09-06T07:00:00+02:00", 3),
     ])
 
     events = beads.parse_events(text, "repo", window)
@@ -68,8 +69,8 @@ def test_dst_window_is_elapsed_utc_not_local_calendar_time():
     assert window.start == datetime(2026, 3, 7, 7, 30, tzinfo=UTC)
     assert window.end == datetime(2026, 3, 8, 7, 30, tzinfo=UTC)
     text = "\n".join([
-        _event("start", "2026-03-07T02:30:00-05:00"),
-        _event("end", "2026-03-08T03:30:00-04:00"),
+        _event("start", "2026-03-07T02:30:00-05:00", 1),
+        _event("end", "2026-03-08T03:30:00-04:00", 2),
     ])
 
     events = beads.parse_events(text, "repo", window)
@@ -81,9 +82,9 @@ def test_current_partial_hour_is_included_but_events_at_cycle_end_are_not():
     anchor = datetime(2026, 9, 6, 5, 17, 42, 500000, tzinfo=UTC)
     window = ReportingWindow.from_anchor(anchor, 1)
     text = "\n".join([
-        _event("partial-hour", "2026-09-06T05:00:00Z"),
-        _event("before-end", "2026-09-06T05:17:42.499999Z"),
-        _event("at-end", "2026-09-06T05:17:42.500000Z"),
+        _event("partial-hour", "2026-09-06T05:00:00Z", 1),
+        _event("before-end", "2026-09-06T05:17:42.499999Z", 2),
+        _event("at-end", "2026-09-06T05:17:42.500000Z", 3),
     ])
 
     events = beads.parse_events(text, "repo", window)
@@ -154,13 +155,13 @@ def test_git_filters_author_time_when_committer_time_differs(tmp_path):
     assert {commit["subject"] for commit in scanned} == {"start", "mismatch"}
 
 
-def test_naive_event_timestamps_are_malformed_rather_than_ambiguous():
+def test_naive_event_timestamps_fail_rather_than_being_ambiguous():
     window = ReportingWindow.from_anchor(
         datetime(2026, 9, 6, 5, 0, tzinfo=UTC), 1
     )
-    events = beads.parse_events(_event("naive", "2026-09-05T05:00:00"), "repo", window)
 
-    assert events == []
+    with pytest.raises(beads.ForensicParseError, match="invalid time"):
+        beads.parse_events(_event("naive", "2026-09-05T05:00:00", 1), "repo", window)
 
 
 def test_cycle_window_is_shared_by_git_and_bead_reads(monkeypatch, tmp_path):
