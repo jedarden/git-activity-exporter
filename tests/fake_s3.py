@@ -50,11 +50,12 @@ class FakeS3:
         self._gate("delete", Key)
         self.objects.pop(Key, None)
 
-    def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None):
+    def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None,
+                        MaxKeys=1000):
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
         if ContinuationToken:
             keys = [k for k in keys if k > ContinuationToken]
-        page = keys[:1000]
+        page = keys[:MaxKeys]
         resp = {}
         if Delimiter:
             prefixes = sorted({
@@ -64,6 +65,6 @@ class FakeS3:
                 resp["CommonPrefixes"] = [{"Prefix": p} for p in prefixes]
         else:
             resp["Contents"] = [{"Key": k} for k in page]
-        if len(keys) > 1000:
+        if len(keys) > len(page):
             resp["NextContinuationToken"] = page[-1]
         return resp

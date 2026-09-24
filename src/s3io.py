@@ -50,6 +50,12 @@ def delete_key(s3, bucket: str, key: str):
     s3.delete_object(Bucket=bucket, Key=key)
 
 
+def prefix_exists(s3, bucket: str, prefix: str) -> bool:
+    """Whether any object exists below prefix."""
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    return bool(resp.get("Contents"))
+
+
 def list_prefixes(s3, bucket: str, prefix: str) -> list:
     """The immediate child "directories" of prefix, as full prefixes.
 

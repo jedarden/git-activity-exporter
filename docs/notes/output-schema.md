@@ -26,10 +26,13 @@ commit:
    A Parquet or `meta.json` generation failure raises with nothing
    uploaded; the previous cycle stays live everywhere.
 2. **Stage.** The payloads are uploaded to `cycles/<cycle_id>/`, a prefix no
-   consumer reads until it is pointed at. A staged cycle's objects are
-   **immutable**: they are written once, before the commit, and never
-   rewritten. An upload failure here aborts with the previous cycle still
-   live; the orphaned prefix is swept by a later cycle's prune.
+   consumer reads until it is pointed at. Before the first upload the
+   publisher checks that this prefix is empty; an existing prefix is a
+   `cycle_id` collision and the publication fails without changing the
+   committed or fixed-key dataset. A staged cycle's objects are **immutable**:
+   they are written once, before the commit, and never rewritten. An upload
+   failure here aborts with the previous cycle still live; the orphaned
+   prefix is swept by a later cycle's prune.
 3. **Mirror.** The staged payloads are copied to the fixed keys at the
    prefix root — `hourly.parquet`, `commits.parquet`, `bead_events.parquet`,
    then `meta.json` **last** — for consumers that predate the pointer. A
@@ -43,7 +46,8 @@ commit:
    and the cycle fails with the previous cycle still committed.
 5. **Prune.** The committed cycle and the newest two others are kept
    (three cycles ≈ three poll intervals of grace for a reader that resolved
-   the previous pointer); older prefixes are deleted, best-effort.
+   the previous pointer); older prefixes are deleted, best-effort. "Newest"
+   means the cycle ID order defined below, not S3 modification time.
 
 **Consumers should read pointer-first:** GET `current.json`, then the
 objects its `objects` mapping names, resolving keys against the prefix the
@@ -62,6 +66,43 @@ crossed a publication boundary. The pointer is the migration target.
 
 Publication is single-writer by deployment: one exporter replica owns the
 prefix.
+
+### Cycle identity and retention ordering
+
+`generated_at` is captured once at the start of a cycle and is the cycle's
+only clock value. It is a real UTC calendar timestamp in the exact form
+`YYYY-MM-DDTHH:MM:SSZ`, with one-second precision and an explicit `Z`. A
+cycle ID has the exact grammar:
+
+```text
+<YYYYMMDDTHHMMSSZ>-<8 lowercase hexadecimal characters>
+```
+
+The first component is the `generated_at` value with `-` and `:` removed, not
+an S3 timestamp and not the publication landing time. For example,
+`2026-09-06T05:00:00Z` produces a prefix of `20260906T050000Z`. The second
+component is the first eight hexadecimal characters of a UUID4 value: 32
+random bits. IDs with different `generated_at` values therefore cannot
+collide; IDs in the same second are distinct probabilistically, not by an
+absolute guarantee.
+
+The publisher treats any existing object below `cycles/<cycle_id>/` as a
+collision. It raises a publication error before the first payload, fixed-key,
+or pointer PUT; it never overwrites or reuses that prefix. The failed attempt
+leaves the previous pointer and fixed keys intact, and the next poll mints a
+new ID. The single-writer deployment rule makes the existence check and the
+subsequent writes a serialized operation; another writer is not supported.
+
+Retention lists immediate children below `cycles/`, accepts only IDs matching
+the grammar above (and a real calendar timestamp), and sorts the valid IDs
+lexicographically in descending order. Because the timestamp component is
+fixed-width, that is newest `generated_at` first. Within one second the
+suffix is a deterministic lexical tie-break, not evidence of collection order.
+Malformed or foreign children are ignored and left untouched. The committed
+ID is removed from the candidate list and retained explicitly; the remaining
+`RETAINED_CYCLES - 1` highest valid IDs are the grace set. Thus "newest" is
+defined by embedded `generated_at` order, while the pointer's cycle is always
+protected even if the clock moves backward or retention is reduced.
 
 Column types are the Parquet types as written. "Null when" describes the
 values actually seen; nothing in this file is a `NaN` or a sentinel string.
@@ -209,7 +250,7 @@ change type, or lose one of the relations in the table without failing CI.
 | Field | Type | Null when | Notes |
 |---|---|---|---|
 | `version` | string | never | The exporter's own version (`VERSION_FILE`), `"unknown"` if unreadable. Identifies the writer, not the document format. |
-| `cycle_id` | string | never | `generated_at` compacted (`2026-09-06T05:00:00Z` → `20260906T050000Z`) plus a short random suffix; identical to `current.json`'s `cycle_id`, and lexicographic order is cycle order. |
+| `cycle_id` | string | never | Exact `generated_at` compacted (`2026-09-06T05:00:00Z` → `20260906T050000Z`) plus eight lowercase hexadecimal characters from UUID4. It is identical to `current.json`'s `cycle_id`; the timestamp portion orders retention, with the suffix only breaking same-second ties. |
 | `generated_at` | string | never | RFC 3339 UTC with an explicit `Z`. When collection *began* — it can trail the pointer's landing by up to `cycle_seconds`. |
 | `window_days` | int | never | The window every Parquet file of the same cycle was cut to. |
 | `repos_total` | int | never | Repos enumerated this cycle: denylist applied, forge-empty repos already dropped. |
@@ -287,9 +328,10 @@ coverage changes.
   of an error string.
 - **The example's values are illustrative.** What is contracted is the key
   set, the types, and the relations in the table — coverage arithmetic,
-  failed/stale disjointness, `repo_errors` keys = `repos_failed`,
-  `cycle_id` naming `generated_at`. All of it is enforced on fixtures and
-  on the builder's real output by `tests/test_meta_schema.py`.
+  failed/stale disjointness, `repo_errors` keys = `repos_failed`, and
+  `cycle_id` naming `generated_at` with the exact eight-hex grammar. All of it
+  is enforced on fixtures and on the builder's real output by
+  `tests/test_meta_schema.py`.
 
 ## Join keys
 

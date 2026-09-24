@@ -47,7 +47,9 @@ Single-writer by deployment: one exporter replica publishes this prefix.
 """
 import json
 import logging
+import re
 import uuid
+from datetime import datetime
 
 from . import s3io
 
@@ -56,6 +58,11 @@ log = logging.getLogger(__name__)
 #: The pointer object, relative to the destination prefix. One atomic PUT of
 #: this file is the protocol's commit point.
 POINTER_NAME = "current.json"
+
+_GENERATED_AT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_CYCLE_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
+_GENERATED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_CYCLE_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 #: Pointer document shape; bump when the schema changes.
 POINTER_SCHEMA_VERSION = 1
@@ -72,14 +79,55 @@ class PublicationError(RuntimeError):
     """A cycle could not be published; the previous cycle remains live."""
 
 
-def new_cycle_id(generated_at: str) -> str:
-    """Sortable id from the cycle's generated_at plus a short unique suffix.
+def _validate_generated_at(generated_at: str) -> None:
+    if not isinstance(generated_at, str) or not _GENERATED_AT_RE.fullmatch(generated_at):
+        raise PublicationError("generated_at must be YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        parsed = datetime.strptime(generated_at, _GENERATED_AT_FORMAT)
+    except ValueError as e:
+        raise PublicationError("generated_at must be a valid UTC calendar timestamp") from e
+    if parsed.isoformat(timespec="seconds") + "Z" != generated_at:
+        raise PublicationError("generated_at must be a valid UTC calendar timestamp")
 
-    The fixed-width timestamp prefix is what makes the prune's lexicographic
-    sort a recency order; the suffix keeps two cycles in the same second
-    distinct.
-    """
-    stamp = generated_at.replace("-", "").replace(":", "")
+
+def _compact_generated_at(generated_at: str) -> str:
+    _validate_generated_at(generated_at)
+    return generated_at.replace("-", "").replace(":", "")
+
+
+def _validate_cycle_stamp(stamp: str) -> None:
+    try:
+        parsed = datetime.strptime(stamp, _CYCLE_STAMP_FORMAT)
+    except ValueError as e:
+        raise PublicationError("cycle_id must contain a valid UTC calendar timestamp") from e
+    if parsed.isoformat(timespec="seconds").replace("-", "").replace(":", "") + "Z" != stamp:
+        raise PublicationError("cycle_id must contain a valid UTC calendar timestamp")
+
+
+def validate_cycle_id(cycle_id: str, generated_at: str) -> None:
+    """Validate the ID grammar and its exact generated_at relationship."""
+    expected_stamp = _compact_generated_at(generated_at)
+    if not isinstance(cycle_id, str) or not _CYCLE_ID_RE.fullmatch(cycle_id):
+        raise PublicationError("cycle_id must be <compacted generated_at>-<8 lowercase hex>")
+    stamp = cycle_id.split("-", 1)[0]
+    _validate_cycle_stamp(stamp)
+    if stamp != expected_stamp:
+        raise PublicationError("cycle_id must name the cycle's generated_at")
+
+
+def _is_valid_cycle_id(cycle_id: str) -> bool:
+    if not isinstance(cycle_id, str) or not _CYCLE_ID_RE.fullmatch(cycle_id):
+        return False
+    try:
+        _validate_cycle_stamp(cycle_id.split("-", 1)[0])
+    except PublicationError:
+        return False
+    return True
+
+
+def new_cycle_id(generated_at: str) -> str:
+    """Mint a fixed-width sortable ID for a canonical generated_at value."""
+    stamp = _compact_generated_at(generated_at)
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
 
 
@@ -97,6 +145,7 @@ def _meta_last(payloads):
 
 
 def pointer_bytes(cycle_id: str, generated_at: str, payload_names) -> bytes:
+    validate_cycle_id(cycle_id, generated_at)
     doc = {
         "schema_version": POINTER_SCHEMA_VERSION,
         "cycle_id": cycle_id,
@@ -121,9 +170,19 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
     names = [name for name, _, _ in payloads]
     if len(set(names)) != len(names):
         raise PublicationError(f"duplicate payload names: {names}")
+    validate_cycle_id(cycle_id, generated_at)
 
     pointer_key = f"{prefix}/{POINTER_NAME}"
     base = f"{prefix}/cycles/{cycle_id}/"
+
+    try:
+        collision = s3io.prefix_exists(s3, bucket, base)
+    except Exception as e:
+        raise PublicationError(
+            f"cycle collision check failed for {cycle_id}; previous cycle untouched"
+        ) from e
+    if collision:
+        raise PublicationError(f"cycle_id collision: {cycle_id} already exists")
 
     # Step 2: stage. Nothing below can touch the committed cycle, so a
     # failure here needs no rollback anywhere.
@@ -185,15 +244,22 @@ def _restore_fixed(s3, bucket: str, prefix: str, snapshot: dict):
 
 
 def _prune(s3, bucket: str, prefix: str, keep: str, retention: int):
-    """Delete the oldest cycle prefixes beyond the retention window.
+    """Delete the oldest valid cycle prefixes beyond the retention window.
 
     The pointer's cycle is protected explicitly, not just by sort position:
     an operator-shrunk retention or a clock surprise must not be able to
-    delete the cycle consumers are being pointed at.
+    delete the cycle consumers are being pointed at. Foreign children are
+    ignored rather than being allowed to consume a retention slot.
     """
     base = f"{prefix}/cycles/"
     ids = sorted(
-        (p[len(base):].rstrip("/") for p in s3io.list_prefixes(s3, bucket, base)),
+        (
+            cycle_id
+            for cycle_id in (
+                p[len(base):].rstrip("/") for p in s3io.list_prefixes(s3, bucket, base)
+            )
+            if _is_valid_cycle_id(cycle_id)
+        ),
         reverse=True,
     )
     doomed = [cid for cid in ids if cid != keep][max(0, retention - 1):]

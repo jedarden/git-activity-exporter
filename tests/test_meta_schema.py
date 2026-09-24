@@ -11,6 +11,7 @@ lose one of those guarantees without failing here first.
 import json
 import re
 from collections import namedtuple
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,8 +23,19 @@ OUTPUT_SCHEMA_MD = (
     Path(__file__).resolve().parent.parent / "docs" / "notes" / "output-schema.md"
 )
 
-RFC3339_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-CYCLE_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+RFC3339_Z = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+CYCLE_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+
+
+def _valid_timestamp(value):
+    if not isinstance(value, str) or not RFC3339_Z.fullmatch(value):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return parsed.isoformat(timespec="seconds") + "Z" == value
+
 
 Field = namedtuple("Field", "type nullable")
 
@@ -97,22 +109,21 @@ def validate_meta(meta):
             bad.append(f"{name} is not of contract type {spec.type!r}")
 
     generated_at, cycle_id = meta.get("generated_at"), meta.get("cycle_id")
-    if isinstance(generated_at, str):
-        if not RFC3339_Z.match(generated_at):
-            bad.append("generated_at must be RFC 3339 UTC with an explicit Z")
-        if isinstance(cycle_id, str) and not cycle_id.startswith(
-            generated_at.replace("-", "").replace(":", "")
-        ):
-            bad.append("cycle_id must name the cycle's generated_at")
-    if isinstance(cycle_id, str) and not CYCLE_ID.match(cycle_id):
+    if isinstance(generated_at, str) and not _valid_timestamp(generated_at):
+        bad.append("generated_at must be RFC 3339 UTC with an explicit Z")
+    if isinstance(generated_at, str) and _valid_timestamp(generated_at) \
+            and isinstance(cycle_id, str) \
+            and cycle_id.split("-", 1)[0] != generated_at.replace("-", "").replace(":", ""):
+        bad.append("cycle_id must name the cycle's generated_at")
+    if isinstance(cycle_id, str) and not CYCLE_ID.fullmatch(cycle_id):
         bad.append("cycle_id must be <compacted generated_at>-<8 hex>")
     epoch = meta.get("bead_epoch_utc")
-    if isinstance(epoch, str) and not RFC3339_Z.match(epoch):
+    if isinstance(epoch, str) and not _valid_timestamp(epoch):
         bad.append("bead_epoch_utc must be RFC 3339 UTC with an explicit Z")
     attribution = meta.get("attribution_epoch")
     if isinstance(attribution, dict):
         for repo, value in attribution.items():
-            if not isinstance(value, str) or not RFC3339_Z.match(value):
+            if not _valid_timestamp(value):
                 bad.append(f"attribution_epoch[{repo!r}] must be RFC 3339 UTC with an explicit Z")
 
     total, scanned = meta.get("repos_total"), meta.get("repos_scanned")
@@ -237,6 +248,10 @@ def _invalid_fixtures():
          "repos_failed is null and the field is never null"),
         ("naive generated_at", set_("generated_at", "2026-09-23T15:00:00"),
          "generated_at must be RFC 3339 UTC with an explicit Z"),
+        ("impossible generated_at", set_("generated_at", "2026-02-30T15:00:00Z"),
+         "generated_at must be RFC 3339 UTC with an explicit Z"),
+        ("uppercase cycle suffix", set_("cycle_id", "20260923T150000Z-1A2B3C4D"),
+         "cycle_id must be <compacted generated_at>-<8 hex>"),
         ("naive bead_epoch_utc", set_("bead_epoch_utc", "2026-08-14T16:42:03"),
          "bead_epoch_utc must be RFC 3339 UTC with an explicit Z"),
         ("cycle_id names another cycle", set_("cycle_id", "20260901T000000Z-1a2b3c4d"),

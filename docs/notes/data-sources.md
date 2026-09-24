@@ -186,10 +186,11 @@ table inside its upload, so the same failure had already overwritten
 `hourly.parquet` by the time it fired.
 
 **A staging upload failure leaves the previous cycle committed.** The
-payloads land under `cycles/<cycle_id>/` before anything consumer-visible
-changes; the first failure aborts there. The orphaned prefix is inert —
-nothing points at it — and is swept by the retention prune of a later
-cycle.
+publisher first checks that `cycles/<cycle_id>/` is empty, so an ID collision
+is rejected before any payload, fixed-key, or pointer PUT. Payloads then land
+under that prefix before anything consumer-visible changes; the first upload
+failure aborts there. The orphaned prefix is inert — nothing points at it —
+and is swept by the retention prune of a later cycle.
 
 **A fixed-key mirror or pointer failure rolls the fixed keys back.** The
 fixed keys are snapshotted in memory before they are overwritten; any
@@ -209,12 +210,18 @@ never rewritten — so a consumer reading pointer-then-objects always
 assembles one whole cycle regardless of where a concurrent publication
 has gotten to.
 
-**Pruning is retention-bounded and never fatal.** Three cycle prefixes are
-kept (the committed one plus the two newest), so a consumer that resolved
-the previous pointer has roughly three poll intervals to finish reading.
-Older prefixes are deleted after the commit; a deletion failure is logged
-and left for the next cycle. The committed cycle is protected explicitly,
-so no prune can ever delete the cycle the pointer names.
+**Pruning is retention-bounded and never fatal.** Cycle IDs have the exact
+form `<compacted generated_at>-<8 lowercase hex>`, so the fixed-width timestamp
+prefix makes descending ID order equal to descending `generated_at` order at
+one-second precision. The publisher keeps the committed ID plus the two
+highest remaining valid IDs; the committed ID is removed from the ranking
+and protected explicitly, so a clock surprise or a reduced retention cannot
+delete what `current.json` names. Same-second suffixes provide only a
+deterministic tie-break, and malformed or foreign children under `cycles/`
+are ignored rather than consuming a slot. A consumer that resolved the
+previous pointer therefore has roughly three poll intervals to finish
+reading. Older valid prefixes are deleted after the commit; a deletion
+failure is logged and left for the next cycle.
 
 ## Beads — epoch-bounded, two-thirds coverage
 
