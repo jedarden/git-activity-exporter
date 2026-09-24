@@ -64,8 +64,53 @@ between the mirror's PUTs can still interleave, exactly as it always
 could. `meta.json`'s `cycle_id` vs `current.json`'s tells such a reader it
 crossed a publication boundary. The pointer is the migration target.
 
-Publication is single-writer by deployment: one exporter replica owns the
-prefix.
+## Single-writer deployment rule
+
+Publication is intentionally single-writer by deployment: exactly one
+exporter replica owns `DEST_S3_PREFIX`. The protocol has no S3 lock, lease,
+conditional PUT, or runtime replica assertion. Deployment shape is therefore
+part of the correctness boundary, not merely a capacity choice.
+
+With two publishers, the failure is not just a lost update. None of the
+protocol's operations serializes with another publisher:
+
+- The prefix existence check and staged PUTs are separate operations. If two
+  publishers mint the same `cycle_id`, both can observe an empty prefix and
+  overwrite the same objects, defeating staged immutability.
+- Fixed-key mirror PUTs and best-effort rollback can interleave. The fixed keys
+  can end with payloads from one cycle and metadata from another, or one
+  publisher's rollback can overwrite another publisher's successful commit.
+- A `current.json` PUT is atomic for that object but is not conditional. The
+  last writer wins, so a slower publisher with an older `generated_at` can
+  move the pointer backward.
+- Prune protects only its publisher's `keep` cycle and the grace candidates in
+  its list view. It can delete another publisher's in-flight staged prefix or a
+  committed cycle that a reader just resolved. `current.json` can then name
+  missing or mixed objects, so the pointer-first whole-cycle guarantee no
+  longer holds.
+
+Nothing in the current protocol identifies the owning publisher or detects
+this interleaving, and there is no automatic reconciliation. Treat every
+multi-writer deployment, including two replicas of this same image, as
+unsupported.
+
+**Decision: rely on deployment shape alone.** The reference Deployment in the
+`declarative-config` repository
+(`k8s/ardenone-cluster/git-activity-exporter/deployment.yml`) is pinned to
+`replicas: 1` and carries a manifest comment warning that two pods would fight
+over the RWO PVC and double-write the same objects. That warning is an
+operational prohibition: do not manually scale the Deployment, attach an HPA,
+or run another workload with the same destination bucket and prefix. Its
+`Recreate` strategy prevents overlap during ordinary rollouts but does not
+prevent scale-out; the RWO PVC and the process-local poll loop likewise are not
+S3 writer exclusion. Reusers must preserve the same deployment boundary.
+
+Supporting more than one publisher requires a real ownership protocol, not a
+preflight existence check: unique ownership, conditional acquisition and safe
+takeover, renewal and release, and fencing of publication mutations are needed
+to stop a paused former owner from resuming after another takes over. Until
+that protocol exists, increasing the replica count is forbidden rather than an
+unsupported tuning option.
 
 ### Cycle identity and retention ordering
 
