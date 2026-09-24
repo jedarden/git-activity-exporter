@@ -1,4 +1,4 @@
-from src import beads
+from src import aggregate, beads
 
 
 def _ev(repo, hour, kind, actor="system", issue="x"):
@@ -59,3 +59,49 @@ def test_a_busy_hour_without_a_mass_import_is_left_alone():
 
     assert bulk_cells == set()
     assert not any(e["is_bulk_import"] for e in out)
+
+
+def test_bulk_close_threshold_is_strict_at_150_and_151():
+    at_bar = [_ev("at-bar", 100, "closed", issue=f"at-{i}") for i in range(150)]
+    over_bar = [_ev("over-bar", 101, "closed", issue=f"over-{i}") for i in range(151)]
+
+    out, bulk_cells = beads.mark_bulk_hours(at_bar + over_bar, 150)
+
+    assert bulk_cells == {("over-bar", 101)}
+    assert all(not event["is_bulk_import"] for event in out[:150])
+    assert all(event["is_bulk_import"] for event in out[150:])
+
+
+def test_fleet_hour_share_escalates_at_exactly_half():
+    flagged = [_ev("flagged", 200, "closed", issue=f"flagged-{i}") for i in range(151)]
+    unflagged = [_ev("unflagged", 200, "closed", issue=f"unflagged-{i}") for i in range(149)]
+
+    out, bulk_cells = beads.mark_bulk_hours(flagged + unflagged, 150, bulk_hour_share=0.5)
+
+    assert bulk_cells == {("flagged", 200), ("unflagged", 200)}
+    assert all(event["is_bulk_import"] for event in out)
+
+
+def test_closure_split_preserves_the_pre_split_total():
+    events = (
+        [_ev("bulk", 300, "closed", issue=f"bulk-{i}") for i in range(151)]
+        + [_ev("propagated", 300, "closed", issue=f"propagated-{i}") for i in range(149)]
+        + [_ev("ordinary", 301, "closed", issue=f"ordinary-{i}") for i in range(2)]
+    )
+    pre_split_total = sum(event["kind"] == "closed" for event in events)
+
+    marked, _ = beads.mark_bulk_hours(events, 150)
+    rows = aggregate.build_hourly([], marked, {})
+    repo_rows = {
+        (row["repo"], row["hour_epoch"]): row
+        for row in rows
+        if row["worker"] is None
+    }
+
+    assert repo_rows[("bulk", 300)]["beads_closed_bulk"] == 151
+    assert repo_rows[("propagated", 300)]["beads_closed_bulk"] == 149
+    assert repo_rows[("ordinary", 301)]["beads_closed"] == 2
+    assert sum(
+        row["beads_closed"] + row["beads_closed_bulk"]
+        for row in repo_rows.values()
+    ) == pre_split_total
