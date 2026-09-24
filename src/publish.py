@@ -252,16 +252,20 @@ def _prune(s3, bucket: str, prefix: str, keep: str, retention: int):
     ignored rather than being allowed to consume a retention slot.
     """
     base = f"{prefix}/cycles/"
-    ids = sorted(
-        (
-            cycle_id
-            for cycle_id in (
-                p[len(base):].rstrip("/") for p in s3io.list_prefixes(s3, bucket, base)
-            )
-            if _is_valid_cycle_id(cycle_id)
-        ),
-        reverse=True,
-    )
+    try:
+        ids = sorted(
+            (
+                cycle_id
+                for cycle_id in (
+                    p[len(base):].rstrip("/") for p in s3io.list_prefixes(s3, bucket, base)
+                )
+                if _is_valid_cycle_id(cycle_id)
+            ),
+            reverse=True,
+        )
+    except Exception:
+        log.warning("could not list cycles; leaving cleanup for the next cycle")
+        return
     doomed = [cid for cid in ids if cid != keep][max(0, retention - 1):]
     for cid in doomed:
         try:

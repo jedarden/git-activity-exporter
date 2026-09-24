@@ -184,6 +184,9 @@ def test_existing_cycle_id_is_a_collision_before_any_write():
     s3 = FakeS3()
     do_publish(s3, "A")
     puts = list(s3.puts)
+    objects = dict(s3.objects)
+    pointer = s3.objects[f"{PREFIX}/current.json"]
+    fixed = fixed_keys(s3)
 
     generated_at, cycle = identity("A")
     with pytest.raises(publish.PublicationError, match="collision"):
@@ -193,7 +196,27 @@ def test_existing_cycle_id_is_a_collision_before_any_write():
         )
 
     assert s3.puts == puts
+    assert s3.objects == objects
+    assert s3.objects[f"{PREFIX}/current.json"] == pointer
+    assert fixed_keys(s3) == fixed
     assert_pointer_view_is("A", s3)
+
+
+def test_staged_prefix_collision_preserves_pointer_and_fixed_keys():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    orphan_key = f"{PREFIX}/cycles/{cycle_id('B')}/in-flight"
+    s3.objects[orphan_key] = (b"abandoned", "application/octet-stream")
+    before = dict(s3.objects)
+    before_puts = list(s3.puts)
+
+    with pytest.raises(publish.PublicationError, match="collision"):
+        do_publish(s3, "B")
+
+    assert s3.objects == before
+    assert s3.puts == before_puts
+    assert_pointer_view_is("A", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}
 
 
 def test_staging_failure_leaves_previous_cycle_live_everywhere():
@@ -210,23 +233,24 @@ def test_staging_failure_leaves_previous_cycle_live_everywhere():
     assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}
 
 
-def test_mirror_failure_rolls_fixed_keys_back():
+@pytest.mark.parametrize(
+    "failed_name",
+    ("hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json"),
+)
+def test_mirror_failure_rolls_fixed_keys_back(failed_name):
     s3 = FakeS3()
     do_publish(s3, "A")
+    before_pointer = s3.objects[f"{PREFIX}/current.json"]
 
-    # Fail the fixed-key (not staged) put of bead_events: two mirrors have
-    # already landed when it fires, which is exactly the half-mirrored set
-    # the rollback exists to undo.
     s3.fail_when(lambda op, key: RuntimeError("mirror boom")
-                 if op == "put" and key.endswith("/bead_events.parquet")
-                 and "cycles/" not in key else None)
+                 if op == "put" and key == f"{PREFIX}/{failed_name}" else None)
     with pytest.raises(publish.PublicationError) as excinfo:
         do_publish(s3, "B")
 
     assert "mirror" in str(excinfo.value.__cause__)
     assert_pointer_view_is("A", s3)
-    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}, \
-        "every fixed key must hold the previous cycle again, including the ones already mirrored"
+    assert s3.objects[f"{PREFIX}/current.json"] == before_pointer
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}
 
 
 def test_mirror_failure_on_first_run_cleans_the_partial_mirror():
@@ -246,6 +270,7 @@ def test_mirror_failure_on_first_run_cleans_the_partial_mirror():
 def test_pointer_failure_rolls_the_mirror_back():
     s3 = FakeS3()
     do_publish(s3, "A")
+    before_pointer = s3.objects[f"{PREFIX}/current.json"]
 
     s3.fail_when(lambda op, key: RuntimeError("pointer boom")
                  if op == "put" and key.endswith("/current.json") else None)
@@ -255,6 +280,7 @@ def test_pointer_failure_rolls_the_mirror_back():
     # The mirror had already flipped the fixed keys to B; the rollback is
     # what stops the pointer and the fixed keys naming different cycles.
     assert_pointer_view_is("A", s3)
+    assert s3.objects[f"{PREFIX}/current.json"] == before_pointer
     assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}
 
 
@@ -313,8 +339,29 @@ def test_prune_failure_is_not_fatal():
     do_publish(s3, "B")
     s3.fail_when(lambda op, key: RuntimeError("delete boom")
                  if op == "delete" else None)
-    do_publish(s3, "C")  # must not raise
+    do_publish(s3, "C")
     assert_pointer_view_is("C", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("C")}
+    s3.fail_when(None)
+    assert s3io.list_prefixes(s3, BUCKET, f"{PREFIX}/cycles/") == [
+        f"{PREFIX}/cycles/{cycle_id(tag)}/" for tag in ("A", "B", "C")
+    ]
+
+
+def test_prune_listing_failure_is_not_fatal():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    s3.fail_when(lambda op, key: RuntimeError("list boom")
+                 if op == "list" and key == f"{PREFIX}/cycles/" else None)
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("B")}
+    s3.fail_when(None)
+    assert s3io.list_prefixes(s3, BUCKET, f"{PREFIX}/cycles/") == [
+        f"{PREFIX}/cycles/{cycle_id(tag)}/" for tag in ("A", "B")
+    ]
 
 
 def test_orphaned_staging_prefix_from_a_failed_cycle_is_swept():

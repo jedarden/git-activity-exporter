@@ -52,6 +52,7 @@ class FakeS3:
 
     def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None,
                         MaxKeys=1000):
+        self._gate("list", Prefix)
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
         if ContinuationToken:
             keys = [k for k in keys if k > ContinuationToken]
