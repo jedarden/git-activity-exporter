@@ -8,12 +8,13 @@ enumeration" -- and the ordering property the mirror prune depends on: the
 prune consumes the *complete* enumeration (every page, in order) and never
 runs at all when enumeration fails or returns nothing.
 """
+import json
 from types import SimpleNamespace
 
 import pytest
 import requests
 
-from src import forge, main
+from src import forge, main, s3io
 from tests.fake_s3 import FakeS3
 
 BASE = "https://forge"
@@ -315,3 +316,65 @@ def test_enumeration_error_fails_the_cycle_before_any_prune_or_publish(monkeypat
     assert s3.puts == []
     assert s3.objects == {}
     assert (tmp_path / "survivor.git").exists()
+
+
+def test_empty_enumeration_publishes_without_pruning_and_recovers_after_fix(monkeypatch, tmp_path):
+    cfg = _cfg(tmp_path)
+    bucket = cfg.dest.bucket
+    prefix = cfg.dest_prefix
+    cfg.forge_owner = "wrong-owner"
+    _mirror(tmp_path, "repo-1")
+    _mirror(tmp_path, "orphan")
+    first_forge = FakeForge([{"ok": True, "data": []}]).install(monkeypatch)
+    monkeypatch.setattr(
+        main.gitscan,
+        "ensure_mirror",
+        lambda repo, *args: (str(tmp_path / f"{repo['name']}.git"), True),
+    )
+    monkeypatch.setattr(main.gitscan, "scan_commits", lambda *args: [])
+    monkeypatch.setattr(main.beads, "read_events", lambda *args: [])
+    nows = iter(("2026-09-23T12:00:00Z", "2026-09-23T12:01:00Z"))
+    monkeypatch.setattr(main, "_now", lambda: next(nows))
+    s3 = FakeS3()
+
+    main._run_cycle(cfg, s3, {})
+
+    first_pointer = json.loads(
+        s3io.download_bytes(s3, bucket, f"{prefix}/current.json")
+    )
+    first_meta = json.loads(
+        s3io.download_bytes(
+            s3, bucket, f"{prefix}/{first_pointer['objects']['meta.json']}"
+        )
+    )
+    assert len(s3.puts) == 9
+    assert first_meta["repos_total"] == 0
+    assert first_meta["repos_scanned"] == 0
+    assert first_meta["mirrors_pruned"] == []
+    assert first_forge.calls[0]["params"]["owner"] == "wrong-owner"
+    assert (tmp_path / "repo-1.git").exists()
+    assert (tmp_path / "orphan.git").exists()
+
+    cfg.forge_owner = "fixed-owner"
+    second_forge = FakeForge([
+        {"ok": True, "data": [repo(1)]}
+    ]).install(monkeypatch)
+
+    main._run_cycle(cfg, s3, {})
+
+    second_pointer = json.loads(
+        s3io.download_bytes(s3, bucket, f"{prefix}/current.json")
+    )
+    second_meta = json.loads(
+        s3io.download_bytes(
+            s3, bucket, f"{prefix}/{second_pointer['objects']['meta.json']}"
+        )
+    )
+    assert second_pointer["cycle_id"] != first_pointer["cycle_id"]
+    assert second_forge.calls[0]["params"]["owner"] == "fixed-owner"
+    assert second_meta["repos_total"] == 1
+    assert second_meta["repos_scanned"] == 1
+    assert second_meta["repos_failed"] == []
+    assert second_meta["mirrors_pruned"] == ["orphan"]
+    assert (tmp_path / "repo-1.git").exists()
+    assert not (tmp_path / "orphan.git").exists()
