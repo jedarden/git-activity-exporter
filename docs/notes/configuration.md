@@ -20,7 +20,7 @@ everything else has a default.
 | `BEAD_BULK_CLOSE_THRESHOLD` | `150` | closures per `(repo, hour)` above which the cell is flagged |
 | `BEAD_BULK_HOUR_SHARE` | `0.5` | share of an hour's fleet-wide closures already flagged before the whole hour is treated as bulk |
 | `MAX_FAILURE_RATE` | `0.2` | fraction of repos that may fail before the cycle is withheld instead of published |
-| `FAMILIES_FILE` | `families.yaml` | repo → family map |
+| `FAMILIES_FILE` | `families.yaml` | repo → family map; a relative path resolves against the process working directory — [The families file](#the-families-file) |
 | `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
 | `POLL_INTERVAL_SECONDS` | `3600` | sleep from one cycle attempt's end to the next cycle's start — [Poll-cycle lifecycle](#poll-cycle-lifecycle) |
 | `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
@@ -197,6 +197,69 @@ filter is why `lines_*` tracks work rather than checkpoint churn, and why
 
 The list lives in `config.DEFAULT_EXCLUDED_PATHS`; `tests/test_docs.py`
 fails if this block and the code drift apart.
+
+## The families file
+
+`FAMILIES_FILE` (default `families.yaml`) maps repositories to the middle
+scope tier. The mapping is editorial — no rule derived from repo metadata
+says that `commitgraph` and `commitgraph-deprecated` are one programme — so
+it is a checked-in document rather than something inferred at runtime, and a
+reuser is expected to replace it wholesale:
+
+```yaml
+families:
+  agent-fleet:
+    - NEEDLE
+    - bead-rs
+  infra:
+    - declarative-config
+```
+
+One top-level `families` key; under it, family name → list of repo names.
+Any other top-level key is ignored. A family whose list is empty or null is
+legal and contributes nothing. The loader does not type-check beyond that —
+a family value must be a list of name strings (a bare scalar would be
+iterated character by character into nonsense mappings), and a family name
+repeated in the YAML itself is collapsed by the YAML parser, last one
+winning, before the loader sees it.
+
+**Matching is exact and case-sensitive.** Names are looked up as whole
+strings against the Forgejo repo name exactly as enumeration reports it —
+no globs, no patterns, no substrings, no case folding: `needle-pod` does
+not match `NEEDLE-POD`. A spelling or case mismatch is not an error; the
+repo silently lands in `unassigned`, which is precisely what `meta.json`'s
+`unassigned_repos` exists to surface.
+
+Unmapped repos fall through to `unassigned` rather than failing, so a new
+repo appears in the ecosystem and repo tiers on its first commit without
+anyone touching config first. Two listing errors are distinguished:
+
+- A repo listed twice under the **same** family is tolerated.
+- A repo listed under **two different** families is a hard error
+  (`ValueError`), not last-write-wins — duplicates would make family totals
+  depend on dict ordering.
+
+The same asymmetry governs a failed load:
+
+| State of the file | Startup behavior |
+|---|---|
+| readable, valid | mapping loaded; startup proceeds |
+| missing | warning logged, empty mapping, every repo reports `unassigned`; startup proceeds |
+| empty file, or `families:` absent/null | empty mapping with no warning; every repo reports `unassigned` |
+| present but unparseable YAML | process exits non-zero before the health server binds |
+| a repo under two families | process exits non-zero before the health server binds |
+
+An absent file is a legible degraded state — the whole fleet reports
+`unassigned` and the panel still works — while a corrupt or ambiguous one is
+a deployment fault: the process crashloops until the file is fixed, because
+publishing a silently wrong middle tier would be worse than publishing none.
+Missing is a config decision; broken is a bug.
+
+**The file is read once per process**, at startup, before the health server
+binds and before the first cycle. Nothing re-reads it mid-process, so
+editing it changes nothing until the exporter restarts. What that restart
+does to already-published cycles — the attribution-over-time contract — is
+pinned in [output-schema.md](output-schema.md#family-attribution-over-time).
 
 ## Destination credentials (`DEST_S3_*`)
 

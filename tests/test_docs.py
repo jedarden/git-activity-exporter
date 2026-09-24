@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
-from src import main
+from src import families, main
 from src.config import DEFAULT_EXCLUDED_PATHS
 
 CONFIGURATION_MD = (
@@ -71,3 +71,34 @@ def test_documented_meta_keys_match_builder():
     built = main.build_meta(cfg, stats, "2026-09-16T00:00:00Z", 1.0, [], [],
                             cycle_id="20260916T000000Z-01234567")
     assert set(built) == set(documented)
+
+
+def test_documented_families_example_loads(tmp_path):
+    # The yaml example in configuration.md's families section is the schema
+    # reusers copy. It must be a document families.load actually accepts --
+    # either side edited without the other fails here, the way the
+    # exclusion-pattern block is held against DEFAULT_EXCLUDED_PATHS.
+    text = CONFIGURATION_MD.read_text()
+    _, _, section = text.partition("## The families file")
+    assert section, "configuration.md lost the families-file section"
+    fence = re.search(r"```yaml\n(.*?)```", section, re.DOTALL)
+    assert fence, "the families file schema must be given as a yaml example"
+    p = tmp_path / "documented.yaml"
+    p.write_text(fence.group(1))
+
+    mapping = families.load(str(p))
+
+    assert mapping["NEEDLE"] == "agent-fleet"
+    assert mapping["declarative-config"] == "infra"
+
+
+def test_family_attribution_over_time_is_pinned():
+    # The temporal decision (per-publication, never retroactive) is the part
+    # of the families contract with no test of its own -- it lives in prose.
+    # Losing the section, or the pin itself, must fail rather than drift.
+    path = CONFIGURATION_MD.parent / "output-schema.md"
+    text = path.read_text()
+    _, _, section = text.partition("## Family attribution over time")
+    assert section, "output-schema.md lost the family-attribution-over-time section"
+    section = section.split("\n## ", 1)[0]
+    assert "never retroactive" in section

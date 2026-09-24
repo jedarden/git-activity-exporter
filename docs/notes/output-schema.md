@@ -176,7 +176,7 @@ There are no per-tier files, so tiers cannot drift apart.
 | `hour_utc` | string | never | `YYYY-MM-DDTHH:00:00Z`, the hour bucket |
 | `hour_epoch` | int64 | never | hours since the epoch; the numeric form of `hour_utc` |
 | `repo` | string | never | Forgejo repo name |
-| `family` | string | never | from `families.yaml`; `unassigned` when unmapped |
+| `family` | string | never | from `families.yaml`; `unassigned` when unmapped — [attribution over time](#family-attribution-over-time) |
 | `worker` | string | repository rows | null for the repo aggregate, the attributed actor for post-epoch rows, or `inferential` before the repo epoch |
 | `commits` | int64 | never, may be 0 | |
 | `bulk_commits` | int64 | never, may be 0 | commits flagged bulk (see the LOC filter below) |
@@ -255,6 +255,56 @@ published here and counted nowhere.
 dependency edits — are null rather than guessed. If bead-rs starts stating
 the result on closes, this column takes the stated value with no format
 change.
+
+## Family attribution over time
+
+Every `family` value in all three Parquet files comes from the
+[`families.yaml` mapping](configuration.md#the-families-file) **as it stood
+at process startup**. The file is read once, before the first cycle, and
+every cycle that process publishes resolves `family` from that one mapping
+at row-build time; nothing re-reads the file mid-process.
+
+Published cycles are immutable — [staged objects are written once and never
+rewritten](#publication-protocol) — so the temporal decision is pinned as
+follows: **attribution is per-publication, never retroactive.** Editing
+`families.yaml` and restarting changes only the cycles published after the
+restart. Concretely:
+
+- **A remap is a step change at a cycle boundary, not a rewrite.** The first
+  cycle a restarted process publishes carries the new mapping everywhere —
+  `hourly.parquet`, `commits.parquet`, `bead_events.parquet`, and
+  `unassigned_repos` alike. No older cycle is republished, re-derived, or
+  corrected.
+- **The family tier can straddle a remap for up to two cycles.** Retention
+  keeps the committed cycle plus the newest two others, and the grace
+  cycles keep whatever mapping they were published with. Summing a family
+  across cycles — or comparing family totals between the pointer's cycle
+  and its grace set — can therefore see both sides of a remap until pruning
+  ages the older cycles out. Cross-cycle family comparisons must be
+  cycle-scoped. This inconsistency is accepted by design rather than
+  papered over, because rewriting already-published objects is exactly what
+  the publication protocol forbids; consumers wanting a remapped history
+  re-aggregate client-side from per-cycle snapshots.
+- **The fixed legacy keys always carry the newest mapping.** They are
+  overwritten each cycle, so a fixed-key reader scraping over time sees the
+  same step change at the same boundary — detectable the usual way, by
+  comparing `meta.json`'s `cycle_id` with `current.json`'s.
+- **`unassigned` is a fallback bucket whose membership is time-dependent by
+  design, not a stable family.** Adding a repo to the map removes it from
+  `unassigned` and from `unassigned_repos` only in cycles published after
+  the restart; the older retained cycles keep `family = "unassigned"` and
+  keep listing the repo. Removing a repo from the map — or renaming it on
+  the forge, or changing its case — puts it in `unassigned` from the next
+  published cycle on. A consumer reconstructing "family X over time" must
+  union per-cycle snapshots; nothing in the protocol backfills the new
+  mapping into older ones.
+
+The exporter does not echo the mapping into `meta.json` and does not version
+it: the mapping a cycle actually used is recoverable from that cycle's own
+rows together with its `unassigned_repos`, and a changed mapping is visible
+by comparing published cycles. Adding mapping metadata to `meta.json` would
+be a schema change, not a clarification, and is deliberately out of this
+contract.
 
 ## `meta.json`
 
