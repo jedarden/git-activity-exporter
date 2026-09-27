@@ -9,6 +9,9 @@ from src.config import DEFAULT_EXCLUDED_PATHS
 CONFIGURATION_MD = (
     Path(__file__).resolve().parent.parent / "docs" / "notes" / "configuration.md"
 )
+DATA_SOURCES_MD = (
+    Path(__file__).resolve().parent.parent / "docs" / "notes" / "data-sources.md"
+)
 
 
 def _documented_exclusions():
@@ -38,6 +41,26 @@ def test_dest_s3_variables_are_documented():
     text = CONFIGURATION_MD.read_text()
     for name in names:
         assert f"`{name}`" in text, f"{name} missing from docs/notes/configuration.md"
+
+
+def test_forgejo_git_credential_contract_is_documented():
+    text = DATA_SOURCES_MD.read_text()
+    _, _, section = text.partition("### Forgejo Git credentials")
+    assert section, "data-sources.md lost the Forgejo Git credential section"
+    section = section.split("\n### ", 1)[0]
+    section = " ".join(section.split())
+
+    for phrase in (
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0=credential.helper",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_TERMINAL_PROMPT=0",
+        "command argument",
+        "Git stderr is captured",
+        "Authentication failures are classified as non-transient",
+        "existing mirror is kept",
+    ):
+        assert phrase in section, f"credential-safety contract missing: {phrase}"
 
 
 def test_documented_meta_keys_match_builder():

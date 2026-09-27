@@ -38,6 +38,10 @@ class GitError(Exception):
     pass
 
 
+class GitAuthenticationError(GitError):
+    """Git rejected the configured Forgejo credential."""
+
+
 class GitTimeout(GitError):
     """The invocation exceeded GIT_TIMEOUT_SECONDS and git was killed.
 
@@ -68,14 +72,31 @@ _TRANSIENT_GIT_MARKERS = (
     "curl 56",
 )
 
+_AUTHENTICATION_MARKERS = (
+    "authentication failed",
+    "http basic: access denied",
+    "could not read username",
+    "could not read password",
+    "returned error: 401",
+    "returned error: 403",
+)
+
 
 def _is_transient_remote_error(error: Exception) -> bool:
+    if isinstance(error, GitAuthenticationError):
+        return False
     if isinstance(error, GitTimeout):
         return True
     if not isinstance(error, GitError):
         return False
     message = str(error).lower()
     return any(marker in message for marker in _TRANSIENT_GIT_MARKERS)
+
+
+def _credential_secrets(env) -> tuple:
+    """Return secret values that must be removed from subprocess failures."""
+    token = (env or {}).get("FORGE_TOKEN")
+    return (token,) if token else ()
 
 
 def _run(args, timeout, cwd=None, env=None):
@@ -88,14 +109,19 @@ def _run(args, timeout, cwd=None, env=None):
     clean, and every failure path is additionally scrubbed here so a future
     change cannot silently reintroduce the leak.
     """
+    secrets = _credential_secrets(env)
     try:
         proc = subprocess.run(
             args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
         )
     except subprocess.TimeoutExpired:
-        raise GitTimeout(f"{_safe(args)} timed out after {timeout}s")
+        raise GitTimeout(f"{_safe(args, secrets)} timed out after {timeout}s")
     if proc.returncode != 0:
-        raise GitError(f"{_safe(args)} failed rc={proc.returncode}: {_scrub(proc.stderr.strip()[:300])}")
+        stderr = _scrub(proc.stderr.strip()[:300], secrets)
+        message = f"{_safe(args, secrets)} failed rc={proc.returncode}: {stderr}"
+        if any(marker in stderr.lower() for marker in _AUTHENTICATION_MARKERS):
+            raise GitAuthenticationError(message)
+        raise GitError(message)
     return proc.stdout
 
 
@@ -109,7 +135,7 @@ def _run_remote(args, timeout, cwd=None, env=None, before_attempt=None):
     return retry.call(
         operation,
         is_retryable=_is_transient_remote_error,
-        label=_safe(args),
+        label=_safe(args, _credential_secrets(env)),
     )
 
 
@@ -117,13 +143,17 @@ def _run_remote(args, timeout, cwd=None, env=None, before_attempt=None):
 _CRED_RE = re.compile(r"(https?://)[^/@\s]+@")
 
 
-def _scrub(text: str) -> str:
-    return _CRED_RE.sub(r"\1<redacted>@", text or "")
+def _scrub(text: str, secrets=()) -> str:
+    scrubbed = _CRED_RE.sub(r"\1<redacted>@", text or "")
+    for secret in secrets:
+        if secret:
+            scrubbed = scrubbed.replace(secret, "<redacted>")
+    return scrubbed
 
 
-def _safe(args) -> str:
+def _safe(args, secrets=()) -> str:
     """A loggable rendering of a git command with any credential removed."""
-    return _scrub(" ".join(str(a) for a in args))
+    return _scrub(" ".join(str(a) for a in args), secrets)
 
 
 def _credential_env(token: str) -> dict:
@@ -186,6 +216,12 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
                              f"--deepen={depth}", url, refspec], timeout, env=env)
                 depth *= 2
             return path, True
+        except GitAuthenticationError:
+            # An invalid or insufficient token is not mirror corruption. Keep
+            # the last known-good mirror in place and let the caller record
+            # the failure without trying another doomed clone.
+            log.warning("authentication failed for %s; keeping its mirror", repo["name"])
+            raise
         except GitTimeout as e:
             # A timeout means the mirror is fine and the forge is slow. The
             # old behavior deleted it and re-cloned here -- a strictly longer

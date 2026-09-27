@@ -59,6 +59,26 @@ below.
 every non-empty repo the token can read; failure, stale, and incomplete-history
 coverage are explicit in `meta.json` as described below.
 
+### Forgejo Git credentials
+
+`FORGE_TOKEN` is supplied to `git clone` and `git fetch` through the process
+environment, not by adding userinfo to `clone_url` or by putting the token in a
+command argument. The exporter gives Git a one-shot credential helper through
+`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0=credential.helper`, and
+`GIT_CONFIG_VALUE_0`; that helper reads `FORGE_TOKEN` only when Git asks for a
+password. `GIT_TERMINAL_PROMPT=0` prevents an unattended operation from
+falling back to an interactive prompt. The URL passed to Git stays the clean
+Forgejo `clone_url`, and the token is not written to the mirror's `.git/config`.
+
+Git stderr is captured. Before an exception, retry message, log line, or
+`repo_errors` value can expose it, the exporter redacts both URL credentials
+and the configured `FORGE_TOKEN`; the main collection boundary applies the
+redaction once more before writing public cycle metadata. Authentication
+failures are classified as non-transient: they receive no remote retry, an
+existing mirror is kept rather than deleted and re-cloned, and the repository
+is reported in `repos_failed` with a scrubbed reason. Never substitute a token
+directly into a URL, shell command, or log message.
+
 `SHALLOW_SINCE_DAYS` is a date bound, not a commit count. The cutoff for a
 cycle is the UTC date `generated_at - WINDOW_DAYS - SHALLOW_SINCE_DAYS`. A
 new mirror is cloned with that bound. On every later cycle the collector fetches

@@ -93,6 +93,39 @@ def test_token_travels_in_env_not_argv():
     assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
+def test_authentication_failure_is_redacted_and_not_retried(monkeypatch, caplog):
+    token = "FORGE_TOKEN_TEST_ONLY_7f3c"
+    calls = []
+    stderr = (
+        "fatal: Authentication failed for "
+        f"'https://x-access-token:{token}@git.ardenone.com/jedarden/x.git'"
+    )
+
+    def fail(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(gitscan.subprocess, "run", fail)
+    env = gitscan._credential_env(token)
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(gitscan.GitAuthenticationError) as excinfo:
+            gitscan._run_remote(
+                ["git", "clone", "--mirror", "https://git.ardenone.com/jedarden/x.git", "/tmp/x.git.tmp"],
+                17,
+                env=env,
+            )
+
+    args, kwargs = calls[0]
+    assert len(calls) == 1, "authentication failures must not use transient retries"
+    assert token not in " ".join(args), "the token must not be in Git argv"
+    assert kwargs["env"]["FORGE_TOKEN"] == token
+    assert token not in kwargs["env"]["GIT_CONFIG_VALUE_0"]
+    assert token not in str(excinfo.value)
+    assert "<redacted>" in str(excinfo.value)
+    assert token not in caplog.text
+
+
 # --- Failure semantics (docs/notes/data-sources.md) -------------------------
 # These tests exercise ensure_mirror's decision tree with the git subprocess
 # faked out, the same way the rest of this suite avoids needing a mirror.
@@ -237,6 +270,22 @@ def test_fetch_corruption_reclones(tmp_path, monkeypatch):
     assert out_path == str(path)
     assert refreshed is True
     assert path.is_dir(), "the re-clone replaces the corrupt mirror in place"
+
+
+def test_authentication_failure_keeps_existing_mirror_without_reclone(tmp_path, monkeypatch):
+    path = _fake_mirror(tmp_path)
+    calls = []
+
+    def fail(args, timeout, cwd=None, env=None):
+        calls.append(args)
+        raise gitscan.GitAuthenticationError("authentication failed: <redacted>")
+
+    monkeypatch.setattr(gitscan, "_run", fail)
+    with pytest.raises(gitscan.GitAuthenticationError):
+        gitscan.ensure_mirror(_repo(), str(tmp_path), "tok", 100, 600)
+
+    assert len(calls) == 1, "an auth failure must not fall through to a re-clone"
+    assert path.is_dir(), "the last known-good mirror must be preserved"
 
 
 def test_clone_timeout_excludes_repo_and_cleans_its_tmp(tmp_path, monkeypatch):
