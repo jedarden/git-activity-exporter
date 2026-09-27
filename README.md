@@ -94,6 +94,9 @@ transition rules for `/health` and `/ready`. Treat the committed defaults and
 
 The [deployment and release workflow](docs/notes/deployment.md) documents the
 Argo build, image versioning, runtime inputs, PVC, probes, and GitOps handoff.
+Its [resource envelope and scaling notes](docs/notes/deployment.md#resource-envelope-and-cold-start)
+also record the measured payload, forensic-log, and cold-clone bounds behind
+the reference pod's memory settings.
 
 ## Development
 

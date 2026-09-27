@@ -105,6 +105,69 @@ root-owned Longhorn volume. Keep one replica and the `Recreate` strategy:
 two pods cannot safely share the RWO volume and would race while publishing
 the same S3 keys.
 
+## Resource envelope and cold start
+
+The reference Deployment requests `512Mi` of memory and limits the container
+to `2Gi` (`100m`/`2` CPU). The request is a scheduling reservation, not a
+process cap; the cgroup limit is the `2Gi` value. There is one process and one
+sequential cycle, so collection lists, parsed rows, Arrow tables, and all four
+serialized payloads can overlap in the same address space before the first S3
+PUT. The exporter has no per-repo byte limit or streaming serializer.
+
+These are the current measurements that size that envelope:
+
+| Workload | Observed input/output | Resource implication |
+|---|---:|---|
+| Largest checked-in forensic blob measured (NEEDLE `HEAD`, 2026-09-27) | 21,270,143 bytes / 38,018 nonblank records | `git show HEAD:.beads/checkpoint/forensic.jsonl` reads the whole blob; parsing its 90-day window retained 34,417 events and reached 162,468KiB RSS on the measurement host. |
+| 30-day fleet activity sample (2026-08-17) | ~14,000 commits; 41,626,557 changed `.beads/` lines; 16,650 migration closures | Line churn is not row count: `.beads/` lines are accumulated in commit totals, while the event log is parsed into event rows. A single 9,072,022-line/25,639-file artifact commit remains one commit row and is flagged by `TRIM_MAX_LINES`/`TRIM_MAX_FILES`; those thresholds do not cap memory. |
+| Representative serialization probe at that sample's row counts | 6,128 hourly rows + 14,000 commit rows + 16,650 event rows → `hourly.parquet` 30,584 bytes, `commits.parquet` 303,121 bytes, `bead_events.parquet` 122,317 bytes, `meta.json` 590 bytes; total 456,612 bytes | The probe used the real Arrow schemas and representative row shapes, not a production cycle artifact. It reached 174,864KiB RSS locally, so serialized bytes substantially understate construction memory. Treat this as a regression baseline, not a hard capacity guarantee. |
+| Largest mirror inputs | `agent-transcript-archive` 3.4GiB; `unfairmarket-research` 1.5GiB; all full mirrors 14.04GiB | These are PVC/clone and Git pack-operation bounds, not payload sizes. The first live cold pass exceeded the old 600-second Git timeout on both large histories; the reference ConfigMap now uses 1,800 seconds per Git attempt. |
+
+The 2Gi limit is therefore a vertical capacity boundary, not a graceful
+per-repository quota. A forensic file or commit scan that stays below it can
+finish normally even when it is large. A Git timeout, unreadable forensic
+blob, malformed record, or integrity failure is handled per repository:
+`repos_failed` records the reason, the repo's rows are omitted, and the cycle
+publishes the remaining fleet when the failed fraction is at most
+`MAX_FAILURE_RATE` (20% by default). Above that fraction the cycle is
+withheld and the previous pointer remains live. `WINDOW_DAYS` does not reduce
+forensic input memory because the file is validated and parsed before its
+window filter is applied.
+
+If construction or parsing crosses the container's `2Gi` limit, Linux kills
+the process with `OOMKilled`; there is no opportunity to turn that allocation
+failure into a single-repo `repos_failed` entry. The Deployment restarts the
+pod, `/ready` returns 503 again until a cycle succeeds, and a failure during
+collection or payload generation has not written a new S3 object because all
+four payloads are generated before publication. The previous pointer remains
+the recovery anchor; any staged prefix left before the commit by a kill during
+publication is inert and is removed by later retention cleanup. This is why a growing
+forensic log needs vertical memory headroom or a future streaming/parser
+change, not another exporter replica.
+
+### First-deploy timing and scaling
+
+A cold deployment clones the fleet serially before it can publish. NEEDLE
+alone measured 148.6 seconds and 133MB for a 60-day cold clone, while an
+existing mirror fetched in 1.21 seconds. The two largest histories exceeded
+600 seconds during the first live fleet pass, so there is no defensible
+single-minute SLA for a full-fleet cold cycle; plan for an hours-long first
+publication rather than the warm-cycle cadence. The readiness probe permits
+`240 × 30s = 2h` of unready time, but that is probe grace, not a clone
+deadline: `/health` remains live and the pod is not restarted merely because
+`/ready` is still 503. The hard per-attempt timeout is 1,800 seconds. With
+roughly 111 repos, one timed-out attempt for every repo is already about 55.5
+hours; the three-attempt remote retry policy makes the pathological ceiling
+longer. These are failure ceilings, not the expected runtime.
+
+After the first successful publication, a restart with the PVC intact performs
+a warm fetch pass, not a fleet-wide cold clone. Keep `replicas: 1` and
+`Recreate`: this writer has no S3 lease or fencing protocol, so horizontal
+scaling would corrupt the single destination prefix. Scale vertically (raise
+the request and limit in GitOps) or reduce the reporting/fleet workload until
+payload construction remains comfortably below `2Gi`; do not add replicas as
+a memory workaround.
+
 ## Deployment probes and rollout behavior
 
 The container port is named `health` and is 8080. The Deployment uses:
