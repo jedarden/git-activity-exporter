@@ -44,6 +44,22 @@ image's embedded version comes from the `VERSION` file copied from the build
 context. Because an automatic bump is pushed before the Kaniko step, the
 source version and image tag agree.
 
+## Container smoke verification
+
+The repository-owned [`scripts/smoke-container.sh`](../../scripts/smoke-container.sh)
+builds the image locally unless `SKIP_BUILD=1` is set, then runs it with
+isolated dummy Forgejo and S3 endpoints. It verifies the built image's
+`families.yaml` and `VERSION` files, the `appuser`/UID 1000 runtime identity,
+the 8080 exposed port, `/health` returning 200, and `/ready` returning 503
+before a successful cycle. The Argo WorkflowTemplate runs the same runtime
+checks against the just-built versioned image after the Kaniko step.
+
+The GitOps repository's
+`scripts/test-git-activity-exporter-deployment.sh` performs the static gate
+for the WorkflowTemplate and Deployment: every referenced image is tagged,
+the Deployment image is semver-pinned, and the named `health` port and
+`/health` liveness plus `/ready` readiness paths remain aligned.
+
 ## Promoting an image to the Deployment
 
 After a successful build, update only the image pin in
