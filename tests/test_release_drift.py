@@ -97,13 +97,13 @@ def test_release_drift_check_rejects_latest_in_compose_image(tmp_path):
         ),
         (
             Path("examples/self-hosting/kubernetes.yaml"),
-            "image: ronaldraygun/git-activity-exporter:0.1.41",
+            "image: ronaldraygun/git-activity-exporter:{version}",
             "image: ronaldraygun/git-activity-exporter",
             "examples/self-hosting/kubernetes.yaml",
         ),
         (
             Path("examples/self-hosting/compose.yaml"),
-            "git-activity-exporter-self-hosting:0.1.41}",
+            "git-activity-exporter-self-hosting:{version}}}",
             "git-activity-exporter-self-hosting}",
             "examples/self-hosting/compose.yaml",
         ),
@@ -114,6 +114,7 @@ def test_release_drift_check_rejects_unpinned_images(
 ):
     _copy_release_files(tmp_path)
     path = tmp_path / relative_path
+    old = old.format(version=(ROOT / "VERSION").read_text().strip())
     path.write_text(path.read_text().replace(old, new))
 
     result = _run(tmp_path)
