@@ -22,7 +22,11 @@ The same four data objects are mirrored to the prefix root (fixed keys,
 `meta.json` last) for consumers that have not moved to the pointer.
 Pointer-resolved reads are atomic — one whole cycle, never a mix of two —
 while a failed publication leaves the previous complete dataset live
-everywhere. The protocol and its failure semantics are specified in
+everywhere. The exporter implementation and its publication failure-path
+tests cover this protocol. Consumers should resolve `current.json` first;
+legacy fixed-key reads can cross a write boundary and must compare their
+`meta.json` `cycle_id` with the pointer. The protocol and its failure
+semantics are specified in
 [`docs/notes/output-schema.md`](docs/notes/output-schema.md#publication-protocol).
 
 Column types, nullability, and the join keys the attempt ledger uses against
@@ -34,8 +38,10 @@ Column types, nullability, and the join keys the attempt ledger uses against
 - **Scope** — ecosystem → family → repo, with an optional worker partition
   after each repository's attribution epoch. All tiers are sums over
   `hourly.parquet`; pre-epoch worker activity is labelled `inferential` and
-  is not included in default worker counts. There are no per-tier files, so
-  tiers cannot disagree with each other.
+  is not included in default worker counts. The exporter publishes this
+  worker-tier contract; the worker selector and attribution-aware captions
+  remain a dashboard-site follow-up. There are no per-tier files, so tiers
+  cannot disagree with each other.
 - **Measure** — commits · lines of code · beads.
 - **Time** — hour → day → week, rolled up client-side.
 

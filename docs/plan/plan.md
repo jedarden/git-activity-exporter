@@ -63,12 +63,16 @@ tiers cannot drift apart. Affordable because the grid is 1.7% dense.
 - [x] **Phase 3 — Panel.** `public/git-activity/` with scope/measure/time
       selectors, burst timeline, punchcard, and honest captions for the bead
       epoch and the LOC filter.
-- [x] **Phase 4 — Worker tier.** A fourth scope level from bead-event
+- [x] **Phase 4 — Worker tier (exporter data).** A fourth scope level from bead-event
       actors. Events after each repository's attribution epoch (its first
       `closed` event with a non-`system` actor) are partitioned by actor;
       earlier events remain labelled `inferential` and are excluded from
       worker counts by default. `meta.json` carries the per-repo epoch. The
-      panel update is tracked separately.
+-      exporter implementation and regression coverage are complete.
+- [ ] **Phase 4 follow-up — Worker-tier panel.** Add the worker selector,
+      inferential-row handling, and attribution-aware captions to the
+      dashboard-site consumer. That panel work is outside this repository;
+      this exporter only publishes the worker-grain data and epoch metadata.
 - [ ] **Phase 5 — Factory ledger join.** This exporter is one of the three
       join sources for the factory attempt ledger (NEEDLE plan section 4.4;
       sink and joins owned by declarative-config). Publish bead events at
