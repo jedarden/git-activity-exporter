@@ -107,6 +107,32 @@ The `/ready` response remains empty and has no `Content-Type` header. These are
 exact GET paths; a trailing slash or query string is a different path and
 therefore returns `404`.
 
+### Prometheus metrics
+
+`GET /metrics` returns the following complete, dependency-free Prometheus text
+exposition. The `HELP` text, `TYPE`, metric names, and label values are part of
+the monitoring contract; consumers should not need to infer them from logs or
+from the `/health` JSON response. Every family and every listed labeled sample
+is emitted on every scrape, including before the first cycle attempt.
+
+| Metric | HELP text | TYPE | Labels | Value and reset semantics |
+|---|---|---|---|---|
+| `git_activity_exporter_up` | `Process health; this endpoint is live.` | `gauge` | none | Always `1` while this endpoint can answer. It is not a cycle-success signal. |
+| `git_activity_exporter_process_start_time_seconds` | `Unix start time.` | `gauge` | none | Unix timestamp captured when the process starts. It changes only on process restart. |
+| `git_activity_exporter_poll_interval_seconds` | `Configured post-cycle sleep.` | `gauge` | none | The configured `POLL_INTERVAL_SECONDS`; set during startup and constant until restart. |
+| `git_activity_exporter_last_successful_publication_timestamp_seconds` | `Unix timestamp of the latest committed publication, or 0 before the first one.` | `gauge` | none | `0` before the first complete publication, then the newest committed cycle's `generated_at` timestamp. Withheld and failed cycles leave it unchanged; it resets to `0` on process restart. |
+| `git_activity_exporter_cycle_attempts_total` | `Cycle attempts by terminal outcome.` | `counter` | `outcome`: `published`, `withheld`, `failed` | One counter per terminal outcome. `published` increments only after a complete publication returns successfully; `withheld` is a `MAX_FAILURE_RATE` rejection; `failed` is another cycle exception. Counters are process-lifetime and reset on restart. |
+| `git_activity_exporter_last_cycle_outcome` | `Current terminal outcome, one for the current outcome.` | `gauge` | `outcome`: `published`, `withheld`, `failed` | One-hot state: the current outcome is `1` and the other two are `0`; all three are `0` before the first attempt. A withheld or failed cycle does not change the successful-publication timestamp. It resets to all zeroes on restart. |
+| `git_activity_exporter_publication_failures_total` | `Failed publication attempts since process start.` | `counter` | none | Increments only for a `PublicationError`; collection failures and withheld cycles do not count. It is retained across successful publications and resets on restart. |
+| `git_activity_exporter_publication_failures_consecutive` | `Consecutive failed publication attempts.` | `gauge` | none | Increments for each consecutive `PublicationError`; a successful publication resets it to `0`. Withheld cycles do not reset it. It resets on restart. |
+| `git_activity_exporter_prune_consecutive_failures` | `Consecutive failed post-publication prune attempts.` | `gauge` | none | Increments when post-commit cycle cleanup fails and resets to `0` after a fully successful prune. A prune failure does not make the publication or cycle outcome fail. It resets on restart. |
+
+The `/metrics` surface deliberately exports only the prune consecutive-failure
+gauge. The `/health`-only `prune.last_outcome` and `prune.failures_total`
+fields remain the detailed process-local cleanup diagnostics; they are not
+additional Prometheus metric names. No other metric families or labels are
+part of this endpoint's contract.
+
 ### Staleness alert
 
 Poll `/health` at least once per `POLL_INTERVAL_SECONDS`. Alert when
