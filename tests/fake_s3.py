@@ -58,7 +58,11 @@ class FakeS3:
         if Key not in self.objects:
             raise _nosuch_key()
         data, ct = self.objects[Key]
-        return {"Body": io.BytesIO(data), "ContentType": ct}
+        return {
+            "Body": io.BytesIO(data),
+            "ContentType": ct,
+            "CacheControl": self.cache_controls.get(Key),
+        }
 
     def head_object(self, Bucket, Key):
         self.calls.append(("head", Key))
@@ -66,7 +70,11 @@ class FakeS3:
         if Key not in self.objects:
             raise _nosuch_key()
         data, ct = self.objects[Key]
-        return {"ContentLength": len(data), "ContentType": ct}
+        return {
+            "ContentLength": len(data),
+            "ContentType": ct,
+            "CacheControl": self.cache_controls.get(Key),
+        }
 
     def delete_object(self, Bucket, Key):
         self.calls.append(("delete", Key))

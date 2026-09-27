@@ -119,6 +119,31 @@ def test_happy_path_stages_mirrors_and_commits():
     assert_pointer_view_is("A", s3)
 
 
+def test_publication_sets_content_type_and_cache_control_metadata():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+
+    for name, _, content_type in payloads("A"):
+        cycle_key = f"{PREFIX}/cycles/{cycle_id('A')}/{name}"
+        fixed_key = f"{PREFIX}/{name}"
+
+        assert s3.head_object(Bucket=BUCKET, Key=cycle_key) == {
+            "ContentLength": len(s3.objects[cycle_key][0]),
+            "ContentType": content_type,
+            "CacheControl": "public, max-age=31536000, immutable",
+        }
+        assert s3.head_object(Bucket=BUCKET, Key=fixed_key) == {
+            "ContentLength": len(s3.objects[fixed_key][0]),
+            "ContentType": content_type,
+            "CacheControl": "no-cache, max-age=0, must-revalidate",
+        }
+
+    pointer_key = f"{PREFIX}/current.json"
+    pointer_metadata = s3.head_object(Bucket=BUCKET, Key=pointer_key)
+    assert pointer_metadata["ContentType"] == "application/json"
+    assert pointer_metadata["CacheControl"] == "no-cache, max-age=0, must-revalidate"
+
+
 def test_meta_json_is_always_mirrored_last():
     # Even a caller that lists meta first gets the protocol's order: meta is
     # the fixed keys' completion marker.

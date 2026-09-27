@@ -69,7 +69,12 @@ class RecordingS3(FakeS3):
 
     def put_object(self, Bucket, Key, Body, ContentType, CacheControl=None):
         self.put_calls.append(
-            {"Bucket": Bucket, "Key": Key, "CacheControl": CacheControl}
+            {
+                "Bucket": Bucket,
+                "Key": Key,
+                "ContentType": ContentType,
+                "CacheControl": CacheControl,
+            }
         )
         return super().put_object(Bucket, Key, Body, ContentType, CacheControl)
 
@@ -121,6 +126,19 @@ def test_configured_prefix_generates_documented_object_keys(
 
     assert [call["Bucket"] for call in s3.put_calls] == ["activity-bucket"] * 9
     assert [call["Key"] for call in s3.put_calls] == expected_keys
+    assert [call["ContentType"] for call in s3.put_calls[:4]] == [
+        "application/octet-stream",
+        "application/octet-stream",
+        "application/octet-stream",
+        "application/json",
+    ]
+    assert [call["ContentType"] for call in s3.put_calls[4:8]] == [
+        "application/octet-stream",
+        "application/octet-stream",
+        "application/octet-stream",
+        "application/json",
+    ]
+    assert s3.put_calls[8]["ContentType"] == "application/json"
     assert set(s3.objects) == set(expected_keys)
     assert all(key.startswith(f"{prefix}/") for key in s3.objects)
     assert all("//" not in key for key in s3.objects)
