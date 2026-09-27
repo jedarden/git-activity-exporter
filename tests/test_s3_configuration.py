@@ -106,20 +106,28 @@ def test_configured_prefix_generates_documented_object_keys(
 
     main._run_cycle(cfg, s3, {})
 
-    pointer_key = "reports/activity/current.json"
+    prefix = cfg.dest_prefix
+    pointer_key = f"{prefix}/current.json"
     pointer = json.loads(s3.objects[pointer_key][0])
     names = ["hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json"]
     expected_keys = (
         [
-            f"reports/activity/cycles/{pointer['cycle_id']}/{name}"
+            f"{prefix}/cycles/{pointer['cycle_id']}/{name}"
             for name in names
         ]
-        + [f"reports/activity/{name}" for name in names]
+        + [f"{prefix}/{name}" for name in names]
         + [pointer_key]
     )
 
     assert [call["Bucket"] for call in s3.put_calls] == ["activity-bucket"] * 9
     assert [call["Key"] for call in s3.put_calls] == expected_keys
+    assert set(s3.objects) == set(expected_keys)
+    assert all(key.startswith(f"{prefix}/") for key in s3.objects)
+    assert all("//" not in key for key in s3.objects)
+    assert pointer["objects"] == {
+        name: f"cycles/{pointer['cycle_id']}/{name}" for name in names
+    }
+    assert [f"{prefix}/{key}" for key in pointer["objects"].values()] == expected_keys[:4]
     assert [call["CacheControl"] for call in s3.put_calls[:4]] == [
         "public, max-age=31536000, immutable"
     ] * 4

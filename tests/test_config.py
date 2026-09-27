@@ -99,6 +99,13 @@ def test_load_uses_documented_defaults(isolated_env, monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize("raw_prefix", ["reports/activity/", "reports/activity///"])
+def test_dest_s3_prefix_strips_trailing_slashes(isolated_env, monkeypatch, raw_prefix):
+    monkeypatch.setenv("DEST_S3_PREFIX", raw_prefix)
+
+    assert config.load().dest_prefix == "reports/activity"
+
+
 @pytest.mark.parametrize("name", NUMERIC_ENV_NAMES)
 def test_invalid_numeric_values_are_rejected(isolated_env, monkeypatch, name):
     monkeypatch.setenv(name, "not-a-number")
