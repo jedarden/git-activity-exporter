@@ -28,7 +28,7 @@ Decide these values before editing the workload:
 | Forgejo owner | `analytics` | `FORGE_OWNER` |
 | S3 bucket | `analytics-git-activity` | `DEST_S3_BUCKET` |
 | S3 prefix | `exports/git-activity` | `DEST_S3_PREFIX` |
-| Image | `registry.example/analytics/git-activity-exporter:0.1.35` | Deployment `image` |
+| Image | `registry.example/analytics/git-activity-exporter:0.1.36` | Deployment `image` |
 | Mirror volume | a writable 20 GiB or larger RWO PVC | `CLONE_ROOT` and the volume mount |
 
 Use a bucket/prefix dedicated to this exporter. Only one exporter replica may
@@ -140,6 +140,13 @@ inject them with Secret references or an ExternalSecret. `DEST_S3_BUCKET`,
 `DEST_S3_PREFIX`, and the addressing style are non-secret workload settings.
 Use `path` for stores without bucket-specific virtual-host DNS (a common
 self-hosted setup); use `virtual` only when your S3 service supports it.
+
+The exporter supports environment injection only: it reads these values from
+the process environment at startup. It does not read a credential file or
+command-line flags, and it never puts the values in subprocess arguments,
+logs, exception text, health responses, or smoke-test output. In a temporary
+Docker run, provide them through an ephemeral `--env-file` or inherited
+environment; do not write them as `--env NAME=value` arguments.
 
 The exporter writes `current.json`, `meta.json`, and three Parquet objects at
 the prefix. Consumers should resolve `current.json` first; it names one

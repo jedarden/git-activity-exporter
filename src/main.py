@@ -252,7 +252,7 @@ def _run_cycle(cfg, s3, family_map):
             expected_names=publish.DEFAULT_FIXED_NAMES,
         )
     except Exception as e:
-        raise publish.PublicationError("publication recovery failed at cycle start") from e
+        publish.raise_safe_publication_error("publication recovery failed at cycle start", e)
 
     started = time.monotonic()
     generated_at = _now()
@@ -349,7 +349,15 @@ def main():
     logging.basicConfig(level=cfg.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     family_map = families.load(cfg.families_file)
-    s3 = s3io.client(cfg.dest)
+    try:
+        s3 = s3io.client(cfg.dest)
+    except Exception as error:
+        # Client construction happens before the poll loop. Keep startup
+        # failures actionable without allowing a provider exception to echo
+        # either S3 credential into stderr.
+        message = s3io.redact_credentials(str(error), cfg.dest)
+        print(f"S3 client creation failed: {message}", file=sys.stderr)
+        sys.exit(1)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -378,9 +386,12 @@ def main():
         except CycleWithheld as e:
             _record_cycle_outcome("withheld")
             log.warning("cycle withheld: %s", e)
-        except Exception:
+        except Exception as error:
             _record_cycle_outcome("failed")
-            log.exception("cycle failed, will retry next interval")
+            log.error(
+                "cycle failed, will retry next interval: %s",
+                s3io.redact_credentials(str(error), cfg.dest),
+            )
         stop.wait(cfg.poll_interval_seconds)
 
 

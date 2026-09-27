@@ -6,6 +6,20 @@ VERSION=$(tr -d '[:space:]' < "$ROOT/VERSION")
 IMAGE=${IMAGE:-git-activity-exporter-smoke:"$VERSION"}
 NAME=${NAME:-git-activity-exporter-smoke-$$}
 SMOKE_TMP=$(mktemp -d)
+SMOKE_ENV="$SMOKE_TMP/exporter.env"
+
+cat > "$SMOKE_ENV" <<EOF
+FORGE_BASE_URL=http://127.0.0.1:9
+FORGE_OWNER=smoke
+FORGE_TOKEN=smoke-token
+DEST_S3_ENDPOINT=http://127.0.0.1:9
+DEST_S3_ACCESS_KEY_ID=smoke-access-key
+DEST_S3_SECRET_ACCESS_KEY=smoke-secret-key
+DEST_S3_BUCKET=smoke
+DEST_S3_ADDRESSING_STYLE=path
+CLONE_ROOT=/tmp/mirrors
+POLL_INTERVAL_SECONDS=3600
+EOF
 
 cleanup() {
     docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -18,16 +32,7 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
 fi
 
 docker run --detach --name "$NAME" --publish 127.0.0.1::8080 \
-    --env FORGE_BASE_URL=http://127.0.0.1:9 \
-    --env FORGE_OWNER=smoke \
-    --env FORGE_TOKEN=smoke-token \
-    --env DEST_S3_ENDPOINT=http://127.0.0.1:9 \
-    --env DEST_S3_ACCESS_KEY_ID=smoke-access-key \
-    --env DEST_S3_SECRET_ACCESS_KEY=smoke-secret-key \
-    --env DEST_S3_BUCKET=smoke \
-    --env DEST_S3_ADDRESSING_STYLE=path \
-    --env CLONE_ROOT=/tmp/mirrors \
-    --env POLL_INTERVAL_SECONDS=3600 \
+    --env-file "$SMOKE_ENV" \
     "$IMAGE" >/dev/null
 
 HOST_PORT=$(docker port "$NAME" 8080/tcp | sed -n '1s/.*://p')

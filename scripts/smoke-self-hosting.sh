@@ -8,13 +8,24 @@ IMAGE=${IMAGE:-git-activity-exporter-self-hosting:"$VERSION"}
 PROJECT=${COMPOSE_PROJECT_NAME:-git-activity-exporter-self-hosting-$$}
 SMOKE_TMP=$(mktemp -d)
 FIXTURE_ROOT="$SMOKE_TMP/fixture"
+SMOKE_ENV="$SMOKE_TMP/compose.env"
+
+cat > "$SMOKE_ENV" <<EOF
+SMOKE_FORGE_TOKEN=self-hosting-forge-token
+SMOKE_S3_ACCESS_KEY_ID=self-hosting-access-key
+SMOKE_S3_SECRET_ACCESS_KEY=self-hosting-secret-key
+EOF
+
+compose() {
+    EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
+        docker compose --env-file "$SMOKE_ENV" --project-name "$PROJECT" \
+        --file "$PROFILE_DIR/compose.yaml" "$@"
+}
 
 python "$ROOT/scripts/check-release-drift.py"
 
 cleanup() {
-    EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
-        docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
-        --profile self-hosting down --volumes --remove-orphans >/dev/null 2>&1 || true
+    compose --profile self-hosting down --volumes --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$SMOKE_TMP"
 }
 trap cleanup EXIT INT TERM
@@ -36,13 +47,9 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     docker build --tag "$IMAGE" "$ROOT"
 fi
 
-EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
-    docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
-    --profile self-hosting up --detach
+compose --profile self-hosting up --detach
 
-HOST_PORT=$(EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
-    docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
-    port exporter 8080 | sed -n '1s/.*://p')
+HOST_PORT=$(compose port exporter 8080 | sed -n '1s/.*://p')
 if [[ -z $HOST_PORT ]]; then
     echo "self-hosting exporter did not publish port 8080" >&2
     exit 1
@@ -56,13 +63,9 @@ for _ in $(seq 1 90); do
     if [[ $health_status == 200 && $ready_status == 200 ]]; then
         break
     fi
-    running=$(EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
-        docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
-        ps --status running --services)
+    running=$(compose ps --status running --services)
     if ! grep -qx exporter <<< "$running"; then
-        EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
-            docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
-            logs exporter >&2 || true
+        compose logs exporter >&2 || true
         exit 1
     fi
     sleep 1
@@ -71,9 +74,7 @@ done
 [[ ${health_status:-} == 200 ]]
 [[ ${ready_status:-} == 200 ]]
 
-S3_PORT=$(EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
-    docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
-    port s3-fixture 9000 | sed -n '1s/.*://p')
+S3_PORT=$(compose port s3-fixture 9000 | sed -n '1s/.*://p')
 BROWSER_HOST=dashboard.example.test
 BROWSER_BASE_URL="http://127.0.0.1:$S3_PORT/git-activity/data"
 # The Host header selects the fixture's website handler. The path is the same

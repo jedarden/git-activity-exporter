@@ -33,6 +33,18 @@ class ImmutableObjectError(RuntimeError):
     """An immutable S3 object exists with bytes or metadata that differ."""
 
 
+class S3ClientError(RuntimeError):
+    """The S3 client could not be constructed without exposing its inputs."""
+
+
+class S3OperationError(RuntimeError):
+    """A safe summary of an S3 operation failure."""
+
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class S3PermissionError(RuntimeError):
     """The destination failed the startup permission preflight."""
 
@@ -59,6 +71,18 @@ def _safe_error_summary(error: Exception) -> str:
             return f"{code} (HTTP {status})"
         return code
     return type(error).__name__
+
+
+def redact_credentials(text: str, endpoint: S3Endpoint) -> str:
+    """Remove configured S3 credential values from arbitrary exception text."""
+    redacted = str(text or "")
+    for secret in (
+        getattr(endpoint, "access_key_id", ""),
+        getattr(endpoint, "secret_access_key", ""),
+    ):
+        if secret:
+            redacted = redacted.replace(secret, "<redacted>")
+    return redacted
 
 
 def _permission_probe_key(prefix: str) -> str:
@@ -134,6 +158,8 @@ def check_permissions(s3, bucket: str, prefix: str):
 
 
 def _is_transient(error: Exception) -> bool:
+    if isinstance(error, S3OperationError):
+        return error.retryable
     if isinstance(error, ClientError):
         response = error.response or {}
         error_info = response.get("Error", {})
@@ -153,36 +179,58 @@ def _is_transient(error: Exception) -> bool:
 
 
 def _call(operation, label):
-    return retry.call(operation, is_retryable=_is_transient, label=label)
+    try:
+        return retry.call(
+            operation,
+            is_retryable=_is_transient,
+            label=label,
+            error_summary=_safe_error_summary,
+        )
+    except Exception as error:
+        # Keep raw provider exceptions inside this adapter. Callers can still
+        # distinguish missing objects because the operation closures below
+        # handle those expected responses before this boundary.
+        raise S3OperationError(
+            f"{label} failed: {_safe_error_summary(error)}",
+            retryable=_is_transient(error),
+        ) from None
 
 
 def client(endpoint: S3Endpoint):
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint.endpoint_url,
-        aws_access_key_id=endpoint.access_key_id,
-        aws_secret_access_key=endpoint.secret_access_key,
-        region_name=endpoint.region,
-        # boto3's own adaptive/standard retries would otherwise compose with
-        # the application policy and make the attempt bound unknowable.
-        config=BotoConfig(
-            s3={"addressing_style": endpoint.addressing_style},
-            retries={"mode": "standard", "total_max_attempts": 1},
-        ),
-    )
+    try:
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint.endpoint_url,
+            aws_access_key_id=endpoint.access_key_id,
+            aws_secret_access_key=endpoint.secret_access_key,
+            region_name=endpoint.region,
+            # boto3's own adaptive/standard retries would otherwise compose
+            # with the application policy and make the attempt bound
+            # unknowable.
+            config=BotoConfig(
+                s3={"addressing_style": endpoint.addressing_style},
+                retries={"mode": "standard", "total_max_attempts": 1},
+            ),
+        )
+    except Exception as error:
+        # Some botocore/provider failures stringify request details. Keep the
+        # failure useful enough to identify client construction, but never
+        # let either configured credential escape through the exception.
+        message = redact_credentials(str(error), endpoint)
+        raise S3ClientError(f"S3 client creation failed: {message}") from None
 
 
 def download_bytes(s3, bucket: str, key: str):
     """Returns the object body, or None if it doesn't exist yet (first run)."""
-    try:
-        return _call(
-            lambda: s3.get_object(Bucket=bucket, Key=key)["Body"].read(),
-            f"S3 GET s3://{bucket}/{key}",
-        )
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
-            return None
-        raise
+    def get():
+        try:
+            return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                return None
+            raise
+
+    return _call(get, f"S3 GET s3://{bucket}/{key}")
 
 
 def fetch_object(s3, bucket: str, key: str):
@@ -191,16 +239,16 @@ def fetch_object(s3, bucket: str, key: str):
     Publication recovery compares both bytes and content type so a repaired
     fixed key has the same object metadata as its immutable source.
     """
-    try:
-        def get():
+    def get():
+        try:
             resp = s3.get_object(Bucket=bucket, Key=key)
             return resp["Body"].read(), resp.get("ContentType")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                return None
+            raise
 
-        return _call(get, f"S3 GET s3://{bucket}/{key}")
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
-            return None
-        raise
+    return _call(get, f"S3 GET s3://{bucket}/{key}")
 
 
 def delete_key(s3, bucket: str, key: str):

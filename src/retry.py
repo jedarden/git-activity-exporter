@@ -18,7 +18,13 @@ MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = (1, 2)
 
 
-def call(operation: Callable, *, is_retryable: Callable[[Exception], bool], label: str):
+def call(
+    operation: Callable,
+    *,
+    is_retryable: Callable[[Exception], bool],
+    label: str,
+    error_summary: Callable[[Exception], str] = str,
+):
     """Run one remote operation with the shared bounded retry policy.
 
     ``is_retryable`` is intentionally supplied by the transport adapter. A
@@ -35,6 +41,6 @@ def call(operation: Callable, *, is_retryable: Callable[[Exception], bool], labe
             delay = BACKOFF_SECONDS[attempt - 1]
             log.warning(
                 "transient failure during %s (attempt %d/%d); retrying in %ss: %s",
-                label, attempt, MAX_ATTEMPTS, delay, error,
+                label, attempt, MAX_ATTEMPTS, delay, error_summary(error),
             )
             time.sleep(delay)

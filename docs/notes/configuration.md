@@ -320,6 +320,22 @@ So the deployment's only job is to land those values in the pod env by some
 secrets-by-reference means. The values must exist in as few places as
 possible and never in git, a ConfigMap, or a log.
 
+This environment injection is the supported provisioning path: a secret
+manager (or a Kubernetes `Secret`/`ExternalSecret` reconciled from one) sets
+`DEST_S3_ENDPOINT`, `DEST_S3_ACCESS_KEY_ID`, and
+`DEST_S3_SECRET_ACCESS_KEY` in the exporter process environment. The exporter
+does not accept S3 credentials as command-line flags, does not read credential
+files, and never passes them to a subprocess. For Docker or local smoke runs,
+use an ephemeral `--env-file` or inherited environment instead of
+`--env NAME=value`, so the values are absent from the child process argument
+list as well.
+
+Credential values are intentionally absent from client-construction errors,
+publication errors, retry logs, and the `/health` response. Provider error
+messages are reduced to a safe type/code/status summary before they are logged;
+the health contract exposes only publication state. The smoke scripts use
+temporary env files and their output contains no credential values.
+
 The author's deployment (manifests in the `declarative-config` repo,
 `k8s/ardenone-cluster/git-activity-exporter/`) wires them like this, as the
 reference for reusers:

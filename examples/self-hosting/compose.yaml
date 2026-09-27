@@ -3,7 +3,7 @@ services:
   # second exporter or create a local destination by accident.
   forgejo-fixture:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.35}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.36}
     command: [python, /fixture/mock-forgejo.py]
     environment:
       FORGE_OWNER: reuser
@@ -19,7 +19,7 @@ services:
 
   s3-fixture:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.35}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.36}
     command: [python, /fixture/mock-s3.py]
     environment:
       # The smoke sends browser-shaped requests with this Host header. The
@@ -40,7 +40,7 @@ services:
 
   mirror-volume-init:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.35}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.36}
     user: "0:0"
     command: [sh, -c, mkdir -p /data/mirrors && chown -R 1000:1000 /data/mirrors]
     volumes:
@@ -48,7 +48,7 @@ services:
 
   exporter:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.35}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.36}
     depends_on:
       forgejo-fixture:
         condition: service_healthy
@@ -59,15 +59,15 @@ services:
     environment:
       FORGE_BASE_URL: http://forgejo-fixture:8081
       FORGE_OWNER: reuser
-      FORGE_TOKEN: self-hosting-forge-token
+      FORGE_TOKEN: ${SMOKE_FORGE_TOKEN}
       GIT_CONFIG_SYSTEM: /etc/git-activity-exporter/gitconfig
       FAMILIES_FILE: /etc/git-activity-exporter/families.yaml
       CLONE_ROOT: /data/mirrors
       DEST_S3_ENDPOINT: http://s3-fixture:9000
       DEST_S3_BUCKET: reuser-git-activity
       DEST_S3_PREFIX: exports/reuser
-      DEST_S3_ACCESS_KEY_ID: self-hosting-access-key
-      DEST_S3_SECRET_ACCESS_KEY: self-hosting-secret-key
+      DEST_S3_ACCESS_KEY_ID: ${SMOKE_S3_ACCESS_KEY_ID}
+      DEST_S3_SECRET_ACCESS_KEY: ${SMOKE_S3_SECRET_ACCESS_KEY}
       DEST_S3_ADDRESSING_STYLE: path
       WINDOW_DAYS: "30"
       SHALLOW_SINCE_DAYS: "40"

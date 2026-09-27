@@ -105,6 +105,14 @@ class PublicationError(RuntimeError):
     """A cycle could not be published; the previous cycle remains live."""
 
 
+def raise_safe_publication_error(message: str, error: Exception):
+    """Raise a publication error without retaining a raw provider exception."""
+    safe = f"{message}: {s3io._safe_error_summary(error)}"
+    # Keep a useful, sanitized cause for callers that inspect the phase while
+    # ensuring traceback formatting cannot reveal a provider request/secret.
+    raise PublicationError(safe) from s3io.S3OperationError(safe)
+
+
 @dataclass(frozen=True)
 class _PointerState:
     """The result of reading current.json without trusting its contents."""
@@ -485,9 +493,9 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
             s3, bucket, prefix, expected_names=names
         )
     except Exception as e:
-        raise PublicationError(
-            f"publication recovery failed before staging {cycle_id}"
-        ) from e
+        raise_safe_publication_error(
+            f"publication recovery failed before staging {cycle_id}", e
+        )
 
     bootstrap_snapshot = None
     if not recovery.prune_allowed:
@@ -496,9 +504,9 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
                 s3, bucket, prefix, names
             )
         except Exception as e:
-            raise PublicationError(
-                f"publication bootstrap snapshot failed before staging {cycle_id}"
-            ) from e
+            raise_safe_publication_error(
+                f"publication bootstrap snapshot failed before staging {cycle_id}", e
+            )
 
     pointer_key = f"{prefix}/{POINTER_NAME}"
     base = f"{prefix}/cycles/{cycle_id}/"
@@ -506,9 +514,9 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
     try:
         collision = s3io.prefix_exists(s3, bucket, base)
     except Exception as e:
-        raise PublicationError(
-            f"cycle collision check failed for {cycle_id}; previous cycle untouched"
-        ) from e
+        raise_safe_publication_error(
+            f"cycle collision check failed for {cycle_id}; previous cycle untouched", e
+        )
     if collision:
         raise PublicationError(f"cycle_id collision: {cycle_id} already exists")
 
@@ -521,7 +529,9 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
                 cache_control=IMMUTABLE_CACHE_CONTROL,
             )
     except Exception as e:
-        raise PublicationError(f"staging {base} failed; previous cycle untouched") from e
+        raise_safe_publication_error(
+            f"staging {base} failed; previous cycle untouched", e
+        )
 
     # Step 4: mirror to the fixed keys, meta.json last.
     try:
@@ -534,9 +544,9 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
         _recover_after_failure(
             s3, bucket, prefix, "fixed-key mirror", bootstrap_snapshot
         )
-        raise PublicationError(
-            "fixed-key mirror failed; fixed keys restored to the previous cycle"
-        ) from e
+        raise_safe_publication_error(
+            "fixed-key mirror failed; fixed keys restored to the previous cycle", e
+        )
 
     # Step 5: the commit. One atomic PUT.
     committed_pointer = pointer_bytes(cycle_id, generated_at, names)
@@ -555,14 +565,18 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
                     report = _prune(s3, bucket, prefix, keep=cycle_id, retention=retention)
                     _record_prune_health(cycle_id, report)
                 return pointer_key
-        except Exception:
-            log.exception("could not resolve ambiguous pointer PUT for %s", cycle_id)
+        except Exception as resolve_error:
+            log.error(
+                "could not resolve ambiguous pointer PUT for %s: %s",
+                cycle_id,
+                s3io._safe_error_summary(resolve_error),
+            )
         _recover_after_failure(
             s3, bucket, prefix, "pointer commit", bootstrap_snapshot
         )
-        raise PublicationError(
-            "pointer write failed; fixed keys restored to the previous cycle"
-        ) from e
+        raise_safe_publication_error(
+            "pointer write failed; fixed keys restored to the previous cycle", e
+        )
 
     if recovery.prune_allowed:
         report = _prune(s3, bucket, prefix, keep=cycle_id, retention=retention)
@@ -577,10 +591,11 @@ def _recover_after_failure(s3, bucket, prefix: str, phase: str, bootstrap_snapsh
             _restore_fixed_snapshot(s3, bucket, prefix, bootstrap_snapshot)
         else:
             recover_publication(s3, bucket, prefix, expected_names=DEFAULT_FIXED_NAMES)
-    except Exception:
-        log.exception(
-            "recovery after %s failed; fixed keys may remain mixed until restart",
+    except Exception as error:
+        log.error(
+            "recovery after %s failed; fixed keys may remain mixed until restart: %s",
             phase,
+            s3io._safe_error_summary(error),
         )
 
 
@@ -604,11 +619,11 @@ def _prune(s3, bucket: str, prefix: str, keep: str, retention: int):
             ),
             reverse=True,
         )
-    except Exception:
+    except Exception as error:
         log.warning(
-            "cycle prune discovery failed for keep=%s; cleanup deferred",
+            "cycle prune discovery failed for keep=%s; cleanup deferred: %s",
             keep,
-            exc_info=True,
+            s3io._safe_error_summary(error),
         )
         return PruneReport("failed", (keep,))
     doomed = [cid for cid in ids if cid != keep][max(0, retention - 1):]
@@ -618,12 +633,12 @@ def _prune(s3, bucket: str, prefix: str, keep: str, retention: int):
             for key in s3io.list_keys(s3, bucket, f"{base}{cid}/"):
                 s3io.delete_key(s3, bucket, key)
             log.info("pruned cycle %s", cid)
-        except Exception:
+        except Exception as error:
             failed.append(cid)
             log.warning(
-                "cycle prune deletion failed for keep=%s cycle=%s; cleanup deferred",
+                "cycle prune deletion failed for keep=%s cycle=%s; cleanup deferred: %s",
                 keep,
                 cid,
-                exc_info=True,
+                s3io._safe_error_summary(error),
             )
     return PruneReport("failed" if failed else "succeeded", tuple(failed))

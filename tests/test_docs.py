@@ -63,6 +63,23 @@ def test_forgejo_git_credential_contract_is_documented():
         assert phrase in section, f"credential-safety contract missing: {phrase}"
 
 
+def test_s3_credential_provisioning_and_redaction_contract_is_documented():
+    text = CONFIGURATION_MD.read_text()
+    _, _, section = text.partition("## Destination credentials (`DEST_S3_*`)")
+    assert section, "configuration.md lost the S3 credential section"
+    section = section.split("\n## ", 1)[0]
+    for phrase in (
+        "process environment",
+        "does not accept S3 credentials as command-line flags",
+        "never passes them to a subprocess",
+        "ephemeral `--env-file`",
+        "client-construction errors",
+        "publication errors",
+        "`/health` response",
+    ):
+        assert phrase in section, f"S3 credential-safety contract missing: {phrase}"
+
+
 def test_documented_meta_keys_match_builder():
     section = CONFIGURATION_MD.parent / "output-schema.md"
     text = section.read_text()
