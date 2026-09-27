@@ -6,8 +6,9 @@ One endpoint answers "which repos exist": `GET
 {FORGE_BASE_URL}/api/v1/repos/search`, called with `Authorization: token
 <FORGE_TOKEN>` and query parameters `owner` (pinned to `FORGE_OWNER`),
 `limit` (fixed at 50) and `page` (1-based), each request bounded by
-`HTTP_TIMEOUT_SECONDS`. It is discovery only — commit data deliberately
-does not come from the API, where a page of 50 commits costs ~1s without
+`HTTP_TIMEOUT_SECONDS` per attempt. A transient 5xx, connection failure, or
+timeout gets the bounded retry policy below. It is discovery only — commit data
+deliberately does not come from the API, where a page of 50 commits costs ~1s without
 stats and ~13s with and the same numbers come free from `git log` against
 the local mirror.
 
@@ -126,8 +127,36 @@ use the same clock.
 ## Failure semantics
 
 Specified here because every one of these used to be an accident of
-implementation. `GIT_TIMEOUT_SECONDS` (default 600) bounds each git
-invocation individually — clone, fetch, `log`, `ls-tree`, `show` — not a cycle.
+implementation.
+
+### Transient failure retries
+
+All remote retrying is bounded per operation: three total attempts, with a
+deterministic 1-second delay before attempt 2 and a 2-second delay before
+attempt 3. There is no jitter and no retry budget shared across a cycle. The
+configured `HTTP_TIMEOUT_SECONDS` and `GIT_TIMEOUT_SECONDS` apply to each
+attempt, not to the whole three-attempt operation, so the worst case is three
+timeouts plus two backoff delays for that operation. An exhausted operation
+still has the cycle-fatal or per-repository result described below.
+
+The policy covers Forgejo enumeration `GET`s (5xx responses, connection
+failures, and timeouts), remote Git `fetch`/`clone` operations (connection
+failures and timeouts, including bounded deepen fetches), and S3 API calls.
+In particular, every S3 `PUT` during staging, fixed-key mirroring, commit, or
+best-effort rollback gets the same policy. S3 throttling, 5xx responses, and
+transport/timeouts are transient. The S3 SDK's own retries are disabled so it
+cannot multiply these attempts. Reads, listings, and deletes use the same S3
+classification; retention cleanup remains non-fatal as specified below.
+
+Authentication, validation, other HTTP 4xx responses, corrupt-mirror errors,
+and local Git scan commands (`log`, `ls-tree`, and `show`) are not retried.
+Retries apply to one operation only: they never restart enumeration from page
+1, repeat a whole cycle, or bypass publication rollback.
+
+`GIT_TIMEOUT_SECONDS` (default 600) bounds each Git attempt individually —
+clone, fetch, `log`, `ls-tree`, `show` — not a cycle. `HTTP_TIMEOUT_SECONDS`
+(default 30) has the corresponding per-attempt meaning for each Forgejo API
+page request.
 
 **A timed-out fetch keeps the mirror and serves it stale.** The repo still
 appears in the cycle, scanned from the previous cycle's copy, and is listed
@@ -221,14 +250,15 @@ Forgejo token failed 97 of 112 repos while the 15 public ones kept cloning,
 and an every-repo guard stayed quiet while a 6,588-cell dataset was replaced
 by a 1,580-cell one.
 
-**Persistent failure has no in-cycle retry or circuit breaker.** The next poll
-is the retry, and there is no memory of past cycles across an exporter restart,
-deliberately: per-cycle truth is what `meta.json` can honestly state. A repo
-whose clone, `log`, forensic lookup, or forensic `show` keeps failing appears
-in `repos_failed`/`repo_errors` of every cycle that publishes; a repo whose fetch
-keeps timing out appears in `repos_stale` instead. Comparing successive
-`meta.json` objects exposes either form of persistence without silently
-discarding the last usable mirror.
+**Persistent failure has no cycle-level retry or circuit breaker.** Once an
+operation has exhausted its three attempts, the cycle follows the rules below
+and sleeps the full `POLL_INTERVAL_SECONDS` before the next cycle. There is no
+memory of past cycles across an exporter restart: per-cycle truth is what
+`meta.json` can honestly state. A repo whose clone, `log`, forensic lookup, or
+forensic `show` keeps failing appears in `repos_failed`/`repo_errors` of every
+cycle that publishes; a repo whose fetch keeps timing out appears in
+`repos_stale` instead. Comparing successive `meta.json` objects exposes either
+form of persistence without silently discarding the last usable mirror.
 
 **A Forgejo enumeration failure fails the cycle before repo processing.** No
 mirrors are pruned and no objects are published; the previous published
@@ -262,15 +292,17 @@ the previous cycle live everywhere. The pre-protocol loop serialized each
 table inside its upload, so the same failure had already overwritten
 `hourly.parquet` by the time it fired.
 
-**A staging upload failure leaves the previous cycle committed.** The
-publisher first checks that `cycles/<cycle_id>/` is empty, so an ID collision
-is rejected before any payload, fixed-key, or pointer PUT. Payloads then land
-under that prefix before anything consumer-visible changes; the first upload
-failure aborts there. The orphaned prefix is inert — nothing points at it —
-and is swept by the retention prune of a later cycle.
+**A staging upload failure leaves the previous cycle committed.** After its
+bounded PUT attempts are exhausted, the publisher first checks that
+`cycles/<cycle_id>/` is empty, so an ID collision is rejected before any
+payload, fixed-key, or pointer PUT. Payloads then land under that prefix before
+anything consumer-visible changes; the first upload failure aborts there. The
+orphaned prefix is inert — nothing points at it — and is swept by the retention
+prune of a later cycle.
 
-**A fixed-key mirror or pointer failure rolls the fixed keys back.** The
-fixed keys are snapshotted in memory before they are overwritten; any
+**A fixed-key mirror or pointer failure rolls the fixed keys back.** After its
+bounded PUT attempts are exhausted, the fixed keys are snapshotted in memory
+before they are overwritten; any
 failure from the first mirror PUT through the commit PUT restores that
 snapshot before the cycle fails. After any failed publication, the pointer
 and the fixed keys both name the previous complete cycle — never a mixture

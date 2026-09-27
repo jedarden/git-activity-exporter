@@ -8,12 +8,31 @@ come from the API: measured 2026-08-17 against git.ardenone.com (Forgejo
 same numbers come free from `git log --numstat` against a local mirror.
 """
 import logging
+import re
 
 import requests
+
+from . import retry
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
+
+
+def _is_transient(error: Exception) -> bool:
+    """Whether a Forgejo page request may succeed on another attempt."""
+    if isinstance(error, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(error, requests.HTTPError):
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is not None:
+            return 500 <= status < 600
+        # Keep mocked/adapted response implementations useful without making
+        # production behavior depend on parsing an exception string.
+        match = re.search(r"\b([5-9][0-9]{2})\b", str(error))
+        return bool(match and 500 <= int(match.group(1)) < 600)
+    return False
 
 
 def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=()):
@@ -23,12 +42,23 @@ def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=())
 
     repos, page = [], 1
     while True:
-        resp = session.get(
-            f"{base_url}/api/v1/repos/search",
-            params={"limit": PAGE_SIZE, "page": page, "owner": owner},
-            timeout=timeout,
+        def get_page():
+            resp = session.get(
+                f"{base_url}/api/v1/repos/search",
+                params={"limit": PAGE_SIZE, "page": page, "owner": owner},
+                timeout=timeout,
+            )
+            # The status check belongs inside the retry operation: a 5xx is
+            # the response from this attempt, not a successful GET followed
+            # by a separate non-retryable validation step.
+            resp.raise_for_status()
+            return resp
+
+        resp = retry.call(
+            get_page,
+            is_retryable=_is_transient,
+            label=f"Forgejo repository enumeration page {page}",
         )
-        resp.raise_for_status()
         batch = resp.json().get("data") or []
         if not batch:
             break

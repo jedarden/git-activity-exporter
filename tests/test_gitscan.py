@@ -10,6 +10,13 @@ from src.config import DEFAULT_EXCLUDED_PATHS
 from src.window import ReportingWindow
 
 
+@pytest.fixture(autouse=True)
+def no_retry_sleep(monkeypatch):
+    # Backoff timing is pinned in tests/test_retry.py; remote-operation tests
+    # should not spend real seconds waiting between injected faults.
+    monkeypatch.setattr(gitscan.retry.time, "sleep", lambda _seconds: None)
+
+
 def test_bead_id_prefers_trailer_over_scope():
     assert gitscan._bead_id_from("fix(needle-aaaaaaaa): x", "needle-bbbbbbbb") == "needle-bbbbbbbb"
 
@@ -211,7 +218,7 @@ def test_fetch_timeout_keeps_mirror_and_serves_it_stale(tmp_path, monkeypatch):
     assert out_path == str(path)
     assert refreshed is False, "a fetch timeout must surface as stale, not failure"
     assert path.is_dir(), "the mirror must survive a timed-out fetch"
-    assert len(calls) == 1, "no re-clone may follow a fetch timeout"
+    assert len(calls) == gitscan.retry.MAX_ATTEMPTS, "no re-clone may follow a fetch timeout"
     assert "fetch" in calls[0]
 
 

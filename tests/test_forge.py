@@ -23,6 +23,13 @@ OWNER = "test-owner"
 TIMEOUT = 30
 
 
+@pytest.fixture(autouse=True)
+def no_retry_sleep(monkeypatch):
+    # Retry timing is tested directly in tests/test_retry.py. Keep API tests
+    # quick while still asserting every attempt.
+    monkeypatch.setattr(forge.retry.time, "sleep", lambda _seconds: None)
+
+
 class FakeResponse:
     def __init__(self, payload, status=200):
         self.payload = payload
@@ -30,10 +37,22 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(f"{self.status_code} error for repos/search")
+            error = requests.HTTPError(f"{self.status_code} error for repos/search")
+            error.response = self
+            raise error
 
     def json(self):
         return self.payload
+
+
+class ResponseSequence:
+    """Responses for one page, consumed once per attempt."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+
+    def next(self):
+        return self.responses.pop(0)
 
 
 class FakeForge:
@@ -64,6 +83,8 @@ class FakeForge:
                     "authorization": self.headers.get("Authorization"),
                 })
                 item = outer.pages[params.get("page", 1) - 1]
+                if isinstance(item, ResponseSequence):
+                    item = item.next()
                 if isinstance(item, Exception):
                     raise item
                 if isinstance(item, int):
@@ -196,14 +217,33 @@ def test_http_error_response_fails_the_walk(monkeypatch):
     f = FakeForge([page(1), 500]).install(monkeypatch)
     with pytest.raises(requests.HTTPError):
         forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
-    assert [c["params"]["page"] for c in f.calls] == [1, 2], "no retry, no partial result"
+    assert [c["params"]["page"] for c in f.calls] == [1, 2, 2, 2]
+
+
+def test_http_5xx_succeeds_on_a_later_attempt(monkeypatch):
+    f = FakeForge([ResponseSequence(503, 503, page(1, count=1))]).install(monkeypatch)
+
+    out = forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert [c["params"]["page"] for c in f.calls] == [1, 1, 1]
+    assert {c["timeout"] for c in f.calls} == {TIMEOUT}
+    assert [r["name"] for r in out] == ["repo-1"]
+
+
+def test_client_error_is_not_retried(monkeypatch):
+    f = FakeForge([401]).install(monkeypatch)
+
+    with pytest.raises(requests.HTTPError):
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert len(f.calls) == 1
 
 
 def test_transport_error_fails_the_walk(monkeypatch):
     f = FakeForge([requests.ConnectionError("connection refused")]).install(monkeypatch)
     with pytest.raises(requests.ConnectionError):
         forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
-    assert len(f.calls) == 1
+    assert len(f.calls) == forge.retry.MAX_ATTEMPTS
 
 
 # --- enumeration completeness vs. pruning ----------------------------------

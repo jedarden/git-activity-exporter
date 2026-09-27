@@ -9,6 +9,7 @@ same calls the real client makes.
 import json
 
 import pytest
+from botocore.exceptions import ClientError
 
 from src import publish, s3io
 from tests.fake_s3 import FakeS3
@@ -52,6 +53,16 @@ def do_publish(s3, tag, retention=publish.RETAINED_CYCLES):
     return publish.publish_cycle(
         s3, BUCKET, PREFIX, payloads(tag), cycle_id=cycle,
         generated_at=generated_at, retention=retention,
+    )
+
+
+def transient_s3_error(code="InternalError", status=500):
+    return ClientError(
+        {
+            "Error": {"Code": code, "Message": "temporary S3 failure"},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        },
+        "PutObject",
     )
 
 
@@ -229,6 +240,51 @@ def test_staging_failure_leaves_previous_cycle_live_everywhere():
     with pytest.raises(publish.PublicationError):
         do_publish(s3, "B")
 
+    assert_pointer_view_is("A", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}
+
+
+def test_transient_staging_put_retries_then_publishes(monkeypatch):
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    attempts = {"count": 0}
+
+    def fail_twice(op, key):
+        if op == "put" and key == f"{PREFIX}/cycles/{cycle_id('B')}/hourly.parquet":
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                return transient_s3_error()
+        return None
+
+    sleeps = []
+    monkeypatch.setattr(s3io.retry.time, "sleep", sleeps.append)
+    s3.fail_when(fail_twice)
+
+    do_publish(s3, "B")
+
+    assert attempts["count"] == 3
+    assert sleeps == [1, 2]
+    assert_pointer_view_is("B", s3)
+
+
+def test_exhausted_transient_pointer_put_rolls_fixed_keys_back(monkeypatch):
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    attempts = {"count": 0}
+
+    def fail_pointer(op, key):
+        if op == "put" and key == f"{PREFIX}/current.json":
+            attempts["count"] += 1
+            return transient_s3_error()
+        return None
+
+    monkeypatch.setattr(s3io.retry.time, "sleep", lambda _seconds: None)
+    s3.fail_when(fail_pointer)
+
+    with pytest.raises(publish.PublicationError, match="pointer write failed"):
+        do_publish(s3, "B")
+
+    assert attempts["count"] == s3io.retry.MAX_ATTEMPTS
     assert_pointer_view_is("A", s3)
     assert fixed_keys(s3) == {name: data for name, data, _ in payloads("A")}
 

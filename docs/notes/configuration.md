@@ -23,8 +23,8 @@ everything else has a default.
 | `FAMILIES_FILE` | `families.yaml` | repo → family map; a relative path resolves against the process working directory — [The families file](#the-families-file) |
 | `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
 | `POLL_INTERVAL_SECONDS` | `3600` | sleep from one cycle attempt's end to the next cycle's start — [Poll-cycle lifecycle](#poll-cycle-lifecycle) |
-| `GIT_TIMEOUT_SECONDS` | `600` | per git invocation — clone, fetch, `log`, `ls-tree`, `show`; what a timeout *does* is [Failure semantics](data-sources.md#failure-semantics) |
-| `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API call (repo enumeration only) |
+| `GIT_TIMEOUT_SECONDS` | `600` | per Git attempt — clone, fetch, `log`, `ls-tree`, `show`; remote clone/fetch attempts use the [bounded retry policy](data-sources.md#transient-failure-retries) |
+| `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API attempt (repo enumeration only); 5xx/transport failures use the [bounded retry policy](data-sources.md#transient-failure-retries) |
 | `HEALTH_PORT` | `8080` | port for the [health endpoints](#health-endpoints) |
 | `LOG_LEVEL` | `INFO` | |
 | `DEST_S3_ENDPOINT` | *(required)* | S3-compatible endpoint URL |
@@ -118,9 +118,11 @@ Three consequences are deliberate:
   collecting is not debited against the following interval, and an overrun is
   never compensated by a shortened one. Cadence drifts forward monotonically;
   a run of overruns cannot bunch into back-to-back cycles.
-- **A failed cycle waits the full interval before retrying.** No backoff, no
-  in-cycle retry — as in [failure semantics](data-sources.md#failure-semantics),
-  the next poll *is* the retry.
+- **A failed cycle waits the full interval before retrying.** Individual
+  transient remote operations may already have used their bounded retries, but
+  there is no cycle-level backoff or immediate whole-cycle retry. As in
+  [failure semantics](data-sources.md#failure-semantics), the next poll is the
+  retry after an operation is exhausted.
 - **The sleep is interruptible.** It is an event wait, not a busy `time.sleep`,
   so a shutdown signal arriving mid-sleep exits immediately rather than after
   the remaining interval.

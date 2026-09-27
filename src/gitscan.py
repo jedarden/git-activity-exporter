@@ -14,6 +14,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from . import retry
 from .window import ReportingWindow, as_utc
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,35 @@ class GitTimeout(GitError):
     """
 
 
+_TRANSIENT_GIT_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "could not resolve host",
+    "early eof",
+    "network is unreachable",
+    "remote end hung up",
+    "the requested url returned error: 5",
+    "timed out",
+    "tls handshake timeout",
+    "temporary failure in name resolution",
+    "curl 5",
+    "curl 6",
+    "curl 7",
+    "curl 28",
+    "curl 35",
+    "curl 56",
+)
+
+
+def _is_transient_remote_error(error: Exception) -> bool:
+    if isinstance(error, GitTimeout):
+        return True
+    if not isinstance(error, GitError):
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in _TRANSIENT_GIT_MARKERS)
+
+
 def _run(args, timeout, cwd=None, env=None):
     """Run git, and NEVER let a credential reach an exception string.
 
@@ -67,6 +97,20 @@ def _run(args, timeout, cwd=None, env=None):
     if proc.returncode != 0:
         raise GitError(f"{_safe(args)} failed rc={proc.returncode}: {_scrub(proc.stderr.strip()[:300])}")
     return proc.stdout
+
+
+def _run_remote(args, timeout, cwd=None, env=None, before_attempt=None):
+    """Run a fetch/clone operation with bounded transient-fault retries."""
+    def operation():
+        if before_attempt is not None:
+            before_attempt()
+        return _run(args, timeout, cwd=cwd, env=env)
+
+    return retry.call(
+        operation,
+        is_retryable=_is_transient_remote_error,
+        label=_safe(args),
+    )
 
 
 # Anything that looks like credentials in a URL, whatever the scheme.
@@ -132,14 +176,14 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     if os.path.exists(os.path.join(path, "HEAD")):
         try:
             refspec = "+refs/heads/*:refs/heads/*"
-            _run(["git", "-C", path, "fetch", "--quiet", "--prune", f"--shallow-since={since}",
-                  url, refspec], timeout, env=env)
+            _run_remote(["git", "-C", path, "fetch", "--quiet", "--prune", f"--shallow-since={since}",
+                        url, refspec], timeout, env=env)
             depth = max(_DEEPEN_MIN_COMMITS, shallow_since_days)
             for _ in range(_DEEPEN_MAX_ATTEMPTS):
                 if mirror_history_complete(path, reference, shallow_since_days, timeout):
                     break
-                _run(["git", "-C", path, "fetch", "--quiet", "--prune",
-                      f"--deepen={depth}", url, refspec], timeout, env=env)
+                _run_remote(["git", "-C", path, "fetch", "--quiet", "--prune",
+                             f"--deepen={depth}", url, refspec], timeout, env=env)
                 depth *= 2
             return path, True
         except GitTimeout as e:
@@ -161,7 +205,10 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         try:
-            _run(["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp], timeout, env=env)
+            _run_remote(
+                ["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp],
+                timeout, env=env, before_attempt=lambda: shutil.rmtree(tmp, ignore_errors=True),
+            )
         except GitError as e:
             # "error processing shallow info" means the cutoff excludes every
             # commit on the remote -- a repo dormant longer than the window. It
@@ -171,7 +218,10 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
                 raise
             log.info("%s has no commits since %s; cloning at depth 1 instead", repo["name"], since)
             shutil.rmtree(tmp, ignore_errors=True)
-            _run(["git", "clone", "--quiet", "--mirror", "--depth", "1", url, tmp], timeout, env=env)
+            _run_remote(
+                ["git", "clone", "--quiet", "--mirror", "--depth", "1", url, tmp],
+                timeout, env=env, before_attempt=lambda: shutil.rmtree(tmp, ignore_errors=True),
+            )
         shutil.rmtree(path, ignore_errors=True)
         os.rename(tmp, path)
         return path, True
