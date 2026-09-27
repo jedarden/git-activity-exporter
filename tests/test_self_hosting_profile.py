@@ -148,3 +148,14 @@ def test_family_mapping_change_rolls_out_and_is_loaded_by_the_next_process(tmp_p
     # out the Deployment, and the replacement process reads the new mapping.
     family_file.write_text(yaml.safe_dump(changed, sort_keys=False))
     assert _load_families_in_new_process(family_file)["reuser-project"] == "changed"
+
+
+def test_self_hosting_s3_fixture_supports_metadata_preflight():
+    fixture = (PROFILE / "mock-s3.py").read_text()
+
+    # The smoke exporter calls HeadObject against this fixture before it makes
+    # its first Forgejo request. Keep the fixture's metadata contract pinned
+    # so a future simplification does not make the smoke profile skip a
+    # required destination permission.
+    assert "def do_HEAD(self):" in fixture
+    assert "include_body=False" in fixture

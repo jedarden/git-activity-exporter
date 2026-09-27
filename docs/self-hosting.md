@@ -107,8 +107,22 @@ At minimum, the credential needs:
 
 - `GetObject`, `PutObject`, and `DeleteObject` for the selected prefix;
 - `ListBucket` for the selected prefix; and
-- permission to read the bucket's object metadata used during publication
-  recovery.
+- `HeadObject`/object-metadata read permission for the selected prefix.
+
+Before the first repository collection, the exporter runs a destination
+permission preflight. It lists the prefix, writes a unique temporary probe,
+reads its metadata with `HeadObject`, reads its body with `GetObject`, and
+deletes it. The probe is removed after the check, and collection does not
+begin until every operation succeeds. If the check fails, `/health` remains
+live, `/ready` remains `503`, and the exporter reports only the failed
+operation plus a sanitized provider code/status before retrying on the next
+poll interval; credentials and raw provider messages are not logged. The
+repository-owned smoke profile includes an S3 fixture with the metadata
+(`HEAD`) behavior needed to exercise this check:
+
+```bash
+scripts/smoke-self-hosting.sh
+```
 
 Configure these values in the workload:
 

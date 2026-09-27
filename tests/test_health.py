@@ -165,13 +165,15 @@ def test_readiness_transitions_across_failures_withholding_and_recovery(
     cfg = SimpleNamespace(
         log_level=logging.WARNING,
         families_file="families.yaml",
-        dest=object(),
+        dest=SimpleNamespace(bucket="activity-bucket"),
+        dest_prefix="exports/activity",
         health_port=8080,
         poll_interval_seconds=3600,
     )
     monkeypatch.setattr(main.config, "load", lambda: cfg)
     monkeypatch.setattr(main.families, "load", lambda _path: {})
     monkeypatch.setattr(main.s3io, "client", lambda _dest: object())
+    monkeypatch.setattr(main.s3io, "check_permissions", lambda *_args: None)
     monkeypatch.setattr(main.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(main, "_serve_health", lambda _port: None)
     monkeypatch.setattr(main, "_run_cycle", run_cycle)

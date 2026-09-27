@@ -79,13 +79,15 @@ def _drive(monkeypatch, outcomes, on_cycle=None, poll_interval_seconds=3600):
     cfg = SimpleNamespace(
         log_level=logging.CRITICAL,
         families_file="families.yaml",
-        dest=object(),
+        dest=SimpleNamespace(bucket="activity-bucket"),
+        dest_prefix="exports/activity",
         health_port=0,
         poll_interval_seconds=poll_interval_seconds,
     )
     monkeypatch.setattr(main.config, "load", lambda: cfg)
     monkeypatch.setattr(main.families, "load", lambda _path: {})
     monkeypatch.setattr(main.s3io, "client", lambda _dest: object())
+    monkeypatch.setattr(main.s3io, "check_permissions", lambda *_args: None)
     monkeypatch.setattr(main.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(
         main, "_serve_health", lambda port: events.append(("health", port))
@@ -95,6 +97,73 @@ def _drive(monkeypatch, outcomes, on_cycle=None, poll_interval_seconds=3600):
 
     main.main()
     return events
+
+
+def test_s3_permission_preflight_runs_before_the_first_collection(monkeypatch):
+    events = []
+    ScriptedStop.instances = []
+    ScriptedStop.log = events
+    ScriptedStop.stop_after_waits = 1
+
+    cfg = SimpleNamespace(
+        log_level=logging.CRITICAL,
+        families_file="families.yaml",
+        dest=SimpleNamespace(bucket="activity-bucket"),
+        dest_prefix="exports/activity",
+        health_port=0,
+        poll_interval_seconds=3600,
+    )
+    monkeypatch.setattr(main.config, "load", lambda: cfg)
+    monkeypatch.setattr(main.families, "load", lambda _path: {})
+    monkeypatch.setattr(main.s3io, "client", lambda _dest: object())
+    monkeypatch.setattr(main.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(main, "_serve_health", lambda _port: events.append("health"))
+    monkeypatch.setattr(main, "threading", SimpleNamespace(Event=ScriptedStop))
+    monkeypatch.setattr(main.s3io, "check_permissions", lambda *_args: events.append("preflight"))
+    monkeypatch.setattr(main, "_run_cycle", lambda *_args: events.append("cycle") or "generated")
+
+    main.main()
+
+    assert events[:3] == ["health", "preflight", "cycle"]
+
+
+def test_failed_s3_permission_preflight_retries_without_collecting(monkeypatch):
+    events = []
+    ScriptedStop.instances = []
+    ScriptedStop.log = events
+    ScriptedStop.stop_after_waits = 2
+    checks = iter([
+        main.s3io.S3PermissionError("safe preflight failure"),
+        None,
+    ])
+
+    cfg = SimpleNamespace(
+        log_level=logging.CRITICAL,
+        families_file="families.yaml",
+        dest=SimpleNamespace(bucket="activity-bucket"),
+        dest_prefix="exports/activity",
+        health_port=0,
+        poll_interval_seconds=3600,
+    )
+    monkeypatch.setattr(main.config, "load", lambda: cfg)
+    monkeypatch.setattr(main.families, "load", lambda _path: {})
+    monkeypatch.setattr(main.s3io, "client", lambda _dest: object())
+    monkeypatch.setattr(main.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(main, "_serve_health", lambda _port: events.append("health"))
+    monkeypatch.setattr(main, "threading", SimpleNamespace(Event=ScriptedStop))
+
+    def check_permissions(*_args):
+        events.append("preflight")
+        failure = next(checks)
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(main.s3io, "check_permissions", check_permissions)
+    monkeypatch.setattr(main, "_run_cycle", lambda *_args: events.append("cycle") or "generated")
+
+    main.main()
+
+    assert events[:6] == ["health", "preflight", ("wait", 3600), "preflight", "cycle", ("wait", 3600)]
 
 
 def _kinds(events):

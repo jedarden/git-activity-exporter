@@ -1,4 +1,6 @@
 import logging
+import re
+import uuid
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -29,6 +31,106 @@ _TRANSIENT_ERROR_CODES = {
 
 class ImmutableObjectError(RuntimeError):
     """An immutable S3 object exists with bytes or metadata that differ."""
+
+
+class S3PermissionError(RuntimeError):
+    """The destination failed the startup permission preflight."""
+
+
+_PERMISSION_PROBE_CONTENT = b"git-activity-exporter S3 permission probe\n"
+_SAFE_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _safe_error_summary(error: Exception) -> str:
+    """Summarize a remote error without copying its provider message.
+
+    Provider messages can echo request data, endpoint details, or credentials.
+    Error codes and HTTP statuses are sufficient to identify a missing scope
+    while keeping the startup log safe to expose to operators.
+    """
+    if isinstance(error, ClientError):
+        response = error.response or {}
+        error_info = response.get("Error", {})
+        code = error_info.get("Code")
+        if not isinstance(code, str) or not _SAFE_ERROR_CODE.fullmatch(code):
+            code = "provider-error"
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if isinstance(status, int):
+            return f"{code} (HTTP {status})"
+        return code
+    return type(error).__name__
+
+
+def _permission_probe_key(prefix: str) -> str:
+    prefix = prefix.strip("/")
+    suffix = f".git-activity-exporter-permission-check/{uuid.uuid4().hex}"
+    return f"{prefix}/{suffix}" if prefix else suffix
+
+
+def check_permissions(s3, bucket: str, prefix: str):
+    """Verify every S3 operation required by collection and publication.
+
+    The check uses a unique temporary object so a missing object cannot be
+    mistaken for a successful GetObject permission. It always attempts to
+    delete a probe after PutObject has been attempted, including when a later
+    check fails. Only a sanitized operation summary is exposed to callers.
+    """
+    key = _permission_probe_key(prefix)
+    content_type = "application/octet-stream"
+    operation = "ListBucket"
+    probe_attempted = False
+    failure = None
+    cleanup_failure = None
+
+    try:
+        s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+
+        operation = "PutObject"
+        # The request may reach S3 even when the client loses its response, so
+        # cleanup is attempted whenever the PUT has been started.
+        probe_attempted = True
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=_PERMISSION_PROBE_CONTENT,
+            ContentType=content_type,
+        )
+
+        operation = "HeadObject (metadata)"
+        metadata = s3.head_object(Bucket=bucket, Key=key)
+        if metadata.get("ContentLength") != len(_PERMISSION_PROBE_CONTENT):
+            raise ValueError("unexpected probe content length")
+        if metadata.get("ContentType") != content_type:
+            raise ValueError("unexpected probe content type")
+
+        operation = "GetObject"
+        response = s3.get_object(Bucket=bucket, Key=key)
+        body = response["Body"]
+        try:
+            if body.read() != _PERMISSION_PROBE_CONTENT:
+                raise ValueError("unexpected probe body")
+        finally:
+            close = getattr(body, "close", None)
+            if close is not None:
+                close()
+    except Exception as error:
+        failure = (operation, _safe_error_summary(error))
+    finally:
+        if probe_attempted:
+            try:
+                s3.delete_object(Bucket=bucket, Key=key)
+            except Exception as error:
+                cleanup_failure = ("DeleteObject", _safe_error_summary(error))
+
+    if failure is None and cleanup_failure is not None:
+        failure = cleanup_failure
+    if failure is not None:
+        operation, summary = failure
+        message = f"S3 destination permission preflight failed for {operation}: {summary}"
+        if cleanup_failure is not None and failure != cleanup_failure:
+            cleanup_operation, cleanup_summary = cleanup_failure
+            message += f"; cleanup {cleanup_operation} failed: {cleanup_summary}"
+        raise S3PermissionError(message) from None
 
 
 def _is_transient(error: Exception) -> bool:

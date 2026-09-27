@@ -44,6 +44,20 @@ def _list_response(bucket, query):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _send_object(self, include_body):
+        bucket, key = _parts(self.path)
+        item = OBJECTS.get((bucket, key))
+        if item is None:
+            self.send_error(404, "NoSuchKey")
+            return
+        body, content_type = item
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
+
     def do_GET(self):
         if urlsplit(self.path).path == "/health":
             self.send_response(200)
@@ -59,16 +73,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        item = OBJECTS.get((bucket, key))
-        if item is None:
-            self.send_error(404, "NoSuchKey")
-            return
-        body, content_type = item
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_object(include_body=True)
+
+    def do_HEAD(self):
+        # boto3's HeadObject call is the metadata permission check. The
+        # fixture returns the same object headers as GET without a body.
+        self._send_object(include_body=False)
 
     def do_PUT(self):
         bucket, key = _parts(self.path)

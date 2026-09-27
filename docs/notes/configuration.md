@@ -134,9 +134,12 @@ follows from that shape; each is pinned behaviorally against the real loop in
 
 **The first poll starts immediately.** Startup loads configuration, the family
 map, and the S3 client, binds the [health server](#health-endpoints), and then
-begins the first cycle with no initial delay — the first interval sleep happens
-only after the first cycle attempt has finished. A fresh deployment therefore
-lands its first publication one cycle-duration after start, not
+begins the first cycle attempt with no initial delay. That attempt first runs
+the S3 destination permission preflight: collection does not start until the
+configured prefix can be listed, a temporary probe can be written, its
+metadata and body can be read, and it can be deleted. The first interval
+sleep happens only after that cycle attempt has finished. A fresh deployment
+therefore lands its first publication one cycle-duration after start, not
 `POLL_INTERVAL_SECONDS` plus one cycle-duration, and `/ready` stays `503` until
 that publication commits.
 

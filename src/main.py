@@ -357,11 +357,24 @@ def main():
 
     _serve_health(cfg.health_port)
 
+    s3_permissions_checked = False
     while not stop.is_set():
         try:
+            if not s3_permissions_checked:
+                s3io.check_permissions(
+                    s3, cfg.dest.bucket, cfg.dest_prefix
+                )
+                s3_permissions_checked = True
+                log.info("S3 destination permission preflight passed")
             generated_at = _run_cycle(cfg, s3, family_map)
             _record_cycle_outcome("published", generated_at)
             _published.set()
+        except s3io.S3PermissionError as e:
+            _record_cycle_outcome("failed")
+            # S3PermissionError is deliberately sanitized by s3io. Do not
+            # log the provider exception or endpoint, which may contain
+            # credentials in a self-hosted configuration.
+            log.error("%s", e)
         except CycleWithheld as e:
             _record_cycle_outcome("withheld")
             log.warning("cycle withheld: %s", e)

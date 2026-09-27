@@ -23,6 +23,7 @@ class FakeS3:
     def __init__(self):
         self.objects = {}
         self.puts = []
+        self.calls = []
         self._fault = None
         self._after_put_fault = None
 
@@ -40,6 +41,7 @@ class FakeS3:
                 raise err
 
     def put_object(self, Bucket, Key, Body, ContentType):
+        self.calls.append(("put", Key))
         self._gate("put", Key)
         self.objects[Key] = (bytes(Body), ContentType)
         self.puts.append(Key)
@@ -49,18 +51,29 @@ class FakeS3:
                 raise error
 
     def get_object(self, Bucket, Key):
+        self.calls.append(("get", Key))
         self._gate("get", Key)
         if Key not in self.objects:
             raise _nosuch_key()
         data, ct = self.objects[Key]
         return {"Body": io.BytesIO(data), "ContentType": ct}
 
+    def head_object(self, Bucket, Key):
+        self.calls.append(("head", Key))
+        self._gate("head", Key)
+        if Key not in self.objects:
+            raise _nosuch_key()
+        data, ct = self.objects[Key]
+        return {"ContentLength": len(data), "ContentType": ct}
+
     def delete_object(self, Bucket, Key):
+        self.calls.append(("delete", Key))
         self._gate("delete", Key)
         self.objects.pop(Key, None)
 
     def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None,
                         MaxKeys=1000):
+        self.calls.append(("list", Prefix))
         self._gate("list", Prefix)
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
         if ContinuationToken:
