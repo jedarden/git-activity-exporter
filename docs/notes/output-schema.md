@@ -255,10 +255,10 @@ There are no per-tier files, so tiers cannot drift apart.
 | `family` | string | never | from `families.yaml`; `unassigned` when unmapped — [attribution over time](#family-attribution-over-time) |
 | `worker` | string | repository rows | null for the repo aggregate, the attributed actor for post-epoch rows, or `inferential` before the repo epoch |
 | `commits` | int64 | never, may be 0 | |
-| `bulk_commits` | int64 | never, may be 0 | commits flagged bulk (see the LOC filter below) |
-| `lines_added` / `lines_deleted` | int64 | never | excluded-path-filtered totals; bulk commits contribute 0 |
+| `bulk_commits` | int64 | never, may be 0 | commits flagged bulk; there is no separate bulk hourly row or split |
+| `lines_added` / `lines_deleted` | int64 | never | excluded-path-filtered totals from non-bulk commits; bulk commits contribute 0 |
 | `lines_added_raw` / `lines_deleted_raw` | int64 | never | unfiltered totals; bulk commits contribute in full |
-| `files_changed` | int64 | never | excluded paths and bulk commits contribute 0 |
+| `files_changed` | int64 | never | excluded-path-filtered total from non-bulk commits; bulk commits contribute 0 |
 | `beads_closed` | int64 | never | closures outside flagged bulk-import hours |
 | `beads_closed_bulk` | int64 | never | closures inside flagged bulk-import hours |
 | `beads_claimed` | int64 | never | |
@@ -289,9 +289,38 @@ lines.
 | `subject` | string | never | first line only |
 | `bead_id` | string | no bead referenced | from a `Bead-Id:`-style trailer, else a `fix(<bead-id>):` scope; a non-bead scope is not guessed into one |
 | `lines_added` / `lines_deleted` | int64 | never | filtered; see the LOC filter below |
-| `files_changed` | int64 | never | |
+| `files_changed` | int64 | never | excluded-path-filtered |
 | `lines_added_raw` / `lines_deleted_raw` | int64 | never | unfiltered |
-| `is_bulk` | bool | never | above `TRIM_MAX_LINES` or `TRIM_MAX_FILES` |
+| `is_bulk` | bool | never | true when the filtered combined line total is strictly above `TRIM_MAX_LINES` **or** the filtered file total is strictly above `TRIM_MAX_FILES`; equality is not bulk |
+
+## Commit bulk and filtered LOC contract
+
+`is_bulk` is a per-commit annotation. The exporter never drops a flagged
+commit: `commits.parquet` retains its row, and hourly `commits` includes it.
+`hourly.parquet` exposes the count in `bulk_commits`; it does not create a
+second bulk row or a bulk/non-bulk split.
+
+The flag is computed after `EXCLUDED_PATH_PATTERNS` filtering, using the
+per-commit `lines_added`, `lines_deleted`, and `files_changed` values:
+
+```text
+is_bulk = (lines_added + lines_deleted) > trim_max_lines
+          OR files_changed > trim_max_files
+```
+
+Both tests are independent, and both are strict. With the default thresholds,
+5,000 filtered changed lines and 200 filtered files are still ordinary; 5,001
+filtered changed lines or 201 filtered files is bulk. The line threshold is on
+the combined additions-plus-deletions total, not on either side separately.
+
+Bulk status affects only the hourly rollup's filtered measures: a flagged
+commit contributes zero to hourly `lines_added`, `lines_deleted`, and
+`files_changed`. Its full `lines_added_raw` and `lines_deleted_raw` values
+still contribute to the hourly raw audit totals. The raw pair is audit data,
+not another bulk trigger, and excluded-path-only changes therefore cannot make
+a commit bulk merely because their unfiltered counts are large. The commit's
+own filtered values remain in `commits.parquet` so the annotation and the
+filtering decision are inspectable together.
 
 ## `bead_events.parquet`
 
@@ -616,8 +645,8 @@ explicitly want an inferred bucket.
 **Lines of code excludes machine-generated paths.** Measured 2026-08-17 over
 30 days and 105 repos, `.beads/` bookkeeping alone was 68.1% of all line
 volume. `lines_*` excludes the configured patterns; `lines_*_raw` never
-does; a bulk commit counts as a commit and contributes only to the raw
-totals. Every column needed to recompute one from the other is present.
+does; a bulk commit counts as a commit and contributes only to the raw hourly
+totals. The complete bulk and threshold contract is above.
 
 **Bead closures carry a migration artifact.** Every forensic log in the
 fleet begins 2026-08-14 — the bead-rs migration — and three hours that day

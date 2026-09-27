@@ -14,8 +14,8 @@ everything else has a default.
 | `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
 | `WINDOW_DAYS` | `90` | positive reporting-window length in elapsed 24-hour UTC days; [boundary contract](data-sources.md#reporting-window-boundary-contract) |
 | `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | date-based history bound; existing mirrors deepen on fetch when a wider window is requested — [shallow-mirror behavior](data-sources.md#git--bounded-window-explicit-coverage) |
-| `TRIM_MAX_LINES` | `5000` | above this a commit is flagged bulk |
-| `TRIM_MAX_FILES` | `200` | above this a commit is flagged bulk |
+| `TRIM_MAX_LINES` | `5000` | strict upper bound on a commit's filtered `lines_added + lines_deleted`; above it the commit is flagged bulk — [commit bulk contract](output-schema.md#commit-bulk-and-filtered-loc-contract) |
+| `TRIM_MAX_FILES` | `200` | strict upper bound on a commit's filtered `files_changed`; above it the commit is flagged bulk — [commit bulk contract](output-schema.md#commit-bulk-and-filtered-loc-contract) |
 | `EXCLUDED_PATH_PATTERNS` | [the four defaults](#default-excluded-path-patterns) | regexes, comma-separated; replaces the default list wholesale |
 | `BEAD_BULK_CLOSE_THRESHOLD` | `150` | closures per `(repo, hour)` above which the cell is flagged |
 | `BEAD_BULK_HOUR_SHARE` | `0.5` | share of an hour's fleet-wide closures already flagged before the whole hour is treated as bulk |
@@ -34,6 +34,36 @@ everything else has a default.
 | `DEST_S3_REGION` | `us-east-1` | botocore region; most S3-compatible stores ignore it |
 | `DEST_S3_ADDRESSING_STYLE` | `virtual` | `path` wherever the store has no per-bucket virtual-host DNS — see [Destination credentials](#destination-credentials-dest_s3_) |
 | `DEST_S3_PREFIX` | `git-activity/data` | key prefix under the bucket; trailing slash stripped |
+
+## Commit bulk flag and rollup contract
+
+`TRIM_MAX_LINES` and `TRIM_MAX_FILES` are independent, strict upper bounds
+evaluated per commit after `EXCLUDED_PATH_PATTERNS` has been applied. A commit
+is flagged when either condition is true:
+
+```text
+is_bulk = (lines_added + lines_deleted) > TRIM_MAX_LINES
+          OR files_changed > TRIM_MAX_FILES
+```
+
+Equality is not bulk: the default boundaries are 5,000 filtered changed lines
+and 200 filtered files, so the first triggering values are 5,001 and 201.
+The line test uses the combined additions-plus-deletions total; additions and
+deletions do not trigger independently. The file test can flag a commit whose
+filtered line total is small, and vice versa.
+
+The flag is an annotation, not a deletion. The commit remains one row in
+`commits.parquet` and still counts in hourly `commits`; hourly
+`bulk_commits` records how many such rows the cell contains. Bulk commits are
+excluded from hourly `lines_added`, `lines_deleted`, and `files_changed`, but
+their complete `lines_added_raw` / `lines_deleted_raw` values remain in the
+hourly audit totals. Those raw line fields never trigger `is_bulk`; neither do
+excluded-path-only changes, once the filtered values have been removed.
+
+The per-commit filtered values remain visible in `commits.parquet` alongside
+`is_bulk`, so a consumer can inspect the row that was excluded from the
+hourly filtered rollup. There is no separate bulk hourly row or split table;
+use `bulk_commits` together with `commits` when excluding bulk commit counts.
 
 ## Health endpoints
 

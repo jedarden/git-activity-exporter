@@ -9,6 +9,9 @@ from src.config import DEFAULT_EXCLUDED_PATHS
 CONFIGURATION_MD = (
     Path(__file__).resolve().parent.parent / "docs" / "notes" / "configuration.md"
 )
+OUTPUT_SCHEMA_MD = (
+    Path(__file__).resolve().parent.parent / "docs" / "notes" / "output-schema.md"
+)
 DATA_SOURCES_MD = (
     Path(__file__).resolve().parent.parent / "docs" / "notes" / "data-sources.md"
 )
@@ -28,6 +31,27 @@ def test_documented_exclusions_match_code():
     # holds if the pattern list is readable from the docs. Either side edited
     # without the other fails here instead of drifting silently.
     assert _documented_exclusions() == list(DEFAULT_EXCLUDED_PATHS)
+
+
+def test_commit_bulk_contract_is_documented_at_both_surfaces():
+    configuration = " ".join(CONFIGURATION_MD.read_text().split())
+    schema = " ".join(OUTPUT_SCHEMA_MD.read_text().split())
+
+    for phrase in (
+        "independent, strict upper bounds",
+        "Equality is not bulk",
+        "The flag is an annotation, not a deletion",
+        "Those raw line fields never trigger `is_bulk`",
+    ):
+        assert phrase in configuration, f"commit bulk contract missing from configuration.md: {phrase}"
+
+    for phrase in (
+        "`is_bulk` is a per-commit annotation",
+        "does not create a second bulk row or a bulk/non-bulk split",
+        "Both tests are independent, and both are strict",
+        "full `lines_added_raw` and `lines_deleted_raw` values",
+    ):
+        assert phrase in schema, f"commit bulk contract missing from output-schema.md: {phrase}"
 
 
 def test_dest_s3_variables_are_documented():

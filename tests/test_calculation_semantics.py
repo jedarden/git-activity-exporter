@@ -199,12 +199,15 @@ def test_bulk_file_threshold_is_strict_and_independent_of_lines():
 
 
 def test_bulk_reads_the_filtered_counts_not_the_raw_ones():
-    # A commit whose entire volume is checkpoint churn is already excluded
-    # from lines_*; flagging it bulk too would be double exclusion. Bulk
-    # trims what the LOC filter leaves, and this commit leaves nothing.
-    checkpoint_only = _lines(0, 0, files=2, raw_added=9_000_000, raw_files=2)
-    out = gitscan.mark_bulk([checkpoint_only], 5000, 200)
-    assert out[0]["is_bulk"] is False
+    # Bulk status is judged on the filtered fields, not the raw audit pair.
+    # A large excluded contribution must not cross either trigger, including
+    # when the remaining filtered lines are exactly at the boundary.
+    at_filtered_line_bar = _lines(
+        5000, 0, files=2, raw_added=9_000_000, raw_files=900
+    )
+    checkpoint_only = _lines(0, 0, files=2, raw_added=9_000_000, raw_files=900)
+    out = gitscan.mark_bulk([at_filtered_line_bar, checkpoint_only], 5000, 200)
+    assert [c["is_bulk"] for c in out] == [False, False]
 
 
 # --- rollup: raw versus filtered, and which event kinds count ----------------
