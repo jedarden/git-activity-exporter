@@ -95,7 +95,8 @@ transition rules for `/health` and `/ready`. Treat the committed defaults and
 `FORGE_TOKEN` and `DEST_S3_*` credentials.
 
 The [deployment and release workflow](docs/notes/deployment.md) documents the
-Argo build, image versioning, runtime inputs, PVC, probes, and GitOps handoff.
+Argo build, image versioning, runtime inputs, PVC, probes, GitOps handoff,
+post-reconcile verification, and safe image-pin rollback.
 A runnable, non-default [self-hosting profile](docs/notes/deployment.md#self-hosting-smoke-profile)
 demonstrates those inputs with a custom owner, families file, S3 destination,
 mirror volume, and pinned image.

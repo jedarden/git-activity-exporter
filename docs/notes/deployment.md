@@ -263,10 +263,69 @@ The normal release sequence is therefore:
 2. Let the sensor start the WorkflowTemplate and wait for tests and the
    versioned image push to succeed.
 3. Pin that image tag in `declarative-config`, then push the GitOps commit.
-4. Confirm the generated ArgoCD Application is `Synced` and `Healthy`, the
-   replacement pod is running, and `/ready` becomes healthy after its first
-   publication. Confirm `meta.json` freshness and coverage before calling the
-   release complete.
+4. Run the post-reconcile verification below with the GitOps commit SHA and
+   exact semver image tag. It confirms the generated ArgoCD Application is
+   `Synced` and `Healthy`, the replacement pod is running the requested image,
+   the `/health` and `/ready` probe paths are wired correctly, and the running
+   process reports a successful publication.
+5. Confirm the resulting `meta.json` freshness and coverage before calling
+   the release complete.
+
+## Post-reconcile verification
+
+After pushing the image-pin commit, wait for the generated Application and
+verify the live workload from a machine with read-only ArgoCD and Kubernetes
+access. The repository-owned helper performs the checks as one bounded,
+repeatable command:
+
+```bash
+scripts/verify-gitops-deployment.sh \
+  --app git-activity-exporter-ns-ardenone-cluster \
+  --revision <gitops-image-pin-commit-sha> \
+  --image ronaldraygun/git-activity-exporter:<semver>
+```
+
+The helper:
+
+- waits for the ArgoCD Application to be `Synced` and `Healthy`, then requires
+  its observed revision to equal `--revision`;
+- inspects the Deployment template and every selected pod, requiring the
+  exact semver-pinned `--image`, a `Running`/`Ready` pod, and a ready container;
+- checks that the Deployment's named `health` port is 8080, liveness is
+  `GET /health`, and readiness is `GET /ready`;
+- creates only a loopback `kubectl port-forward` and checks live `/health=200`
+  and `/ready=200`; and
+- requires `/health` to report both a non-null
+  `last_successful_cycle_at` and `last_cycle_outcome: "published"`. That
+  outcome is the application-level evidence that a complete publication
+  committed; inspect the published `meta.json` for its freshness and coverage.
+
+The helper never applies, patches, deletes, restarts, or rolls back a cluster
+resource. A port-forward is temporary and local; its process is cleaned up on
+exit. If the command fails, inspect ArgoCD status, pod events/logs, and the
+published metadata read-only, then correct the image pin or workload inputs in
+Git.
+
+### Safe rollback
+
+Rollback is another desired-state change, not a live cluster operation. Keep
+the previous image tag and the image-pin commit SHA in the release record. If
+the new pod is unhealthy or its publication is bad:
+
+1. Identify the prior pin from the parent of the bad GitOps commit, for
+   example `git show <bad-commit>^:k8s/ardenone-cluster/git-activity-exporter/deployment.yml`.
+2. In the `declarative-config` checkout, change only the Deployment image back
+   to that prior semver tag. If the bad commit changed only that image line,
+   `git revert --no-edit <bad-commit>` is equivalent; do not use a whole-file
+   restore for a commit that contains unrelated changes.
+3. Commit the rollback on `main` with the prior image and run `git push origin
+   main` to the configured Forgejo `origin`. ArgoCD will reconcile that new
+   commit; do not use `kubectl rollout undo`, `kubectl set image`, or another
+   direct cluster mutation.
+4. Run `scripts/verify-gitops-deployment.sh` again with the rollback commit
+   SHA and prior image tag. Do not call the rollback complete until ArgoCD is
+   `Synced`/`Healthy`, the pods run the prior image, both probes pass, and the
+   process reports a new successful publication.
 
 For troubleshooting, use read-only ArgoCD/Kubernetes inspection and workflow
 logs. Fix image pins, configuration, secret provisioning, PVC sizing, or
