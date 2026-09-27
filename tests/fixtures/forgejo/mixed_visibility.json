@@ -1,0 +1,42 @@
+[
+  {
+    "ok": true,
+    "data": [
+      {
+        "name": "public-dashboard",
+        "full_name": "test-owner/public-dashboard",
+        "clone_url": "https://forge/test-owner/public-dashboard.git",
+        "empty": false,
+        "private": false
+      },
+      {
+        "name": "private-analytics",
+        "full_name": "test-owner/private-analytics",
+        "clone_url": "https://forge/test-owner/private-analytics.git",
+        "empty": false,
+        "private": true
+      },
+      {
+        "name": "public-docs",
+        "full_name": "test-owner/public-docs",
+        "clone_url": "https://forge/test-owner/public-docs.git",
+        "empty": false,
+        "private": false
+      },
+      {
+        "name": "private-internal-tools",
+        "full_name": "test-owner/private-internal-tools",
+        "clone_url": "https://forge/test-owner/private-internal-tools.git",
+        "empty": false,
+        "private": true
+      },
+      {
+        "name": "public-examples",
+        "full_name": "test-owner/public-examples",
+        "clone_url": "https://forge/test-owner/public-examples.git",
+        "empty": false,
+        "private": false
+      }
+    ]
+  }
+]

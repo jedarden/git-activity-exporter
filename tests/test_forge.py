@@ -9,6 +9,7 @@ prune consumes the *complete* enumeration (every page, in order) and never
 runs at all when enumeration fails or returns nothing.
 """
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ BASE = "https://forge"
 TOKEN = "test-token"
 OWNER = "test-owner"
 TIMEOUT = 30
+FORGEJO_FIXTURES = Path(__file__).parent / "fixtures" / "forgejo"
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +123,10 @@ def page(first, count=None):
 def list_repos_with_pages(monkeypatch, pages, denylist=()):
     f = FakeForge(pages).install(monkeypatch)
     return forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT, denylist), f
+
+
+def forgejo_fixture(name):
+    return json.loads((FORGEJO_FIXTURES / name).read_text())
 
 
 # --- the enumeration walk -------------------------------------------------
@@ -243,6 +249,32 @@ def test_private_repos_are_enumerated_like_any_other(monkeypatch):
         monkeypatch, [{"ok": True, "data": [repo(1, private=True), repo(2)]}]
     )
     assert [r["name"] for r in out] == ["repo-1", "repo-2"]
+
+
+def test_mixed_visibility_fixture_retains_every_owner_repository(monkeypatch):
+    # Forgejo applies the token's visibility rules before returning these
+    # pages. The exporter must retain both public and private repositories
+    # rather than applying a second visibility filter of its own.
+    pages = forgejo_fixture("mixed_visibility.json")
+    listed = [repository for page_ in pages for repository in page_["data"]]
+    expected = [
+        {
+            field: repository[field]
+            for field in ("name", "full_name", "clone_url")
+        }
+        for repository in listed
+    ]
+
+    assert {repository["private"] for repository in listed} == {False, True}
+    assert all(
+        repository["full_name"].startswith(f"{OWNER}/")
+        for repository in listed
+    )
+
+    out, fake = list_repos_with_pages(monkeypatch, pages)
+
+    assert out == expected
+    assert [call["params"]["page"] for call in fake.calls] == [1]
 
 
 def test_empty_repos_are_dropped_and_the_rest_kept_whole(monkeypatch):
