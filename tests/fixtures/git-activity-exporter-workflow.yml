@@ -3,6 +3,12 @@ kind: WorkflowTemplate
 metadata:
   name: git-activity-exporter-build
 spec:
+  arguments:
+    parameters:
+      - name: git-repo
+        value: jedarden/git-activity-exporter
+      - name: branch
+        value: main
   entrypoint: build
   synchronization:
     mutexes:
@@ -48,6 +54,9 @@ spec:
         command: [sh]
         source: |
           set -e
+          git clone --depth 1 --branch {{workflow.parameters.branch}} \
+            "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" /tmp/repo
+          cd /tmp/repo
           python -m pytest tests/ -q
       retryStrategy:
         retryPolicy: OnError

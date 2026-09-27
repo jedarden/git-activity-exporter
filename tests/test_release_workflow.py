@@ -84,6 +84,32 @@ def _templates(workflow: dict) -> dict[str, dict]:
     return {template["name"]: template for template in workflow["spec"]["templates"]}
 
 
+def _parameter_values(resource: dict) -> dict[str, str]:
+    return {
+        parameter["name"]: parameter["value"]
+        for parameter in resource["spec"]["arguments"]["parameters"]
+    }
+
+
+def _assert_origin_only(source: str) -> None:
+    """Ensure release scripts cannot select a second or GitHub push remote."""
+    assert "github.com" not in source.lower()
+    assert not re.search(r"(?m)^\s*git\s+remote\b", source)
+
+    for operation in ("fetch", "pull", "push"):
+        for match in re.finditer(
+            rf"\bgit\s+{operation}\b([^\n;&|]*)", source
+        ):
+            arguments = shlex.split(match.group(1))
+            assert "--all" not in arguments
+            assert "--mirror" not in arguments
+            remotes = [
+                argument for argument in arguments if not argument.startswith("-")
+            ]
+            if remotes:
+                assert remotes[0] == "origin", match.group(0)
+
+
 def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -306,6 +332,52 @@ def test_failed_tests_cannot_reach_the_version_bump():
     assert build_steps[1][0]["template"] == "resolve-version"
     assert build_steps[4][0]["template"] == "promote"
     assert build_steps[5][0]["template"] == "verify-rollout"
+
+
+def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
+    workflow = _workflow()
+    templates = _templates(workflow)
+    assert _parameter_values(workflow) == {
+        "git-repo": "jedarden/git-activity-exporter",
+        "branch": "main",
+    }
+
+    sensor = _sensor()
+    trigger_resource = sensor["spec"]["triggers"][0]["template"]["argoWorkflow"][
+        "source"
+    ]["resource"]
+    assert _parameter_values(trigger_resource) == {
+        "git-repo": "jedarden/git-activity-exporter",
+        "branch": "main",
+    }
+
+    test_source = templates["test"]["script"]["source"]
+    resolve_source = templates["resolve-version"]["script"]["source"]
+    promote_source = templates["promote"]["script"]["source"]
+    docker_args = templates["docker-build"]["container"]["args"]
+
+    for source in (test_source, resolve_source, promote_source):
+        _assert_origin_only(source)
+
+    assert '"https://git.ardenone.com/{{workflow.parameters.git-repo}}.git"' in (
+        test_source
+    )
+    assert '"https://git.ardenone.com/{{workflow.parameters.git-repo}}.git"' in (
+        resolve_source
+    )
+    assert (
+        '"https://git.ardenone.com/jedarden/declarative-config.git"'
+        in promote_source
+    )
+    assert "git clone --branch main" in promote_source
+    assert "git fetch origin main" in promote_source
+    assert "git push origin HEAD:main" in promote_source
+    assert re.search(r"\bgit\s+push\b", resolve_source)
+    assert any(
+        argument
+        == "--context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}"
+        for argument in docker_args
+    )
 
 
 def test_promotion_is_serialized_and_verifies_the_pushed_gitops_revision():
@@ -615,3 +687,7 @@ def test_ci_writeback_author_is_excluded_from_build_trigger():
     )
     assert author_filter["comparator"] == "!="
     assert author_filter["value"] == ["Argo Workflows CI"]
+
+    resolve_source = _templates(_workflow())["resolve-version"]["script"]["source"]
+    assert 'git config user.email "github@jedarden.com"' in resolve_source
+    assert 'git config user.name "Argo Workflows CI"' in resolve_source

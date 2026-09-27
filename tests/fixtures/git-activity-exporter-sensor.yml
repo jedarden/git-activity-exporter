@@ -20,3 +20,17 @@ spec:
             comparator: '!='
             value:
               - Argo Workflows CI
+  triggers:
+    - template:
+        name: git-activity-exporter-build
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              spec:
+                arguments:
+                  parameters:
+                    - name: git-repo
+                      value: jedarden/git-activity-exporter
+                    - name: branch
+                      value: main
