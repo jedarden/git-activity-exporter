@@ -44,6 +44,13 @@ be able to:
 - read every public or private repository that should be included; and
 - clone and fetch those repositories over Git HTTPS.
 
+This is a runtime read-only credential: grant `read:repository` (or the
+equivalent provider scope) and do not grant repository write permission. The
+exporter never commits or pushes to a source repository. If you also operate
+the release workflow, provision its separate write-capable CI credential
+independently; never reuse `FORGE_TOKEN` for automatic `VERSION` write-back or
+GitOps promotion.
+
 The exporter uses one `FORGE_TOKEN` for both API requests and Git operations.
 Git receives it through a process environment credential helper; it is not
 placed in a clone URL, command argument, mirror config, or log. Do not put the

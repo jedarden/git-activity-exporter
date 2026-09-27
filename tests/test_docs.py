@@ -128,14 +128,42 @@ def test_runtime_and_release_forgejo_credential_roles_are_documented():
     for phrase in (
         "FORGE_TOKEN",
         "git-activity-exporter-forge",
-        "read access",
+        "read:repository",
+        "read-only repository scope",
         "FORGEJO_TOKEN",
         "forgejo-webhook-token",
         "write:repository",
+        "runtime exporter is therefore read-only",
+        "complete workflow and workload manifests",
         "never referenced by the runtime Deployment",
         "secretKeyRef",
     ):
         assert phrase in section, f"Forgejo credential-role contract missing: {phrase}"
+
+
+def test_plan_and_self_hosting_scope_separate_runtime_reads_from_release_writes():
+    plan = " ".join(
+        (DEPLOYMENT_MD.parent.parent / "plan" / "plan.md").read_text().split()
+    )
+    self_hosting = " ".join(
+        (DEPLOYMENT_MD.parent.parent / "self-hosting.md").read_text().split()
+    )
+
+    for phrase in (
+        "runtime exporter is read-only with respect to source repositories",
+        "separate, privileged",
+        "automatic `VERSION` write-back",
+        "does write its published dataset to S3",
+    ):
+        assert phrase in plan, f"plan scope boundary missing: {phrase}"
+
+    for phrase in (
+        "runtime read-only credential",
+        "read:repository",
+        "never reuse `FORGE_TOKEN`",
+        "automatic `VERSION` write-back",
+    ):
+        assert phrase in self_hosting, f"self-hosting credential boundary missing: {phrase}"
 
 
 def test_s3_credential_provisioning_and_redaction_contract_is_documented():

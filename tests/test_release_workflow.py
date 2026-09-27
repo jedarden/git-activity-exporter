@@ -91,6 +91,19 @@ def _env_by_name(template: dict) -> dict[str, dict]:
     return {entry["name"]: entry for entry in env or []}
 
 
+def _secret_references(value):
+    """Yield every Secret reference in a manifest, including nested pods."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key in {"secretKeyRef", "secretRef"} and isinstance(nested, dict):
+                yield nested
+            else:
+                yield from _secret_references(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _secret_references(nested)
+
+
 def _parameter_values(resource: dict) -> dict[str, str]:
     return {
         parameter["name"]: parameter["value"]
@@ -734,6 +747,14 @@ def test_runtime_and_release_ci_use_distinct_forgejo_credentials():
     ci_secret = "forgejo-webhook-token"
     runtime_secret = "git-activity-exporter-forge"
 
+    # The runtime Secret must not cross the workflow boundary through an
+    # unexpected env entry, volume, or future template. Checking all nested
+    # references makes this guard fail closed when a new CI step is added.
+    workflow_secret_names = {
+        reference.get("name") for reference in _secret_references(workflow)
+    }
+    assert runtime_secret not in workflow_secret_names
+
     # Every CI step that can read or write a Forgejo repository uses the
     # write-capable CI Secret, never the runtime collector Secret.
     for template_name in ("test", "resolve-version", "promote"):
@@ -755,15 +776,21 @@ def test_runtime_and_release_ci_use_distinct_forgejo_credentials():
 
     # The runtime Deployment gets only the read-scope token and must not
     # inherit the CI write-back Secret or environment variable.
-    runtime_containers = [
-        container
-        for resource in _deployment_resources()
-        for container in resource.get("spec", {})
-        .get("template", {})
-        .get("spec", {})
-        .get("containers", [])
-        if container.get("name") == "exporter"
-    ]
+    runtime_resources = []
+    runtime_containers = []
+    for resource in _deployment_resources():
+        containers = (
+            resource.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [])
+        )
+        exporter_containers = [
+            container for container in containers if container.get("name") == "exporter"
+        ]
+        if exporter_containers:
+            runtime_resources.append(resource)
+            runtime_containers.extend(exporter_containers)
     assert runtime_containers
     for container in runtime_containers:
         env = _env_by_name(container)
@@ -778,3 +805,23 @@ def test_runtime_and_release_ci_use_distinct_forgejo_credentials():
             != ci_secret
             for entry in env.values()
         )
+
+    # Check the whole exporter pod, not just its current env list. A future
+    # secret volume or envFrom entry must not smuggle in the CI write token.
+    runtime_secret_names = {
+        reference.get("name")
+        for resource in runtime_resources
+        for reference in _secret_references(resource)
+    }
+    assert runtime_secret in runtime_secret_names
+    assert ci_secret not in runtime_secret_names
+
+
+def test_runtime_source_has_no_repository_write_operation():
+    """Keep the exporter implementation read-only even as release CI evolves."""
+    for path in (ROOT / "src").glob("*.py"):
+        source = path.read_text()
+        assert not re.search(
+            r"\[\s*['\"]git['\"][^\]]*['\"](?:push|commit|add|remote)['\"]",
+            source,
+        ), f"runtime source gained a repository write command: {path}"

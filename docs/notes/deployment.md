@@ -57,22 +57,28 @@ later stage; retries do not recalculate it.
 
 ### Forgejo credential roles
 
-The runtime and release pipeline use separate Forgejo credentials:
+Repository access has an explicit privilege boundary between the running
+exporter and release CI:
 
-- The runtime Deployment receives `FORGE_TOKEN` from Secret
-  `git-activity-exporter-forge`. It needs only read access to enumerate the
-  owner's repositories and clone/fetch their history.
-- Release CI receives `FORGEJO_TOKEN` (and the equivalent `GIT_PASSWORD` for
-  Kaniko's Git context) from the separate `forgejo-webhook-token` Secret in
-  the `argo-workflows` namespace. This CI credential needs repository read
-  access plus `write:repository` for the automatic `VERSION` commit and the
-  GitOps promotion push.
+| Principal | Credential | Required Forgejo permission | Allowed repository actions |
+| --- | --- | --- | --- |
+| Runtime exporter Deployment | `FORGE_TOKEN` from Secret `git-activity-exporter-forge` | `read:repository` (or the provider's equivalent read-only repository scope) | Enumerate the configured owner's repositories and clone/fetch their history |
+| Release WorkflowTemplate | `FORGEJO_TOKEN` and Kaniko's equivalent `GIT_PASSWORD` from Secret `forgejo-webhook-token` in `argo-workflows` | `read:repository` plus `write:repository` (or equivalent) | Read the application, commit/push automatic `VERSION` bumps, and commit/push the GitOps image pin |
 
-The CI write-back credential is scoped to WorkflowTemplate steps that clone,
-fetch, or push. It is never referenced by the runtime Deployment, and the
-runtime read credential is never used for release write-back. Neither token is
-committed to Git; both are injected with `secretKeyRef` from their owning
-secret-management paths.
+The runtime exporter is therefore read-only against source repositories even
+though it writes the generated dataset to S3. No runtime code has a commit or
+push step. The CI write-back credential is scoped only to the release
+WorkflowTemplate steps that need to clone, fetch, or push; the runtime read
+credential is never mounted in those steps. Conversely, the CI credential is
+never referenced by the runtime Deployment. The repository test suite checks
+both directions of this separation across the complete workflow and workload
+manifests, so adding a credential reference to the wrong side fails before a
+release.
+
+Neither token is committed to Git; both are injected with `secretKeyRef` from
+their owning secret-management paths. If a deployment also runs release CI,
+do not reuse `FORGE_TOKEN` for that workflow: granting it `write:repository`
+would violate the runtime boundary.
 
 ### Updating reproducibility pins
 

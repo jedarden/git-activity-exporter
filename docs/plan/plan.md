@@ -7,8 +7,15 @@ Publish fleet git and bead activity as Parquet for a
 independent axes: scope (ecosystem / family / repo), measure (commits / lines
 of code / beads), and time (hour / day / week).
 
-Out of scope: any write path back into a repo, and any claim about *quality* of
-work — this measures volume and rhythm only.
+The runtime exporter is read-only with respect to source repositories: it
+enumerates repositories and clones or fetches their history, but never commits
+or pushes back to a repo. The release CI workflow is a separate, privileged
+boundary; its automatic `VERSION` write-back and GitOps promotion are release
+operations documented in [`docs/notes/deployment.md`](../notes/deployment.md),
+not exporter behavior. The exporter does write its published dataset to S3.
+
+Out of scope for this plan: repository write paths in the runtime exporter,
+and any claim about *quality* of work — this measures volume and rhythm only.
 
 ## The question it answers
 
