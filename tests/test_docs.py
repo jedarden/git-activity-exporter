@@ -15,6 +15,9 @@ OUTPUT_SCHEMA_MD = (
 DATA_SOURCES_MD = (
     Path(__file__).resolve().parent.parent / "docs" / "notes" / "data-sources.md"
 )
+DEPLOYMENT_MD = (
+    Path(__file__).resolve().parent.parent / "docs" / "notes" / "deployment.md"
+)
 
 
 def _documented_exclusions():
@@ -85,6 +88,22 @@ def test_forgejo_git_credential_contract_is_documented():
         "existing mirror is kept",
     ):
         assert phrase in section, f"credential-safety contract missing: {phrase}"
+
+
+def test_release_reproducibility_update_procedure_is_documented():
+    text = " ".join(DEPLOYMENT_MD.read_text().split())
+    _, _, section = text.partition("### Updating reproducibility pins")
+    assert section, "deployment.md lost the reproducibility update procedure"
+    for phrase in (
+        "requirements.txt",
+        "requirements-dev.txt",
+        "exact `package==version` pin",
+        "docker buildx imagetools inspect",
+        "64-character SHA-256 digest",
+        "python scripts/check-release-drift.py",
+        "docker build --tag local/git-activity-pin-review:local .",
+    ):
+        assert phrase in section, f"reproducibility procedure missing: {phrase}"
 
 
 def test_s3_credential_provisioning_and_redaction_contract_is_documented():

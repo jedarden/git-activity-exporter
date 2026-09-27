@@ -21,8 +21,11 @@ The `git-activity-exporter-build` WorkflowTemplate runs these steps in order:
 
 1. Clone `jedarden/git-activity-exporter` from Forgejo and run
    `pip install -r requirements-dev.txt` followed by `python -m pytest tests/ -q`.
-   Tests run before version resolution so a failed change cannot leave an
-   auto-bump commit behind.
+   The test suite's release-drift gate runs `python scripts/check-release-drift.py`
+   and rejects unpinned Python dependencies, mutable Dockerfile base-image
+   tags, untagged images, and `:latest` references. These checks run before
+   version resolution so a failed change cannot leave an auto-bump commit
+   behind.
 2. Read `VERSION` from `main`. If the triggering commit changed `VERSION`,
    that value is used. Otherwise, increment the patch component, commit the
    new `VERSION` as `ci: auto-bump version to ...`, and push that commit back
@@ -33,9 +36,12 @@ The `git-activity-exporter-build` WorkflowTemplate runs these steps in order:
    uses a pinned Kaniko image and a cache repository; it never publishes or
    references `:latest`.
 
-The Dockerfile packages Python 3.12 slim, `git`, `curl`, the pinned Python
-requirements, `src/`, `VERSION`, and `families.yaml`. It runs as non-root
-`appuser` (UID/GID 1000), exposes port 8080, and starts
+The Dockerfile starts from the multi-platform Python `3.12.11-slim` image at
+digest
+`sha256:47ae396f09c1303b8653019811a8498470603d7ffefc29cb07c88f1f8cb3d19f`,
+then packages `git`, `curl`, the pinned Python requirements, `src/`, `VERSION`,
+and `families.yaml`. It runs as non-root `appuser` (UID/GID 1000), exposes
+port 8080, and starts
 `python -m src.main`. The image keeps `/app` as its working directory, so the
 default relative paths resolve to `/app/VERSION` and `/app/families.yaml`.
 The image's Docker healthcheck calls `/health`; the Kubernetes Deployment
@@ -48,6 +54,34 @@ source version and image tag agree. The workflow serializes releases with the
 `git-activity-exporter-release` mutex so version write-back and promotion do
 not race one another. The resolved version is a workflow output passed to every
 later stage; retries do not recalculate it.
+
+### Updating reproducibility pins
+
+Every entry in `requirements.txt` and `requirements-dev.txt` must use an exact
+`package==version` pin. `requirements-dev.txt` may include the runtime file
+with `-r requirements.txt`, but the included entries are checked too. The
+Dockerfile `FROM` reference must include a 64-character SHA-256 digest; a tag
+alone is mutable. Keep the reviewed version tag alongside the digest so the
+intended upstream variant remains visible.
+
+For an intentional dependency or base-image refresh:
+
+1. Update the dependency lines to the selected exact versions. For a base
+   image, inspect the multi-platform index with
+   `docker buildx imagetools inspect python:<tag>` and record its `Digest` in
+   `Dockerfile` as `python:<tag>@sha256:<digest>`.
+2. Run `python scripts/check-release-drift.py` and
+   `python -m pytest tests/ -q`. Build the image locally when changing the
+   base image: `docker build --tag local/git-activity-pin-review:local .`.
+3. Review the resulting dependency and image-digest diff together. If the
+   same change intentionally updates `VERSION`, run
+   `python scripts/check-release-drift.py --write` to refresh the committed
+   semver references, then rerun both checks.
+
+Do not replace a digest with a floating tag or use `pip install` output as a
+lockfile. A refresh is complete only when the exact dependency pins, the
+Dockerfile digest, the release-drift check, and the test suite are committed
+and reviewed together.
 
 ## Self-hosting smoke profile
 

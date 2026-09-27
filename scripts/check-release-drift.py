@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Validate versioned release image references.
+"""Validate release image, dependency, and base-image reproducibility.
 
 The release workflow treats VERSION as the source of truth for the published
 image. The self-hosting examples are committed documentation and fixtures, so
 their literal image tags must move with that source version as well. Every
 image in the release manifests also needs an explicit non-latest tag or digest.
+Runtime and development Python dependencies must use exact ``==`` pins, and
+every Dockerfile base image must use a content digest.
 """
 
 from __future__ import annotations
@@ -25,6 +27,12 @@ DOCKER_FROM = re.compile(
     r"^\s*FROM(?:\s+--platform=\S+)?\s+(?P<value>\S+)", re.MULTILINE
 )
 IMAGE_DESTINATION = re.compile(r"--destination=(?P<value>[^\s'\"]+)")
+REQUIREMENT_PIN = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+    r"(?:\[[^\]]+\])?\s*==\s*"
+    r"[A-Za-z0-9][A-Za-z0-9.!+_-]*"
+    r"(?:\s*;\s*.+)?$"
+)
 
 VERSIONED_FILES = (
     Path("examples/self-hosting/compose.yaml"),
@@ -41,6 +49,10 @@ PINNED_IMAGE_FILES = (
     Path("Dockerfile"),
     Path("examples"),
     Path("tests/fixtures/git-activity-exporter-workflow.yml"),
+)
+REQUIREMENT_FILES = (
+    Path("requirements.txt"),
+    Path("requirements-dev.txt"),
 )
 TEXT_SUFFIXES = {".md", ".py", ".sh", ".yaml", ".yml"}
 
@@ -123,6 +135,44 @@ def _check_latest_references(root: Path) -> list[str]:
     return errors
 
 
+def _check_python_requirements(root: Path) -> list[str]:
+    """Reject dependency entries that do not select one exact version."""
+    errors: list[str] = []
+    for relative_path in REQUIREMENT_FILES:
+        path = root / relative_path
+        if not path.is_file():
+            errors.append(f"{relative_path}: file is missing")
+            continue
+
+        for line_number, raw_line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if re.fullmatch(r"(?:-r|--requirement)\s+\S+", line):
+                continue
+            if line.startswith(
+                (
+                    "--index-url",
+                    "--extra-index-url",
+                    "--trusted-host",
+                    "--find-links",
+                    "--no-index",
+                    "--require-hashes",
+                    "--hash=",
+                )
+            ):
+                continue
+            if REQUIREMENT_PIN.fullmatch(line):
+                continue
+            errors.append(
+                f"{relative_path}:{line_number}: dependency {raw_line.strip()!r} "
+                "must use an exact == version pin"
+            )
+    return errors
+
+
 def _image_value(value: str) -> str:
     """Resolve the concrete image in a YAML/Compose value when possible."""
     value = value.split("#", 1)[0].strip().strip("'\"")
@@ -148,10 +198,24 @@ def _check_image_reference(
     tag = last_component.rsplit(":", 1)[1] if ":" in last_component else ""
     if tag.lower() == "latest":
         return f"{relative_path}:{line}: image references :latest (mutable tag {image!r})"
-    if separator and not re.fullmatch(
-        r"[A-Za-z][A-Za-z0-9+.-]*:[0-9a-fA-F]+", digest
-    ):
+    if separator and not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
         return f"{relative_path}:{line}: image reference {image!r} has invalid digest"
+    return None
+
+
+def _check_base_image_reference(
+    relative_path: Path, text: str, position: int, value: str
+) -> str | None:
+    error = _check_image_reference(relative_path, text, position, value)
+    if error:
+        return error
+    image = _image_value(value)
+    if "@" not in image:
+        line = _line_number(text, position)
+        return (
+            f"{relative_path}:{line}: base image reference {image!r} must use "
+            "a sha256 digest (IMAGE:TAG@sha256:<64 hex characters>)"
+        )
     return None
 
 
@@ -187,9 +251,12 @@ def _check_pinned_image_references(root: Path) -> list[str]:
                 )
 
             for position, value in references:
-                error = _check_image_reference(
-                    discovered_path, text, position, value
+                checker = (
+                    _check_base_image_reference
+                    if discovered_path.name == "Dockerfile"
+                    else _check_image_reference
                 )
+                error = checker(discovered_path, text, position, value)
                 if error:
                     errors.append(error)
     return errors
@@ -211,7 +278,7 @@ def _rewrite_versioned_files(root: Path, version: str) -> list[Path]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Check self-hosting image tags against VERSION."
+        description="Check release image, dependency, and base-image reproducibility."
     )
     parser.add_argument(
         "--root",
@@ -229,10 +296,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         version = _read_version(root)
+        requirement_errors = _check_python_requirements(root)
         image_errors = _check_pinned_image_references(root)
         latest_errors = _check_latest_references(root)
-        if image_errors or latest_errors:
-            for error in (*image_errors, *latest_errors):
+        if requirement_errors or image_errors or latest_errors:
+            for error in (*requirement_errors, *image_errors, *latest_errors):
                 print(f"ERROR: {error}", file=sys.stderr)
             return 1
 
@@ -251,7 +319,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
-    print(f"release image references match VERSION {version}")
+    print(
+        "release image references and reproducibility pins "
+        f"match VERSION {version}"
+    )
     return 0
 
 
