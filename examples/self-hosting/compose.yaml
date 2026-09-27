@@ -3,7 +3,7 @@ services:
   # second exporter or create a local destination by accident.
   forgejo-fixture:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.42}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.43}
     command: [python, /fixture/mock-forgejo.py]
     environment:
       FORGE_OWNER: reuser
@@ -19,7 +19,7 @@ services:
 
   s3-fixture:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.42}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.43}
     command: [python, /fixture/mock-s3.py]
     environment:
       # The smoke sends browser-shaped requests with this Host header. The
@@ -40,7 +40,7 @@ services:
 
   mirror-volume-init:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.42}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.43}
     user: "0:0"
     command: [sh, -c, mkdir -p /data/mirrors && chown -R 1000:1000 /data/mirrors]
     volumes:
@@ -48,7 +48,7 @@ services:
 
   exporter:
     profiles: [self-hosting]
-    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.42}
+    image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.43}
     depends_on:
       forgejo-fixture:
         condition: service_healthy
