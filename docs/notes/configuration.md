@@ -9,7 +9,7 @@ everything else has a default.
 |---|---|---|
 | `FORGE_BASE_URL` | `https://git.ardenone.com` | Forgejo instance |
 | `FORGE_OWNER` | `jedarden` | whose repos to enumerate |
-| `FORGE_TOKEN` | *(required)* | read scope is sufficient |
+| `FORGE_TOKEN` | *(required)* | runtime read scope is sufficient; release CI uses a separate write-back credential |
 | `REPO_DENYLIST` | *(empty)* | comma-separated repo names to skip |
 | `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
 | `WINDOW_DAYS` | `90` | positive reporting-window length in elapsed 24-hour UTC days; [boundary contract](data-sources.md#reporting-window-boundary-contract) |

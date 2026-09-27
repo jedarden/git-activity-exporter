@@ -84,6 +84,13 @@ def _templates(workflow: dict) -> dict[str, dict]:
     return {template["name"]: template for template in workflow["spec"]["templates"]}
 
 
+def _env_by_name(template: dict) -> dict[str, dict]:
+    env = template.get("env")
+    if env is None and isinstance(template.get("script"), dict):
+        env = template["script"].get("env", [])
+    return {entry["name"]: entry for entry in env or []}
+
+
 def _parameter_values(resource: dict) -> dict[str, str]:
     return {
         parameter["name"]: parameter["value"]
@@ -719,3 +726,55 @@ def test_ci_writeback_author_is_excluded_from_build_trigger():
     resolve_source = _templates(_workflow())["resolve-version"]["script"]["source"]
     assert 'git config user.email "github@jedarden.com"' in resolve_source
     assert 'git config user.name "Argo Workflows CI"' in resolve_source
+
+
+def test_runtime_and_release_ci_use_distinct_forgejo_credentials():
+    workflow = _workflow()
+    templates = _templates(workflow)
+    ci_secret = "forgejo-webhook-token"
+    runtime_secret = "git-activity-exporter-forge"
+
+    # Every CI step that can read or write a Forgejo repository uses the
+    # write-capable CI Secret, never the runtime collector Secret.
+    for template_name in ("test", "resolve-version", "promote"):
+        env = _env_by_name(templates[template_name])
+        assert "FORGE_TOKEN" not in env
+        ci_token = env["FORGEJO_TOKEN"]
+        assert ci_token["valueFrom"]["secretKeyRef"] == {
+            "name": ci_secret,
+            "key": "token",
+        }
+        assert ci_secret != runtime_secret
+
+    kaniko_env = _env_by_name(templates["docker-build"]["container"])
+    assert "FORGE_TOKEN" not in kaniko_env
+    assert kaniko_env["GIT_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": ci_secret,
+        "key": "token",
+    }
+
+    # The runtime Deployment gets only the read-scope token and must not
+    # inherit the CI write-back Secret or environment variable.
+    runtime_containers = [
+        container
+        for resource in _deployment_resources()
+        for container in resource.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+        if container.get("name") == "exporter"
+    ]
+    assert runtime_containers
+    for container in runtime_containers:
+        env = _env_by_name(container)
+        runtime_token = env["FORGE_TOKEN"]
+        assert runtime_token["valueFrom"]["secretKeyRef"] == {
+            "name": runtime_secret,
+            "key": "FORGE_TOKEN",
+        }
+        assert "FORGEJO_TOKEN" not in env
+        assert all(
+            entry.get("valueFrom", {}).get("secretKeyRef", {}).get("name")
+            != ci_secret
+            for entry in env.values()
+        )

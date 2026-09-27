@@ -64,6 +64,18 @@ spec:
             "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" /tmp/repo
           cd /tmp/repo
           python -m pytest tests/ -q
+        env:
+          - name: GIT_CONFIG_COUNT
+            value: "1"
+          - name: GIT_CONFIG_KEY_0
+            value: credential.helper
+          - name: GIT_CONFIG_VALUE_0
+            value: '!f() { test "$1" = get && echo "username=x-token" && echo "password=$FORGEJO_TOKEN"; }; f'
+          - name: FORGEJO_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: forgejo-webhook-token
+                key: token
       retryStrategy:
         retryPolicy: OnError
     - name: resolve-version
@@ -113,6 +125,18 @@ spec:
           fi
 
           echo "$VERSION" > /tmp/version
+        env:
+          - name: GIT_CONFIG_COUNT
+            value: "1"
+          - name: GIT_CONFIG_KEY_0
+            value: credential.helper
+          - name: GIT_CONFIG_VALUE_0
+            value: '!f() { test "$1" = get && echo "username=x-token" && echo "password=$FORGEJO_TOKEN"; }; f'
+          - name: FORGEJO_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: forgejo-webhook-token
+                key: token
     - name: smoke
       inputs:
         parameters:
@@ -224,6 +248,20 @@ spec:
           - name: gitops-revision
             valueFrom:
               path: /tmp/gitops-revision
+      env:
+        - name: GIT_CONFIG_COUNT
+          value: "1"
+        - name: GIT_CONFIG_KEY_0
+          value: credential.helper
+        - name: GIT_CONFIG_VALUE_0
+          value: '!f() { test "$1" = get && echo "username=x-token" && echo "password=$FORGEJO_TOKEN"; }; f'
+        - name: GIT_TERMINAL_PROMPT
+          value: "0"
+        - name: FORGEJO_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: forgejo-webhook-token
+              key: token
     - name: verify-rollout
       inputs:
         parameters:
@@ -256,3 +294,11 @@ spec:
           - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}
           - --destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
           - --build-arg=VERSION={{inputs.parameters.version}}
+        env:
+          - name: GIT_USERNAME
+            value: x-token
+          - name: GIT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: forgejo-webhook-token
+                key: token

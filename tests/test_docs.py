@@ -106,6 +106,24 @@ def test_release_reproducibility_update_procedure_is_documented():
         assert phrase in section, f"reproducibility procedure missing: {phrase}"
 
 
+def test_runtime_and_release_forgejo_credential_roles_are_documented():
+    text = " ".join(DEPLOYMENT_MD.read_text().split())
+    _, _, section = text.partition("### Forgejo credential roles")
+    assert section, "deployment.md lost the Forgejo credential-roles section"
+    section = section.split("### ", 1)[0]
+    for phrase in (
+        "FORGE_TOKEN",
+        "git-activity-exporter-forge",
+        "read access",
+        "FORGEJO_TOKEN",
+        "forgejo-webhook-token",
+        "write:repository",
+        "never referenced by the runtime Deployment",
+        "secretKeyRef",
+    ):
+        assert phrase in section, f"Forgejo credential-role contract missing: {phrase}"
+
+
 def test_s3_credential_provisioning_and_redaction_contract_is_documented():
     text = CONFIGURATION_MD.read_text()
     _, _, section = text.partition("## Destination credentials (`DEST_S3_*`)")

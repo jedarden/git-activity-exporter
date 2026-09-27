@@ -77,8 +77,10 @@ spec:
             - configMapRef:
                 name: git-activity-exporter-config
           env:
-            # Create these two Secrets with your own credential manager. No
-            # credential value belongs in this profile or in a ConfigMap.
+            # Create these two runtime Secrets with your own credential
+            # manager. FORGE_TOKEN is read-only; release CI uses a separate
+            # write-back credential and does not mount it in this Deployment.
+            # No credential value belongs in this profile or in a ConfigMap.
             - name: FORGE_TOKEN
               valueFrom:
                 secretKeyRef:
