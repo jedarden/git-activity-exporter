@@ -1,0 +1,70 @@
+{
+  "repo_count": {
+    "value": 105,
+    "tolerance": 0
+  },
+  "window_hours": {
+    "value": 720,
+    "tolerance": 0
+  },
+  "fano": {
+    "value": 22.0,
+    "tolerance": 0.05
+  },
+  "top_10_share": {
+    "value": 0.34,
+    "tolerance": 0.005
+  },
+  "zero_hours": {
+    "value": 62,
+    "tolerance": 0
+  },
+  "burst_runs": {
+    "value": 34,
+    "tolerance": 0
+  },
+  "longest_burst_hours": {
+    "value": 129,
+    "tolerance": 0
+  },
+  "hour_of_day_spread": {
+    "value": 1.94,
+    "tolerance": 0.005
+  },
+  "hour_of_day_cv": {
+    "value": 0.19,
+    "tolerance": 0.005
+  },
+  "independent_repo_fano": {
+    "value": 12.8,
+    "tolerance": 0.05
+  },
+  "ecosystem_fano": {
+    "value": 34.8,
+    "tolerance": 0.05
+  },
+  "median_active_repos": {
+    "value": 4,
+    "tolerance": 0
+  },
+  "p90_active_repos": {
+    "value": 9,
+    "tolerance": 0
+  },
+  "max_active_repos": {
+    "value": 44,
+    "tolerance": 0
+  },
+  "raw_lines": {
+    "value": 61083980,
+    "tolerance": 0
+  },
+  "beads_lines": {
+    "value": 41626557,
+    "tolerance": 0
+  },
+  "vendored_lines": {
+    "value": 3180287,
+    "tolerance": 0
+  }
+}

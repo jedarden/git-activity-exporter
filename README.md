@@ -52,6 +52,13 @@ through to `unassigned` and still appear in the ecosystem and repo tiers.
 
 ## What the numbers mean
 
+The historical measurements below have a reproducibility record in
+[`docs/research/baseline-provenance.md`](docs/research/baseline-provenance.md),
+including the snapshot manifest contract, calculation definitions, and the
+checked-in validator. The original pre-exporter raw snapshot was not retained,
+so the note distinguishes the published expected values from a rerunnable
+input archive.
+
 Two filters are not optional, and both are visible in the output rather than
 applied silently.
 

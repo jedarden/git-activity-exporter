@@ -15,6 +15,11 @@ work — this measures volume and rhythm only.
 "Is the fleet more productive in bursts?" Measured against 105 local repos
 over 30 days before any code was written:
 
+The source and calculation provenance for these legacy figures is recorded in
+[`docs/research/baseline-provenance.md`](../research/baseline-provenance.md).
+The original raw snapshot was not retained; future refreshes must archive the
+manifest and immutable inputs before changing these values.
+
 - hourly-bucket Fano factor **22.0** (1.0 would be random arrival)
 - busiest 10% of hours hold **34%** of all commits
 - **62 of 720** hours had zero commits
