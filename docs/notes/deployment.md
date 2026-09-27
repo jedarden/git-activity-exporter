@@ -44,6 +44,41 @@ image's embedded version comes from the `VERSION` file copied from the build
 context. Because an automatic bump is pushed before the Kaniko step, the
 source version and image tag agree.
 
+## Self-hosting smoke profile
+
+The committed [`examples/self-hosting/`](../../examples/self-hosting/) profile
+is an opt-in reuser example. It is intentionally separate from the author's
+default `families.yaml` and deployment: no `jedarden` owner, author bucket,
+author prefix, or packaged family mapping is needed. The Kubernetes example
+contains the workload shape, while the Compose profile is the runnable smoke
+harness used to exercise one complete cycle locally.
+
+The profile makes every reuser-specific input visible:
+
+- `FORGE_OWNER=reuser` and a non-default Forgejo endpoint;
+- a mounted `FAMILIES_FILE` mapping `reuser-project` to `reuser-projects`;
+- `DEST_S3_ENDPOINT`, bucket `reuser-git-activity`, prefix `exports/reuser`,
+  path-style addressing, and credentials supplied through environment variables
+  in the fixture only;
+- a single-writer mirror volume (`self-hosting-mirrors` in Compose and a
+  `ReadWriteOnce` 20Gi PVC in Kubernetes); and
+- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.28`).
+
+Run the smoke profile from the repository root:
+
+```bash
+scripts/smoke-self-hosting.sh
+```
+
+The script builds that pinned local tag unless `SKIP_BUILD=1` is set, creates a
+temporary Git repository, starts the opt-in `self-hosting` Compose profile, and
+waits for `/ready` to become `200`. It then resolves `current.json` from the
+fixture S3 endpoint, reads every pointer-named object, validates all three
+Parquet payloads, and checks that the published metadata and family rows name
+the custom owner/mapping. The generated fixture credentials and repository are
+ephemeral; production credentials belong in Secret references as shown in
+`examples/self-hosting/kubernetes.yaml`.
+
 ## Container smoke verification
 
 The repository-owned [`scripts/smoke-container.sh`](../../scripts/smoke-container.sh)

@@ -1,0 +1,123 @@
+# Example self-hosting profile. Create the referenced Secrets out of band and
+# replace the example Forgejo URL before applying this file.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: git-activity-exporter
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-activity-exporter-config
+  namespace: git-activity-exporter
+data:
+  FORGE_BASE_URL: https://forgejo.example.com
+  FORGE_OWNER: reuser
+  FAMILIES_FILE: /etc/git-activity-exporter/families.yaml
+  CLONE_ROOT: /data/mirrors
+  DEST_S3_BUCKET: reuser-git-activity
+  DEST_S3_PREFIX: exports/reuser
+  DEST_S3_ADDRESSING_STYLE: path
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-activity-exporter-families
+  namespace: git-activity-exporter
+data:
+  families.yaml: |
+    families:
+      reuser-projects:
+        - reuser-project
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: git-activity-exporter-mirrors
+  namespace: git-activity-exporter
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-activity-exporter
+  namespace: git-activity-exporter
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: git-activity-exporter
+  template:
+    metadata:
+      labels:
+        app: git-activity-exporter
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: exporter
+          image: ronaldraygun/git-activity-exporter:0.1.28
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: git-activity-exporter-config
+          env:
+            # Create these two Secrets with your own credential manager. No
+            # credential value belongs in this profile or in a ConfigMap.
+            - name: FORGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: git-activity-exporter-forge
+                  key: FORGE_TOKEN
+            - name: DEST_S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: git-activity-exporter-s3
+                  key: DEST_S3_ENDPOINT
+            - name: DEST_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: git-activity-exporter-s3
+                  key: DEST_S3_ACCESS_KEY_ID
+            - name: DEST_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: git-activity-exporter-s3
+                  key: DEST_S3_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: mirrors
+              mountPath: /data/mirrors
+            - name: families
+              mountPath: /etc/git-activity-exporter/families.yaml
+              subPath: families.yaml
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 240
+      volumes:
+        - name: mirrors
+          persistentVolumeClaim:
+            claimName: git-activity-exporter-mirrors
+        - name: families
+          configMap:
+            name: git-activity-exporter-families

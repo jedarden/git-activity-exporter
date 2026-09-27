@@ -1,0 +1,4 @@
+# Replace this mapping with the repositories owned by your Forgejo user.
+families:
+  reuser-projects:
+    - reuser-project
