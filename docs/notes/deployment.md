@@ -66,7 +66,7 @@ The profile makes every reuser-specific input visible:
   in the fixture only;
 - a single-writer mirror volume (`self-hosting-mirrors` in Compose and a
   `ReadWriteOnce` 20Gi PVC in Kubernetes); and
-- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.40`).
+- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.41`).
 
 The repository's release-drift check compares these committed image
 references with `VERSION` and rejects `:latest` references. It runs as part of
