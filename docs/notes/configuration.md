@@ -299,6 +299,16 @@ editing it changes nothing until the exporter restarts. What that restart
 does to already-published cycles — the attribution-over-time contract — is
 pinned in [output-schema.md](output-schema.md#family-attribution-over-time).
 
+For the Kubernetes self-hosting profile, the `families.yaml` ConfigMap is
+watched by Stakater Reloader through the Deployment annotation
+`configmap.reloader.stakater.com/reload: git-activity-exporter-families`.
+When GitOps reconciles a mapping-only ConfigMap commit, Reloader changes the
+pod template and Kubernetes performs the restart automatically. The
+replacement process loads the new map before its next cycle; no live
+`kubectl rollout restart` or other manual cluster mutation is part of the
+change. Install Reloader, or provide an equivalent ConfigMap checksum/rollout
+controller, before using this profile.
+
 ## Destination credentials (`DEST_S3_*`)
 
 `config.load()` reads the four required values straight from the process

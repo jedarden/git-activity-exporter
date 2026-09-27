@@ -77,7 +77,14 @@ families:
 A repository may occur more than once in the same family, but may not occur in
 two different families. Repositories omitted from the file are still scanned
 and published under `unassigned`, so a partial map is safe while setting up.
-The file is read at process startup, so restart the pod after changing it.
+The file is read at process startup. The Kubernetes example therefore marks
+the Deployment with
+`configmap.reloader.stakater.com/reload: git-activity-exporter-families`.
+With [Stakater Reloader](https://github.com/stakater/Reloader) installed, a
+GitOps-only change to that ConfigMap changes the pod template and Kubernetes
+rolls out a replacement process; no manual `kubectl rollout restart` is
+needed. If your cluster uses another controller, configure the equivalent
+ConfigMap-to-Deployment rollout before relying on mapping changes.
 
 For Kubernetes, put this content in the `git-activity-exporter-families`
 ConfigMap (the example uses the same file at
@@ -155,6 +162,8 @@ the example-specific values:
    writable by UID/GID 1000, mounted at `/data/mirrors`, and support
    `ReadWriteOnce`.
 6. Keep `CLONE_ROOT: /data/mirrors`, one replica, and the `Recreate` strategy.
+7. Keep the Reloader annotation, or configure an equivalent automatic rollout
+   mechanism for `git-activity-exporter-families`.
 
 The example expects two Secrets, with these keys:
 
@@ -268,8 +277,9 @@ UID 1000.
   history margin.
 - After rotating a Forgejo or S3 credential, verify the Secret refresh and
   wait for `/health` to show a new published cycle.
-- After changing `families.yaml`, restart the Deployment and verify the next
-  cycle's Parquet family rows.
+- After changing `families.yaml`, commit the ConfigMap change through GitOps,
+  wait for the automatic Deployment rollout, and verify the next cycle's
+  Parquet family rows. Do not manually mutate the live Deployment.
 
 The complete environment-variable and publication contracts are in
 [`docs/notes/configuration.md`](notes/configuration.md) and

@@ -1,4 +1,7 @@
+import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -6,6 +9,25 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE = ROOT / "examples" / "self-hosting"
+
+
+def _load_families_in_new_process(path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                "from src import families; "
+                "print(json.dumps(families.load(sys.argv[1]), sort_keys=True))"
+            ),
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
 
 
 def _resources():
@@ -54,6 +76,9 @@ def test_self_hosting_kubernetes_profile_has_pinned_single_writer_and_pvc():
     deployment = _resource("Deployment", "git-activity-exporter")
     assert deployment["spec"]["replicas"] == 1
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+    assert deployment["metadata"]["annotations"] == {
+        "configmap.reloader.stakater.com/reload": "git-activity-exporter-families",
+    }
     container = deployment["spec"]["template"]["spec"]["containers"][0]
     assert re.fullmatch(r"[^:]+:[0-9]+\.[0-9]+\.[0-9]+", container["image"])
     assert ":latest" not in container["image"]
@@ -90,3 +115,36 @@ def test_self_hosting_families_file_is_the_mounted_example():
     mounted = yaml.safe_load(config_map["data"]["families.yaml"])
     assert families == mounted
     assert families == {"families": {"reuser-projects": ["reuser-project"]}}
+
+
+def test_family_mapping_change_rolls_out_and_is_loaded_by_the_next_process(tmp_path):
+    deployment = _resource("Deployment", "git-activity-exporter")
+    config_map = _resource("ConfigMap", "git-activity-exporter-families")
+    annotations = deployment["metadata"]["annotations"]
+    assert annotations["configmap.reloader.stakater.com/reload"] == config_map[
+        "metadata"
+    ]["name"]
+
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert {
+        volume["name"]: volume["configMap"]["name"]
+        for volume in deployment["spec"]["template"]["spec"]["volumes"]
+        if "configMap" in volume
+    }["families"] == config_map["metadata"]["name"]
+    family_mount = next(
+        mount
+        for mount in container["volumeMounts"]
+        if mount["name"] == "families"
+    )
+    assert family_mount["mountPath"] == "/etc/git-activity-exporter/families.yaml"
+
+    family_file = tmp_path / "families.yaml"
+    initial = {"families": {"initial": ["reuser-project"]}}
+    changed = {"families": {"changed": ["reuser-project"]}}
+    family_file.write_text(yaml.safe_dump(initial, sort_keys=False))
+    assert _load_families_in_new_process(family_file)["reuser-project"] == "initial"
+
+    # A ConfigMap-only GitOps commit changes the mounted file, Reloader rolls
+    # out the Deployment, and the replacement process reads the new mapping.
+    family_file.write_text(yaml.safe_dump(changed, sort_keys=False))
+    assert _load_families_in_new_process(family_file)["reuser-project"] == "changed"

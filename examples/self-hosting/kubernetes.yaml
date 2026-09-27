@@ -46,6 +46,11 @@ kind: Deployment
 metadata:
   name: git-activity-exporter
   namespace: git-activity-exporter
+  annotations:
+    # The exporter reads families.yaml only at startup. Reloader watches this
+    # ConfigMap and changes the pod template when GitOps updates its data,
+    # which lets Kubernetes roll out a fresh process automatically.
+    configmap.reloader.stakater.com/reload: git-activity-exporter-families
 spec:
   replicas: 1
   strategy:
