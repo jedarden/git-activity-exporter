@@ -94,6 +94,11 @@ the custom owner/mapping. The generated fixture credentials and repository are
 ephemeral; production credentials belong in Secret references as shown in
 `examples/self-hosting/kubernetes.yaml`.
 
+The release workflow runs this same profile as the `self-hosting-smoke` gate
+against the exact semver image produced by the preceding image-build step.
+Promotion cannot run if the non-author Forgejo/S3 cycle, pointer, or output
+object checks fail.
+
 ## Container smoke verification
 
 The repository-owned [`scripts/smoke-container.sh`](../../scripts/smoke-container.sh)
@@ -116,12 +121,14 @@ The final workflow steps perform the handoff automatically, in this order:
 
 1. `test` must pass before version resolution can write an automatic `VERSION`
    commit or build an image.
-2. `smoke` must pass against the exact semver image that was pushed.
-3. `promote` clones `declarative-config`, changes only the image pin in
+2. `self-hosting-smoke` must pass the fake Forgejo/S3 publication cycle
+   against the exact semver image that was pushed.
+3. `smoke` must pass the image's runtime health and readiness checks.
+4. `promote` clones `declarative-config`, changes only the image pin in
    `k8s/ardenone-cluster/git-activity-exporter/deployment.yml`, commits it on
    `main`, and pushes it to Forgejo. It emits that GitOps commit SHA as the
    release record.
-4. `verify-rollout` waits for the generated ArgoCD application to report the
+5. `verify-rollout` waits for the generated ArgoCD application to report the
    pushed revision as `Synced`/`Healthy`, then checks the Deployment's exact
    image and ready/available replica status through the read-only Kubernetes
    proxy.

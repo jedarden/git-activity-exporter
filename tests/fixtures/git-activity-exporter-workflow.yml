@@ -26,6 +26,12 @@ spec:
               parameters:
                 - name: version
                   value: "{{steps.resolve-version.outputs.parameters.version}}"
+        - - name: self-hosting-smoke
+            template: self-hosting-smoke
+            arguments:
+              parameters:
+                - name: version
+                  value: "{{steps.resolve-version.outputs.parameters.version}}"
         - - name: smoke
             template: smoke
             arguments:
@@ -125,6 +131,44 @@ spec:
           - name: verified-image
             valueFrom:
               path: /tmp/verified-image
+    - name: self-hosting-smoke
+      inputs:
+        parameters:
+          - name: version
+      container:
+        image: docker:29.7.2-dind
+        command: [sh, -c]
+        args:
+          - |
+            set -eu
+            dockerd-entrypoint.sh &
+            export DOCKER_HOST=unix:///var/run/docker.sock
+            apk add --no-cache bash curl git >/dev/null
+            for _ in $(seq 1 30); do
+              docker info >/dev/null 2>&1 && break
+              sleep 2
+            done
+            docker info >/dev/null
+            docker compose version >/dev/null
+
+            git clone --depth 1 --branch {{workflow.parameters.branch}} \
+              "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" /tmp/repo
+            cd /tmp/repo
+            IMAGE="ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}"
+            docker pull "$IMAGE"
+            SKIP_BUILD=1 IMAGE="$IMAGE" SMOKE_PYTHON_IMAGE="$IMAGE" \
+              scripts/smoke-self-hosting.sh
+      securityContext:
+        privileged: true
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+      retryStrategy:
+        retryPolicy: OnError
     - name: promote
       inputs:
         parameters:

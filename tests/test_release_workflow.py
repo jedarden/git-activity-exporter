@@ -314,6 +314,7 @@ def test_failed_tests_cannot_reach_the_version_bump():
         "test",
         "resolve-version",
         "docker-build",
+        "self-hosting-smoke",
         "smoke",
         "promote",
         "verify-rollout",
@@ -330,8 +331,34 @@ def test_failed_tests_cannot_reach_the_version_bump():
     assert "git add VERSION" in resolve_script
     assert 'git config user.name "Argo Workflows CI"' in resolve_script
     assert build_steps[1][0]["template"] == "resolve-version"
-    assert build_steps[4][0]["template"] == "promote"
-    assert build_steps[5][0]["template"] == "verify-rollout"
+    assert build_steps[5][0]["template"] == "promote"
+    assert build_steps[6][0]["template"] == "verify-rollout"
+
+
+def test_self_hosting_smoke_runs_as_a_pinned_image_release_gate():
+    workflow = _workflow()
+    templates = _templates(workflow)
+    smoke_step = workflow["spec"]["templates"][0]["steps"][3][0]
+    smoke = templates["self-hosting-smoke"]
+    source = smoke["container"]["args"][0]
+
+    assert smoke_step["template"] == "self-hosting-smoke"
+    assert smoke_step["arguments"]["parameters"] == [
+        {
+            "name": "version",
+            "value": "{{steps.resolve-version.outputs.parameters.version}}",
+        }
+    ]
+    assert smoke["container"]["image"] == "docker:29.7.2-dind"
+    assert smoke["securityContext"]["privileged"] is True
+    assert smoke["retryStrategy"]["retryPolicy"] == "OnError"
+    for phrase in (
+        "docker compose version",
+        "docker pull \"$IMAGE\"",
+        "SKIP_BUILD=1 IMAGE=\"$IMAGE\" SMOKE_PYTHON_IMAGE=\"$IMAGE\"",
+        "scripts/smoke-self-hosting.sh",
+    ):
+        assert phrase in source
 
 
 def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
@@ -433,6 +460,7 @@ def test_partial_release_retries_keep_the_resolved_version_and_verification_gate
         "test",
         "resolve-version",
         "docker-build",
+        "self-hosting-smoke",
         "smoke",
         "promote",
         "verify-rollout",
@@ -440,10 +468,10 @@ def test_partial_release_retries_keep_the_resolved_version_and_verification_gate
     assert build_steps[2][0]["arguments"]["parameters"][0]["value"] == (
         "{{steps.resolve-version.outputs.parameters.version}}"
     )
-    assert build_steps[4][0]["arguments"]["parameters"][0]["value"] == (
+    assert build_steps[5][0]["arguments"]["parameters"][0]["value"] == (
         "{{steps.resolve-version.outputs.parameters.version}}"
     )
-    assert build_steps[4][0]["arguments"]["parameters"][1]["value"] == (
+    assert build_steps[5][0]["arguments"]["parameters"][1]["value"] == (
         "{{steps.smoke.outputs.parameters.verified-image}}"
     )
 

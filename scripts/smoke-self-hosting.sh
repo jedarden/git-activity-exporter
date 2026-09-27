@@ -22,7 +22,15 @@ compose() {
         --file "$PROFILE_DIR/compose.yaml" "$@"
 }
 
-python "$ROOT/scripts/check-release-drift.py"
+if [[ -n ${SMOKE_PYTHON_IMAGE:-} ]]; then
+    docker run --rm \
+        --volume "$ROOT:/repo:ro" \
+        --workdir /repo \
+        "$SMOKE_PYTHON_IMAGE" \
+        python /repo/scripts/check-release-drift.py
+else
+    python "$ROOT/scripts/check-release-drift.py"
+fi
 
 cleanup() {
     compose --profile self-hosting down --volumes --remove-orphans >/dev/null 2>&1 || true
@@ -77,6 +85,7 @@ done
 S3_PORT=$(compose port s3-fixture 9000 | sed -n '1s/.*://p')
 BROWSER_HOST=dashboard.example.test
 BROWSER_BASE_URL="http://127.0.0.1:$S3_PORT/git-activity/data"
+INTERNAL_BROWSER_BASE_URL="http://s3-fixture:9000/git-activity/data"
 # The Host header selects the fixture's website handler. The path is the same
 # path the authenticated dashboard browser uses; the fixture maps it to the
 # objects written through the S3 API above. No S3 credentials are sent here.
@@ -84,7 +93,8 @@ curl --fail --silent --show-error \
     --header "Host: $BROWSER_HOST" \
     "$BROWSER_BASE_URL/current.json" > "$SMOKE_TMP/current.json"
 
-python - "$BROWSER_BASE_URL" "$BROWSER_HOST" "$SMOKE_TMP/current.json" <<'PY'
+compose exec --no-TTY exporter python - \
+    "$INTERNAL_BROWSER_BASE_URL" "$BROWSER_HOST" <<'PY'
 import io
 import json
 import re
@@ -94,21 +104,22 @@ from urllib.request import Request, urlopen
 
 import pyarrow.parquet as pq
 
-browser_base, browser_host, pointer_path = sys.argv[1:]
+browser_base, browser_host = sys.argv[1:]
 
 
 def browser_open(url, method="GET"):
     return urlopen(Request(url, method=method, headers={"Host": browser_host}), timeout=10)
 
 
-pointer = json.loads(open(pointer_path).read())
+pointer_url = f"{browser_base}/current.json"
+with browser_open(pointer_url) as response:
+    pointer = json.loads(response.read())
 assert set(pointer["objects"]) == {
     "hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json"
 }
 assert re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}", pointer["cycle_id"])
 assert pointer["cycle_id"].startswith(pointer["generated_at"].replace("-", "").replace(":", ""))
 
-pointer_url = f"{browser_base}/current.json"
 with browser_open(pointer_url) as response:
     assert response.headers["Cache-Control"] == "no-cache, max-age=0, must-revalidate"
 
@@ -139,6 +150,8 @@ events = pq.read_table(
 ).to_pylist()
 assert commits and {row["family"] for row in commits} == {"reuser-projects"}
 assert hourly and {row["family"] for row in hourly} == {"reuser-projects"}
+assert {row["repo"] for row in commits} == {"reuser-project"}
+assert {row["repo"] for row in hourly} == {"reuser-project"}
 assert events == []
 PY
 
