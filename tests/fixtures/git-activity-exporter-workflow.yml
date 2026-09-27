@@ -55,8 +55,41 @@ spec:
         command: [sh]
         source: |
           set -e
-          git config user.name "Argo Workflows CI"
-          git add VERSION
+          git clone --branch {{workflow.parameters.branch}} \
+            "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" \
+            /tmp/repo
+          cd /tmp/repo
+
+          VERSION_CHANGED=$(git diff --name-only HEAD~1 HEAD -- VERSION 2>/dev/null | grep -c '^VERSION$' || true)
+
+          if [ "$VERSION_CHANGED" -gt 0 ] 2>/dev/null; then
+            VERSION=$(cat VERSION | tr -d '[:space:]')
+            echo "VERSION changed in commit — using ${VERSION}"
+          else
+            CURRENT=$(cat VERSION | tr -d '[:space:]')
+            MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+            MINOR=$(echo "$CURRENT" | cut -d. -f2)
+            PATCH=$(echo "$CURRENT" | cut -d. -f3)
+            PATCH=$((PATCH + 1))
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            echo "Auto-bumping ${CURRENT} → ${VERSION}"
+            echo "$VERSION" > VERSION
+            git config user.email "github@jedarden.com"
+            git config user.name "Argo Workflows CI"
+            git add VERSION
+            git commit -m "ci: auto-bump version to ${VERSION}"
+            PUSHED=false
+            for i in 1 2 3; do
+              if git pull --rebase && git push; then
+                PUSHED=true
+                break
+              fi
+              echo "Push attempt $i failed, retrying..."
+              sleep 3
+            done
+            test "$PUSHED" = true
+          fi
+
           echo "$VERSION" > /tmp/version
     - name: smoke
       inputs:
@@ -64,6 +97,11 @@ spec:
           - name: version
       container:
         image: ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
+        command: [sh, -c]
+        args:
+          - |
+            set -eu
+            test "$(tr -d '[:space:]' < /app/VERSION)" = "{{inputs.parameters.version}}"
     - name: promote
       inputs:
         parameters:
@@ -74,11 +112,27 @@ spec:
         source: |
           set -eu
           VERSION="{{inputs.parameters.version}}"
-          git clone https://git.ardenone.com/jedarden/declarative-config.git /tmp/declarative-config
+          printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          git clone --branch main --depth 1 \
+            "https://git.ardenone.com/jedarden/declarative-config.git" \
+            /tmp/declarative-config
           cd /tmp/declarative-config
           MANIFEST=k8s/ardenone-cluster/git-activity-exporter/deployment.yml
-          sed -i "s|ronaldraygun/git-activity-exporter:[^[:space:]]*|ronaldraygun/git-activity-exporter:${VERSION}|" "$MANIFEST"
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(grep -Ec \
+            '^[[:space:]]+image: ronaldraygun/git-activity-exporter:[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' \
+            "$MANIFEST")" = 1
+          sed -i -E \
+            "s|(image: ronaldraygun/git-activity-exporter:)[^[:space:]]*|\1${VERSION}|" \
+            "$MANIFEST"
+          grep -Eq \
+            "^[[:space:]]+image: ronaldraygun/git-activity-exporter:${VERSION}[[:space:]]*$" \
+            "$MANIFEST"
           git add "$MANIFEST"
+          git diff --cached --check
+          git config user.email "github@jedarden.com"
+          git config user.name "Argo Workflows CI"
           git commit -m "ci(git-activity-exporter): promote image to ${VERSION}"
           git push origin HEAD:main
           git rev-parse HEAD > /tmp/gitops-revision
@@ -97,8 +151,10 @@ spec:
         command: [sh]
         source: |
           set -eu
-          printf '%s\n' "{{inputs.parameters.version}}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          VERSION="{{inputs.parameters.version}}"
+          printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
           printf '%s\n' "{{inputs.parameters.gitops-revision}}" | grep -Eq '^[0-9a-f]{40}$'
+          IMAGE="ronaldraygun/git-activity-exporter:${VERSION}"
           curl -fsS https://argocd-ro-ardenone-manager-ts.ardenone.com:8444/api/v1/applications/git-activity-exporter-ns-ardenone-cluster
           kubectl --server=http://ardenone-cluster-traefik:8001 get deployment git-activity-exporter
     - name: docker-build

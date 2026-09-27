@@ -6,8 +6,13 @@ the small committed fixtures keep the test suite reproducible from an
 application-only archive as well.
 """
 
+import os
+import re
+import shlex
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -71,6 +76,148 @@ def _assert_explicit_image_pin(image: str) -> None:
 
 def _templates(workflow: dict) -> dict[str, dict]:
     return {template["name"]: template for template in workflow["spec"]["templates"]}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _new_bare_repository(root: Path, name: str) -> tuple[Path, Path]:
+    origin = root / f"{name}.git"
+    seed = root / f"{name}-seed"
+    _git(root, "init", "--bare", "--initial-branch=main", str(origin))
+    _git(root, "init", "--initial-branch=main", str(seed))
+    _git(seed, "config", "user.name", "Release test")
+    _git(seed, "config", "user.email", "release-test@example.invalid")
+    _git(seed, "remote", "add", "origin", str(origin))
+    return origin, seed
+
+
+def _application_origin(root: Path, *, explicit_version_change: bool) -> Path:
+    origin, seed = _new_bare_repository(root, "application")
+    (seed / "VERSION").write_text("1.2.3\n", encoding="utf-8")
+    (seed / "release-input.txt").write_text("initial\n", encoding="utf-8")
+    _git(seed, "add", "VERSION", "release-input.txt")
+    _git(seed, "commit", "-m", "initial release state")
+
+    if explicit_version_change:
+        (seed / "VERSION").write_text("1.2.9\n", encoding="utf-8")
+    else:
+        (seed / "release-input.txt").write_text("application change\n", encoding="utf-8")
+    _git(seed, "add", "VERSION", "release-input.txt")
+    _git(seed, "commit", "-m", "trigger release")
+    _git(seed, "push", "--set-upstream", "origin", "main")
+    return origin
+
+
+def _run_resolve_version(
+    workflow: dict, root: Path, origin: Path, expected_version_path: Path
+) -> str:
+    """Run the WorkflowTemplate's resolver against a local bare Git repo."""
+    script = _templates(workflow)["resolve-version"]["script"]["source"]
+    checkout = root / "resolve-checkout"
+    clone_pattern = re.compile(
+        r'git clone --branch \{\{workflow\.parameters\.branch\}\} \\\n'
+        r'\s+"https://git\.ardenone\.com/\{\{workflow\.parameters\.git-repo\}\}\.git" \\\n'
+        r'\s+/tmp/repo'
+    )
+    script, replacements = clone_pattern.subn(
+        "git clone --branch main "
+        f"{shlex.quote(str(origin))} {shlex.quote(str(checkout))}",
+        script,
+        count=1,
+    )
+    assert replacements == 1, script
+    script = script.replace("/tmp/repo", str(checkout))
+    script = script.replace("/tmp/version", str(expected_version_path))
+    result = subprocess.run(
+        ["sh", "-c", script],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert result.returncode == 0, result.stderr
+    return expected_version_path.read_text(encoding="utf-8").strip()
+
+
+def _gitops_repository(root: Path) -> Path:
+    origin, seed = _new_bare_repository(root, "declarative-config")
+    manifest = seed / "k8s/ardenone-cluster/git-activity-exporter/deployment.yml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "spec:\n"
+        "  template:\n"
+        "    spec:\n"
+        "      containers:\n"
+        "        - name: exporter\n"
+        "          image: ronaldraygun/git-activity-exporter:1.2.3\n",
+        encoding="utf-8",
+    )
+    _git(seed, "add", str(manifest.relative_to(seed)))
+    _git(seed, "commit", "-m", "initial GitOps state")
+    _git(seed, "push", "--set-upstream", "origin", "main")
+    return origin
+
+
+def _run_promotion(
+    workflow: dict, root: Path, gitops_origin: Path, version: str
+) -> tuple[str, str]:
+    """Run the promotion script locally and return its revision and image."""
+    script = _templates(workflow)["promote"]["script"]["source"]
+    checkout = root / "gitops-checkout"
+    clone_pattern = re.compile(
+        r'git clone --branch main --depth 1 \\\n'
+        r'\s+"https://git\.ardenone\.com/jedarden/declarative-config\.git" \\\n'
+        r'\s+/tmp/declarative-config'
+    )
+    script, replacements = clone_pattern.subn(
+        "git clone --branch main --depth 1 "
+        f"{shlex.quote(str(gitops_origin))} {shlex.quote(str(checkout))}",
+        script,
+        count=1,
+    )
+    assert replacements == 1, script
+    script = script.replace("/tmp/declarative-config", str(checkout))
+    script = script.replace(
+        'VERSION="{{inputs.parameters.version}}"', f'VERSION="{version}"'
+    )
+    revision_path = root / "gitops-revision"
+    script = script.replace("/tmp/gitops-revision", str(revision_path))
+    result = subprocess.run(
+        ["sh", "-c", script],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert result.returncode == 0, result.stderr
+    revision = revision_path.read_text(encoding="utf-8").strip()
+    promoted_manifest = _git(
+        root,
+        "--git-dir",
+        str(gitops_origin),
+        "show",
+        f"{revision}:k8s/ardenone-cluster/git-activity-exporter/deployment.yml",
+    )
+    image = re.search(
+        r"^\s+image:\s+(ronaldraygun/git-activity-exporter:\S+)\s*$",
+        promoted_manifest,
+        re.MULTILINE,
+    )
+    assert image, promoted_manifest
+    return revision, image.group(1)
 
 
 def test_failed_tests_cannot_reach_the_version_bump():
@@ -145,6 +292,87 @@ def test_resolved_version_drives_both_embedded_version_and_image_tag():
     )
     assert "echo \"$VERSION\" > /tmp/version" in templates["resolve-version"]["script"]["source"]
     assert "COPY VERSION ." in (ROOT / "Dockerfile").read_text()
+
+
+@pytest.mark.parametrize(
+    "explicit_version_change, expected_version",
+    [(False, "1.2.4"), (True, "1.2.9")],
+    ids=["automatic-version-bump", "explicit-version-change"],
+)
+def test_release_paths_keep_one_version_before_gitops_promotion(
+    tmp_path: Path, explicit_version_change: bool, expected_version: str
+):
+    """Exercise both resolver branches and the complete image handoff contract."""
+    workflow = _workflow()
+    application_origin = _application_origin(
+        tmp_path, explicit_version_change=explicit_version_change
+    )
+
+    resolved_version = _run_resolve_version(
+        workflow, tmp_path, application_origin, tmp_path / "resolved-version"
+    )
+    source_version = _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "show",
+        "main:VERSION",
+    ).strip()
+    latest_source_commit = _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "log",
+        "-1",
+        "--format=%s",
+        "main",
+    )
+
+    assert resolved_version == expected_version
+    assert source_version == resolved_version
+    if explicit_version_change:
+        assert latest_source_commit == "trigger release"
+    else:
+        assert latest_source_commit == (
+            f"ci: auto-bump version to {resolved_version}"
+        )
+
+    templates = _templates(workflow)
+    docker_args = templates["docker-build"]["container"]["args"]
+    destination = next(arg for arg in docker_args if arg.startswith("--destination="))
+    build_arg = next(arg for arg in docker_args if arg.startswith("--build-arg="))
+    assert destination.replace(
+        "{{inputs.parameters.version}}", resolved_version
+    ) == f"--destination=ronaldraygun/git-activity-exporter:{resolved_version}"
+    assert build_arg.replace(
+        "{{inputs.parameters.version}}", resolved_version
+    ) == f"--build-arg=VERSION={resolved_version}"
+
+    smoke = templates["smoke"]
+    assert smoke["container"]["image"] == (
+        "ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}"
+    )
+    assert (
+        'test "$(tr -d \'[:space:]\' < /app/VERSION)" '
+        '= "{{inputs.parameters.version}}"'
+        in smoke["container"]["args"][0]
+    )
+    # Dockerfile COPY VERSION . places the exact main-branch context value at
+    # /app/VERSION; this is checked before promotion is allowed to run below.
+    assert "COPY VERSION ." in (ROOT / "Dockerfile").read_text()
+    embedded_version = source_version
+    assert embedded_version == resolved_version
+
+    gitops_origin = _gitops_repository(tmp_path)
+    revision, promoted_image = _run_promotion(
+        workflow, tmp_path, gitops_origin, resolved_version
+    )
+    assert revision == _git(
+        tmp_path, "--git-dir", str(gitops_origin), "rev-parse", "main"
+    )
+    assert promoted_image == (
+        f"ronaldraygun/git-activity-exporter:{resolved_version}"
+    )
 
 
 def test_release_workflow_and_kubernetes_manifests_use_explicit_image_pins():
