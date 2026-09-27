@@ -4,6 +4,9 @@ metadata:
   name: git-activity-exporter-build
 spec:
   entrypoint: build
+  synchronization:
+    mutexes:
+      - name: git-activity-exporter-release
   templates:
     - name: build
       steps:
@@ -17,6 +20,26 @@ spec:
               parameters:
                 - name: version
                   value: "{{steps.resolve-version.outputs.parameters.version}}"
+        - - name: smoke
+            template: smoke
+            arguments:
+              parameters:
+                - name: version
+                  value: "{{steps.resolve-version.outputs.parameters.version}}"
+        - - name: promote
+            template: promote
+            arguments:
+              parameters:
+                - name: version
+                  value: "{{steps.resolve-version.outputs.parameters.version}}"
+        - - name: verify-rollout
+            template: verify-rollout
+            arguments:
+              parameters:
+                - name: version
+                  value: "{{steps.resolve-version.outputs.parameters.version}}"
+                - name: gitops-revision
+                  value: "{{steps.promote.outputs.parameters.gitops-revision}}"
     - name: test
       retryStrategy:
         retryPolicy: OnError
@@ -28,8 +51,48 @@ spec:
       script:
         source: |
           set -e
+          git config user.name "Argo Workflows CI"
           git add VERSION
           echo "$VERSION" > /tmp/version
+    - name: smoke
+      inputs:
+        parameters:
+          - name: version
+      container:
+        image: ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
+    - name: promote
+      inputs:
+        parameters:
+          - name: version
+      script:
+        source: |
+          set -eu
+          VERSION="{{inputs.parameters.version}}"
+          git clone https://git.ardenone.com/jedarden/declarative-config.git /tmp/declarative-config
+          cd /tmp/declarative-config
+          MANIFEST=k8s/ardenone-cluster/git-activity-exporter/deployment.yml
+          sed -i "s|ronaldraygun/git-activity-exporter:[^[:space:]]*|ronaldraygun/git-activity-exporter:${VERSION}|" "$MANIFEST"
+          git add "$MANIFEST"
+          git commit -m "ci(git-activity-exporter): promote image to ${VERSION}"
+          git push origin HEAD:main
+          git rev-parse HEAD > /tmp/gitops-revision
+      outputs:
+        parameters:
+          - name: gitops-revision
+            valueFrom:
+              path: /tmp/gitops-revision
+    - name: verify-rollout
+      inputs:
+        parameters:
+          - name: version
+          - name: gitops-revision
+      script:
+        source: |
+          set -eu
+          printf '%s\n' "{{inputs.parameters.version}}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          printf '%s\n' "{{inputs.parameters.gitops-revision}}" | grep -Eq '^[0-9a-f]{40}$'
+          curl -fsS https://argocd-ro-ardenone-manager-ts.ardenone.com:8444/api/v1/applications/git-activity-exporter-ns-ardenone-cluster
+          kubectl --server=http://ardenone-cluster-traefik:8001 get deployment git-activity-exporter
     - name: docker-build
       inputs:
         parameters:

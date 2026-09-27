@@ -42,7 +42,9 @@ Kubernetes Deployment defines the authoritative cluster probes described below.
 The workflow passes the resolved version as a Kaniko build argument, but the
 image's embedded version comes from the `VERSION` file copied from the build
 context. Because an automatic bump is pushed before the Kaniko step, the
-source version and image tag agree.
+source version and image tag agree. The workflow serializes releases with the
+`git-activity-exporter-release` mutex so version write-back and promotion do
+not race one another.
 
 ## Self-hosting smoke profile
 
@@ -97,17 +99,25 @@ the Deployment image is semver-pinned, and the named `health` port and
 
 ## Promoting an image to the Deployment
 
-After a successful build, update only the image pin in
-`k8s/ardenone-cluster/git-activity-exporter/deployment.yml`:
+The final workflow steps perform the handoff automatically, in this order:
 
-```yaml
-image: ronaldraygun/git-activity-exporter:<version>
-```
+1. `test` must pass before version resolution can write an automatic `VERSION`
+   commit or build an image.
+2. `smoke` must pass against the exact semver image that was pushed.
+3. `promote` clones `declarative-config`, changes only the image pin in
+   `k8s/ardenone-cluster/git-activity-exporter/deployment.yml`, commits it on
+   `main`, and pushes it to Forgejo. It emits that GitOps commit SHA as the
+   release record.
+4. `verify-rollout` waits for the generated ArgoCD application to report the
+   pushed revision as `Synced`/`Healthy`, then checks the Deployment's exact
+   image and ready/available replica status through the read-only Kubernetes
+   proxy.
 
-Commit and push that change to the `declarative-config` Forgejo repository.
-Do not apply the Deployment directly with `kubectl`, use a mutable tag, or
-assume that a successful image build changed the running pod. The desired
-state commit is the deployment/release record.
+The desired-state commit triggers ArgoCD's automated reconciliation. No
+workflow step applies, patches, restarts, or rolls back a live resource, and
+the image remains pinned to `ronaldraygun/git-activity-exporter:<version>`.
+The repository-owned verification helper below remains the detailed release
+check for the live probes and successful publication.
 
 ## Runtime packaging and inputs
 
@@ -262,7 +272,8 @@ The normal release sequence is therefore:
 1. Push the application change to Forgejo `main`.
 2. Let the sensor start the WorkflowTemplate and wait for tests and the
    versioned image push to succeed.
-3. Pin that image tag in `declarative-config`, then push the GitOps commit.
+3. Let the workflow pin that image tag in `declarative-config`, push the GitOps
+   commit, and verify the generated ArgoCD Application and Deployment.
 4. Run the post-reconcile verification below with the GitOps commit SHA and
    exact semver image tag. It confirms the generated ArgoCD Application is
    `Synced` and `Healthy`, the replacement pod is running the requested image,

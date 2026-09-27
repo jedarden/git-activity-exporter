@@ -45,10 +45,13 @@ def test_failed_tests_cannot_reach_the_version_bump():
     build_steps = workflow["spec"]["templates"][0]["steps"]
 
     assert workflow["spec"]["entrypoint"] == "build"
-    assert [group[0]["name"] for group in build_steps[:3]] == [
+    assert [group[0]["name"] for group in build_steps] == [
         "test",
         "resolve-version",
         "docker-build",
+        "smoke",
+        "promote",
+        "verify-rollout",
     ]
 
     test = templates["test"]
@@ -60,7 +63,34 @@ def test_failed_tests_cannot_reach_the_version_bump():
 
     resolve_script = templates["resolve-version"]["script"]["source"]
     assert "git add VERSION" in resolve_script
+    assert 'git config user.name "Argo Workflows CI"' in resolve_script
     assert build_steps[1][0]["template"] == "resolve-version"
+    assert build_steps[4][0]["template"] == "promote"
+    assert build_steps[5][0]["template"] == "verify-rollout"
+
+
+def test_promotion_is_serialized_and_verifies_the_pushed_gitops_revision():
+    workflow = _workflow()
+    templates = _templates(workflow)
+    assert workflow["spec"]["synchronization"]["mutexes"] == [
+        {"name": "git-activity-exporter-release"}
+    ]
+
+    promote = templates["promote"]
+    promote_source = promote["script"]["source"]
+    assert "declarative-config.git" in promote_source
+    assert "k8s/ardenone-cluster/git-activity-exporter/deployment.yml" in promote_source
+    assert 'git add "$MANIFEST"' in promote_source
+    assert "git commit -m" in promote_source
+    assert "git push origin HEAD:main" in promote_source
+    assert "/tmp/gitops-revision" in promote_source
+    assert promote["outputs"]["parameters"][0]["name"] == "gitops-revision"
+
+    verify = templates["verify-rollout"]["script"]["source"]
+    assert "argocd-ro-ardenone-manager-ts.ardenone.com" in verify
+    assert "ardenone-cluster-traefik:8001" in verify
+    assert "--server=http://ardenone-cluster-traefik:8001" in verify
+    assert "kubectl apply" not in verify
 
 
 def test_resolved_version_drives_both_embedded_version_and_image_tag():
