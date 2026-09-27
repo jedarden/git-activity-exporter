@@ -13,10 +13,12 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import statistics
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pyarrow.parquet as pq
 
@@ -26,6 +28,59 @@ EXPECTED_PATH_TOTALS = {
     "beads_lines": "beads_lines",
     "vendored_lines": "vendored_lines",
 }
+BASELINE_SCHEMA = "git-activity-baseline/v1"
+EXPECTED_OBJECTS = ("commits.parquet", "line_totals.json", "ecosystem_counts.json")
+SHA1_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+ANCHOR_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z\Z")
+
+
+def _is_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
+    actual = set(value)
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unknown:
+            details.append(f"unknown {unknown}")
+        raise ValueError(f"{label} has invalid fields: {', '.join(details)}")
+
+
+def _validate_repo_name(value: Any, label: str) -> None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{label} must be a non-empty repository name")
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"{label} must not be a path")
+    if any(ord(char) < 32 for char in value):
+        raise ValueError(f"{label} contains a control character")
+
+
+def _validate_sha(value: Any, label: str) -> None:
+    if not isinstance(value, str) or SHA1_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a 40-character hexadecimal SHA")
+
+
+def _validate_relative_object_path(value: Any, label: str) -> None:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"{label} must be a relative object path")
+    path = Path(value)
+    if path.is_absolute() or path.anchor or ".." in path.parts:
+        raise ValueError(f"{label} must be a relative object path")
+
+
+def _validate_tolerance(value: Any, label: str) -> None:
+    if not _is_number(value) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be a finite non-negative number")
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -49,15 +104,82 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("manifest must be a JSON object")
-    for key in ("source", "reporting", "exporter", "objects"):
-        if not isinstance(manifest.get(key), dict):
-            raise ValueError(f"manifest.{key} must be an object")
+    _require_exact_keys(manifest, {"schema", "source", "reporting", "exporter", "objects"}, "manifest")
+    if manifest["schema"] != BASELINE_SCHEMA:
+        raise ValueError(f"manifest.schema must be {BASELINE_SCHEMA!r}")
+
+    source = manifest["source"]
+    if not isinstance(source, dict):
+        raise ValueError("manifest.source must be an object")
+    _require_exact_keys(source, {"forge_base_url", "forge_owner", "repo_count", "repositories"}, "manifest.source")
+    forge_url = source["forge_base_url"]
+    parsed_url = urlsplit(forge_url) if isinstance(forge_url, str) else None
+    if (
+        parsed_url is None
+        or parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise ValueError("manifest.source.forge_base_url must be an HTTPS base URL")
+    if not isinstance(source["forge_owner"], str) or not source["forge_owner"].strip():
+        raise ValueError("manifest.source.forge_owner must be a non-empty string")
+    if not _is_integer(source["repo_count"]) or source["repo_count"] < 0:
+        raise ValueError("manifest.source.repo_count must be a non-negative integer")
+    repositories = source["repositories"]
+    if not isinstance(repositories, list):
+        raise ValueError("manifest.source.repositories must be a list")
+    repository_names = set()
+    for index, repository in enumerate(repositories):
+        label = f"manifest.source.repositories[{index}]"
+        if not isinstance(repository, dict):
+            raise ValueError(f"{label} must be an object")
+        _require_exact_keys(repository, {"name", "head_sha"}, label)
+        _validate_repo_name(repository["name"], f"{label}.name")
+        _validate_sha(repository["head_sha"], f"{label}.head_sha")
+        if repository["name"] in repository_names:
+            raise ValueError(f"manifest source repeats repository {repository['name']!r}")
+        repository_names.add(repository["name"])
+    if source["repo_count"] != len(repositories):
+        raise ValueError("manifest source.repo_count does not match its repository list")
+
     reporting = manifest["reporting"]
+    if not isinstance(reporting, dict):
+        raise ValueError("manifest.reporting must be an object")
+    _require_exact_keys(reporting, {"anchor_utc", "window_days"}, "manifest.reporting")
     if reporting.get("window_days") != 30:
         raise ValueError("the published baseline requires reporting.window_days = 30")
+    anchor_value = reporting.get("anchor_utc")
+    if not isinstance(anchor_value, str) or ANCHOR_RE.fullmatch(anchor_value) is None:
+        raise ValueError("manifest.reporting.anchor_utc must be an RFC 3339 UTC hour")
     anchor = _parse_timestamp(reporting["anchor_utc"])
     if anchor.minute or anchor.second or anchor.microsecond:
         raise ValueError("the published baseline anchor must be on a UTC hour")
+
+    exporter = manifest["exporter"]
+    if not isinstance(exporter, dict):
+        raise ValueError("manifest.exporter must be an object")
+    _require_exact_keys(exporter, {"version", "commit"}, "manifest.exporter")
+    if not isinstance(exporter["version"], str) or not exporter["version"].strip():
+        raise ValueError("manifest.exporter.version must be a non-empty string")
+    _validate_sha(exporter["commit"], "manifest.exporter.commit")
+
+    objects = manifest["objects"]
+    if not isinstance(objects, dict):
+        raise ValueError("manifest.objects must be an object")
+    for name in objects:
+        _validate_relative_object_path(name, f"manifest.objects.{name!r}")
+    if set(objects) != set(EXPECTED_OBJECTS):
+        raise ValueError(f"manifest.objects must contain exactly {list(EXPECTED_OBJECTS)!r}")
+    for name, descriptor in objects.items():
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"manifest.objects.{name} must be an object")
+        _require_exact_keys(descriptor, {"sha256"}, f"manifest.objects.{name}")
+        digest = descriptor["sha256"]
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(f"manifest.objects.{name}.sha256 must be a 64-character hexadecimal digest")
     return manifest
 
 
@@ -66,8 +188,8 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     rows = table.to_pylist()
     seen = set()
     for row in rows:
-        if not isinstance(row.get("repo"), str) or not isinstance(row.get("sha"), str):
-            raise ValueError("commits.parquet has a non-string repo or sha")
+        _validate_repo_name(row.get("repo"), "commits.parquet.repo")
+        _validate_sha(row.get("sha"), "commits.parquet.sha")
         identity = (row["repo"], row["sha"])
         if identity in seen:
             raise ValueError(f"commits.parquet repeats commit identity {identity[0]}:{identity[1]}")
@@ -131,7 +253,11 @@ def _repo_fano(rows: list[dict[str, Any]], repos: list[str], start: datetime, ho
 
 def _load_counts(path: Path, hours: int) -> list[int]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    counts = payload.get("counts") if isinstance(payload, dict) else payload
+    if isinstance(payload, dict):
+        _require_exact_keys(payload, {"counts"}, str(path))
+        counts = payload["counts"]
+    else:
+        counts = payload
     if not isinstance(counts, list) or len(counts) != hours:
         raise ValueError(f"{path} must contain exactly {hours} hourly counts")
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
@@ -189,26 +315,56 @@ def _check_manifest_objects(manifest: dict[str, Any], manifest_path: Path) -> No
     for name, descriptor in manifest["objects"].items():
         if not isinstance(descriptor, dict) or not isinstance(descriptor.get("sha256"), str):
             raise ValueError(f"manifest.objects.{name} must contain sha256")
-        path = manifest_path.parent / name
+        relative = Path(name)
+        root = manifest_path.parent.resolve()
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"manifest object escapes snapshot: {name}") from error
         if not path.is_file():
             raise ValueError(f"manifest object is missing: {path}")
         actual = _sha256(path)
-        if actual != descriptor["sha256"]:
+        if actual.lower() != descriptor["sha256"].lower():
             raise ValueError(f"sha256 mismatch for {name}: expected {descriptor['sha256']}, got {actual}")
 
 
+def _load_line_totals(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    for name in EXPECTED_PATH_TOTALS.values():
+        value = payload.get(name)
+        if not _is_integer(value) or value < 0:
+            raise ValueError(f"{path}.{name} must be a non-negative integer")
+    return payload
+
+
+def _require_manifest_object_argument(name: str, supplied: Path, manifest_path: Path) -> None:
+    expected = (manifest_path.parent / name).resolve()
+    if supplied.resolve() != expected:
+        raise ValueError(f"{name} must be loaded from the manifest object path {expected}")
+
+
 def _compare(result: dict[str, Any], expected: dict[str, Any]) -> list[str]:
+    if not isinstance(expected, dict):
+        raise ValueError("expected values must be a JSON object")
     failures = []
     for name, check in expected.items():
-        if not isinstance(check, dict) or "value" not in check:
+        if not isinstance(check, dict) or set(check) != {"value", "tolerance"}:
             raise ValueError(f"expected.{name} must contain value and tolerance")
+        tolerance = check["tolerance"]
+        _validate_tolerance(tolerance, f"expected.{name}.tolerance")
+        wanted = check["value"]
+        if not _is_number(wanted) or not math.isfinite(wanted):
+            raise ValueError(f"expected.{name}.value must be a finite number")
         if name not in result:
             failures.append(f"{name}: result is missing (supply the path-level line totals)")
             continue
-        tolerance = check.get("tolerance", 0)
         actual = result[name]
-        wanted = check["value"]
-        if isinstance(actual, (int, float)) and isinstance(wanted, (int, float)):
+        if _is_number(actual):
+            if not math.isfinite(actual):
+                raise ValueError(f"expected.{name}.value and result must be finite")
             matches = math.isclose(actual, wanted, rel_tol=0.0, abs_tol=tolerance)
         else:
             matches = actual == wanted
@@ -245,8 +401,11 @@ def main() -> int:
 
     line_totals = None
     if args.line_totals:
-        line_totals = json.loads(args.line_totals.read_text(encoding="utf-8"))
+        _require_manifest_object_argument("line_totals.json", args.line_totals, manifest_path)
+        line_totals = _load_line_totals(args.line_totals)
     hours = manifest["reporting"]["window_days"] * 24
+    if args.ecosystem_counts:
+        _require_manifest_object_argument("ecosystem_counts.json", args.ecosystem_counts, manifest_path)
     ecosystem_counts = _load_counts(args.ecosystem_counts, hours) if args.ecosystem_counts else None
     result = calculate(rows, manifest, line_totals, ecosystem_counts)
     print(json.dumps(result, indent=2, sort_keys=True))
