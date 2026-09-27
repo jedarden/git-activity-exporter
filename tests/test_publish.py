@@ -147,6 +147,70 @@ def test_pointer_document_shape():
         assert not key.startswith(PREFIX), "keys are relative to the prefix, not absolute"
 
 
+def _stored_pointer(document):
+    s3 = FakeS3()
+    s3.objects[f"{PREFIX}/current.json"] = (
+        json.dumps(document).encode(), "application/json"
+    )
+    return s3
+
+
+def _valid_pointer_document():
+    generated_at, cycle = identity("A")
+    return json.loads(publish.pointer_bytes(
+        cycle, generated_at, [name for name, _, _ in payloads("A")]
+    ))
+
+
+@pytest.mark.parametrize("missing", publish.POINTER_REQUIRED_FIELDS)
+def test_pointer_reader_rejects_each_missing_required_field(missing):
+    document = _valid_pointer_document()
+    del document[missing]
+    s3 = _stored_pointer(document)
+
+    state = publish._read_pointer_state(s3, BUCKET, f"{PREFIX}/current.json")
+
+    assert state.present is True
+    assert state.document is None
+    assert f"pointer missing required field(s): {missing}" == state.invalid_reason
+
+
+def test_pointer_reader_accepts_additive_optional_fields():
+    document = _valid_pointer_document()
+    document["producer"] = {"release": "0.1.37"}
+    s3 = _stored_pointer(document)
+
+    state = publish._read_pointer_state(s3, BUCKET, f"{PREFIX}/current.json")
+
+    assert state.document == document
+
+
+@pytest.mark.parametrize("schema_version", [0, 2, "1", True, None])
+def test_pointer_reader_rejects_unknown_or_non_integer_schema_versions(schema_version):
+    document = _valid_pointer_document()
+    document["schema_version"] = schema_version
+    s3 = _stored_pointer(document)
+
+    state = publish._read_pointer_state(s3, BUCKET, f"{PREFIX}/current.json")
+
+    assert state.present is True
+    assert state.document is None
+    assert "unsupported pointer schema_version" in state.invalid_reason
+
+
+def test_unusable_pointer_is_not_dereferenced_for_recovery():
+    document = _valid_pointer_document()
+    document["schema_version"] = 2
+    s3 = _stored_pointer(document)
+    named_object = put_key(f"cycles/{cycle_id('A')}", "hourly.parquet")
+    s3.objects[named_object] = (b"must not be fetched", "application/octet-stream")
+
+    assert publish.recover_publication(
+        s3, BUCKET, PREFIX, expected_names=publish.DEFAULT_FIXED_NAMES
+    ) is None
+    assert ("get", named_object) not in s3.calls
+
+
 def test_absent_pointer_bootstraps_without_pruning_existing_cycles():
     s3 = FakeS3()
     orphan = f"{PREFIX}/cycles/{cycle_id('A')}/diagnostic.txt"

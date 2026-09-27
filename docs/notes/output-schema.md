@@ -119,6 +119,74 @@ exactly as it always could. `meta.json`'s `cycle_id` vs `current.json`'s
 tells such a reader it crossed a publication boundary. The pointer is the
 migration target.
 
+## Output schema-version compatibility
+
+`current.json` is the versioned output envelope. Its `schema_version` is an
+integer describing the pointer and the four objects it names; it is not the
+exporter's release `version` in `meta.json`. The supported values are:
+
+| `schema_version` | Status | Compatibility contract |
+|---|---|---|
+| `1` | supported | The v1 pointer fields and the v1 `meta.json`/Parquet payload schemas documented below. |
+
+There are no other supported values today. A breaking change gets a new
+integer and a new versioned consumer fixture (for example, `v2`); v1 readers
+must not guess how to read it. `meta.json` and the Parquet files do not carry
+an independent `schema_version`: they inherit the version of the pointer
+that names them.
+
+### Required and optional fields
+
+The v1 `current.json` envelope requires all four fields below. Their types and
+relationships are part of the compatibility contract; a field set to `null`
+is not a valid substitute for a missing or correctly typed value.
+
+| Field | Required in v1 | Compatibility rule |
+|---|---|---|
+| `schema_version` | yes | Integer `1`; JSON booleans are not integers for this purpose. |
+| `cycle_id` | yes | A valid cycle ID whose timestamp is exactly `generated_at`. |
+| `generated_at` | yes | A valid UTC timestamp with an explicit `Z`. |
+| `objects` | yes | A non-empty object of simple names to exact relative `cycles/<cycle_id>/<name>` keys. |
+
+The v1 envelope defines no named optional fields. Unknown/additive envelope
+fields are treated as optional extensions and ignored by a v1 reader after the
+required fields validate. Producers must keep the required fields stable;
+consumers must not invent defaults for them. A future optional payload field
+must be read only when present, with its documented default, and must not
+silently replace a required field.
+
+All fields in the v1 `meta.json` table and all columns in the v1 Parquet
+tables are required for that payload schema. `bead_epoch_utc` is nullable, but
+it is not optional. The `version` field in `meta.json` identifies the writer
+release, not the output format. A missing required payload field, missing
+pointer-named object, or pointer object-name mismatch makes the cycle
+incomplete rather than a partial dataset to be guessed around.
+
+### Reader behavior
+
+A consumer must validate `current.json` before fetching any named object:
+
+- An unknown, missing, non-integer, or otherwise invalid `schema_version` is
+  unsupported. The consumer retains the pointer bytes for diagnosis, reads no
+  object named by it, does not repair fixed keys from it, and does not prune
+  cycle prefixes. It waits for or falls back to the last independently valid
+  cycle according to its application policy.
+- A missing or invalid required field has the same fail-closed behavior. The
+  consumer must not fall back to the fixed-key mirror as though it were an
+  atomic replacement, because those keys can be mixed during publication.
+- An unknown/additive field is ignored. A missing optional field is handled by
+  its documented default; v1 has no named optional fields, so no default is
+  implied for any of its four envelope fields.
+- A pointer that passes envelope validation but omits one of the configured
+  four object names, names an object that is absent, or contains `meta.json`
+  from another cycle is unusable. The complete previous cycle remains
+  authoritative until a complete pointer is available.
+
+The exporter implements this policy in `publish.validate_pointer_document`
+and `publish._read_pointer_state`. The reader tests cover supported v1,
+unknown versions, missing required fields, additive fields, and the guarantee
+that an unusable pointer is not dereferenced or used for destructive recovery.
+
 ### Crash recovery
 
 Pod termination is treated as a loss of the client response, not as evidence

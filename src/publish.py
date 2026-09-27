@@ -74,8 +74,12 @@ _CYCLE_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
 _GENERATED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _CYCLE_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
-#: Pointer document shape; bump when the schema changes.
+#: Pointer document shape; bump when the schema changes. The reader accepts
+#: only versions listed in SUPPORTED_POINTER_SCHEMA_VERSIONS: an unknown
+#: version is not safe to dereference because its object set may have changed.
 POINTER_SCHEMA_VERSION = 1
+SUPPORTED_POINTER_SCHEMA_VERSIONS = frozenset((POINTER_SCHEMA_VERSION,))
+POINTER_REQUIRED_FIELDS = ("schema_version", "cycle_id", "generated_at", "objects")
 
 #: Committed cycle prefixes kept behind the pointer's cycle. Three cycles is
 #: roughly three poll intervals of grace for a consumer that resolved the
@@ -268,35 +272,57 @@ def pointer_bytes(cycle_id: str, generated_at: str, payload_names) -> bytes:
     return json.dumps(doc, indent=2).encode()
 
 
+def validate_pointer_document(doc: dict) -> dict:
+    """Validate a decoded ``current.json`` document.
+
+    The v1 envelope has four required fields. Unknown members are optional
+    extensions and deliberately ignored so additive metadata does not break a
+    v1 reader. This function does not validate the configured payload set;
+    callers that have one must do that before fetching named objects.
+    """
+    if not isinstance(doc, dict):
+        raise ValueError("pointer document must be a JSON object")
+
+    missing = [name for name in POINTER_REQUIRED_FIELDS if name not in doc]
+    if missing:
+        raise ValueError(f"pointer missing required field(s): {', '.join(missing)}")
+
+    schema_version = doc["schema_version"]
+    # bool is an int subclass in Python, but it is not a schema version.
+    if type(schema_version) is not int or schema_version not in SUPPORTED_POINTER_SCHEMA_VERSIONS:
+        raise ValueError(f"unsupported pointer schema_version: {schema_version!r}")
+
+    cycle_id = doc["cycle_id"]
+    generated_at = doc["generated_at"]
+    validate_cycle_id(cycle_id, generated_at)
+
+    objects = doc["objects"]
+    if not isinstance(objects, dict) or not objects:
+        raise ValueError("pointer objects must be a non-empty object")
+    for name, object_key in objects.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or "\\" in name
+            or name in (".", "..")
+        ):
+            raise ValueError("pointer object names must be simple names")
+        # The pointer stores keys relative to the configured prefix. An exact
+        # cycle/name match rejects absolute keys, ../ traversal, another
+        # prefix, and a cycle/name mismatch before any GET uses the value.
+        if not isinstance(object_key, str) or object_key != f"cycles/{cycle_id}/{name}":
+            raise ValueError(f"pointer object path is not immutable: {name}")
+    return doc
+
+
 def _read_pointer_state(s3, bucket: str, key: str) -> _PointerState:
     raw = s3io.download_bytes(s3, bucket, key)
     if raw is None:
         return _PointerState(present=False)
     try:
         doc = json.loads(raw)
-        if not isinstance(doc, dict) or doc.get("schema_version") != POINTER_SCHEMA_VERSION:
-            raise ValueError("unsupported pointer schema")
-        cycle_id = doc["cycle_id"]
-        generated_at = doc["generated_at"]
-        validate_cycle_id(cycle_id, generated_at)
-        objects = doc["objects"]
-        if not isinstance(objects, dict) or not objects:
-            raise ValueError("pointer objects must be a non-empty object")
-        for name, object_key in objects.items():
-            if (
-                not isinstance(name, str)
-                or not name
-                or "/" in name
-                or "\\" in name
-                or name in (".", "..")
-            ):
-                raise ValueError("pointer object names must be simple names")
-            # The pointer stores keys relative to the configured prefix. An
-            # exact cycle/name match rejects absolute keys, ../ traversal,
-            # another prefix, and a cycle/name mismatch before any GET uses
-            # the value.
-            if not isinstance(object_key, str) or object_key != f"cycles/{cycle_id}/{name}":
-                raise ValueError(f"pointer object path is not immutable: {name}")
+        validate_pointer_document(doc)
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, PublicationError) as e:
         return _PointerState(present=True, invalid_reason=str(e))
     return _PointerState(present=True, document=doc)
