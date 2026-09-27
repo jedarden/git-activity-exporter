@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: git-activity-exporter-sensor
+spec:
+  dependencies:
+    - name: git-activity-exporter-push
+      filters:
+        data:
+          - path: headers.X-Github-Event
+            type: string
+            value:
+              - push
+          - path: body.ref
+            type: string
+            value:
+              - refs/heads/main
+          - path: body.head_commit.author.name
+            type: string
+            comparator: '!='
+            value:
+              - Argo Workflows CI

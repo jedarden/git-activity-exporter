@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: git-activity-exporter-build
+spec:
+  entrypoint: build
+  templates:
+    - name: build
+      steps:
+        - - name: test
+            template: test
+        - - name: resolve-version
+            template: resolve-version
+        - - name: docker-build
+            template: docker-build
+            arguments:
+              parameters:
+                - name: version
+                  value: "{{steps.resolve-version.outputs.parameters.version}}"
+    - name: test
+      retryStrategy:
+        retryPolicy: OnError
+      script:
+        source: |
+          set -e
+          python -m pytest tests/ -q
+    - name: resolve-version
+      script:
+        source: |
+          set -e
+          git add VERSION
+          echo "$VERSION" > /tmp/version
+    - name: docker-build
+      inputs:
+        parameters:
+          - name: version
+      container:
+        args:
+          - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}
+          - --destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
+          - --build-arg=VERSION={{inputs.parameters.version}}
