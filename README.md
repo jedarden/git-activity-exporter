@@ -89,10 +89,12 @@ acceptable.
 See `docs/notes/configuration.md`. The exporter's
 [liveness and readiness contract](docs/notes/configuration.md#health-endpoints)
 defines the exact statuses, `/health` freshness snapshot, and publication
-transition rules for `/health` and `/ready`. Treat the committed defaults and
-`families.yaml` as the author's example deployment; set `FORGE_BASE_URL`,
-`FORGE_OWNER`, and your own family mapping in addition to the required
-`FORGE_TOKEN` and `DEST_S3_*` credentials.
+transition rules for `/health` and `/ready`. The
+[runtime-file contract](docs/notes/configuration.md#runtime-file-paths-and-packaging)
+defines path resolution and how the image packages `families.yaml` and
+`VERSION`. Treat the committed defaults and `families.yaml` as the author's
+example deployment; set `FORGE_BASE_URL`, `FORGE_OWNER`, and your own family
+mapping in addition to the required `FORGE_TOKEN` and `DEST_S3_*` credentials.
 
 The [deployment and release workflow](docs/notes/deployment.md) documents the
 Argo build, image versioning, runtime inputs, PVC, probes, GitOps handoff,

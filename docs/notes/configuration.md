@@ -20,8 +20,8 @@ everything else has a default.
 | `BEAD_BULK_CLOSE_THRESHOLD` | `150` | closures per `(repo, hour)` above which the cell is flagged |
 | `BEAD_BULK_HOUR_SHARE` | `0.5` | share of an hour's fleet-wide closures already flagged before the whole hour is treated as bulk |
 | `MAX_FAILURE_RATE` | `0.2` | fraction of repos that may fail before the cycle is withheld instead of published |
-| `FAMILIES_FILE` | `families.yaml` | repo → family map; a relative path resolves against the process working directory — [The families file](#the-families-file) |
-| `VERSION_FILE` | `VERSION` | stamped into `meta.json` |
+| `FAMILIES_FILE` | `families.yaml` | repo → family map; [path and packaging](#runtime-file-paths-and-packaging) |
+| `VERSION_FILE` | `VERSION` | version text stamped into `meta.json`; [path and packaging](#runtime-file-paths-and-packaging) |
 | `POLL_INTERVAL_SECONDS` | `3600` | sleep from one cycle attempt's end to the next cycle's start — [Poll-cycle lifecycle](#poll-cycle-lifecycle) |
 | `GIT_TIMEOUT_SECONDS` | `600` | per Git attempt — clone, fetch, `log`, `ls-tree`, `show`; remote clone/fetch attempts use the [bounded retry policy](data-sources.md#transient-failure-retries) |
 | `HTTP_TIMEOUT_SECONDS` | `30` | per Forgejo API attempt (repo enumeration only); 5xx/transport failures use the [bounded retry policy](data-sources.md#transient-failure-retries) |
@@ -34,6 +34,42 @@ everything else has a default.
 | `DEST_S3_REGION` | `us-east-1` | botocore region; most S3-compatible stores ignore it |
 | `DEST_S3_ADDRESSING_STYLE` | `virtual` | `path` wherever the store has no per-bucket virtual-host DNS — see [Destination credentials](#destination-credentials-dest_s3_) |
 | `DEST_S3_PREFIX` | `git-activity/data` | key prefix under the bucket; trailing slash stripped |
+
+## Runtime file paths and packaging
+
+`FAMILIES_FILE` and `VERSION_FILE` are ordinary file paths, not resource names.
+Absolute paths are used unchanged. Relative paths are opened relative to the
+exporter process's current working directory at startup; the application does
+not add an implicit source-tree or module directory.
+
+The container sets its working directory to `/app` and packages both defaults
+there:
+
+| Setting | Effective path in the image |
+|---|---|
+| `FAMILIES_FILE=families.yaml` | `/app/families.yaml` |
+| `VERSION_FILE=VERSION` | `/app/VERSION` |
+
+`Dockerfile` has an explicit `COPY` for each file, so a deployment using the
+defaults needs no ConfigMap or volume mount for them. A deployment that
+overrides `workingDir` must either keep it at `/app` or make both configured
+paths relative to its new working directory. For replacement files, an
+absolute `FAMILIES_FILE` or `VERSION_FILE` paired with a read-only file mount
+is the least ambiguous option.
+
+Both files are read once during process startup. Updating a baked-in file
+requires a new image; updating a mounted or ConfigMap-projected file requires
+a pod restart. The process does not notice either change in place.
+
+Startup has these failure contracts, which `tests/test_runtime_files.py`
+exercises through `main.main()`:
+
+| Input | Startup behavior |
+|---|---|
+| `families.yaml` is missing | Warn, use an empty mapping, and continue with every repo in `unassigned`. |
+| `families.yaml` exists but cannot be read, has malformed YAML, has an unusable structure, or assigns a repo to two families | Fail before the S3 client and health server are created. |
+| `VERSION` is missing, unreadable, empty after trimming, or not UTF-8 | Continue and stamp `unknown` into `meta.json`. |
+| `VERSION` is readable UTF-8 | Trim surrounding whitespace and stamp the remaining opaque text; no semantic-version syntax is imposed. |
 
 ## Commit bulk flag and rollup contract
 
@@ -363,11 +399,11 @@ families:
 
 One top-level `families` key; under it, family name → list of repo names.
 Any other top-level key is ignored. A family whose list is empty or null is
-legal and contributes nothing. The loader does not type-check beyond that —
-a family value must be a list of name strings (a bare scalar would be
-iterated character by character into nonsense mappings), and a family name
-repeated in the YAML itself is collapsed by the YAML parser, last one
-winning, before the loader sees it.
+legal and contributes nothing. The loader rejects a non-mapping top level, a
+non-mapping `families` value, a non-string family name, a non-list family
+value, or a non-string repository name. A family name repeated in the YAML
+itself is collapsed by the YAML parser, last one winning, before the loader
+sees it.
 
 **Matching is exact and case-sensitive.** Names are looked up as whole
 strings against the Forgejo repo name exactly as enumeration reports it —
@@ -393,6 +429,7 @@ The same asymmetry governs a failed load:
 | missing | warning logged, empty mapping, every repo reports `unassigned`; startup proceeds |
 | empty file, or `families:` absent/null | empty mapping with no warning; every repo reports `unassigned` |
 | present but unparseable YAML | process exits non-zero before the health server binds |
+| present but structurally invalid | process exits non-zero before the health server binds |
 | a repo under two families | process exits non-zero before the health server binds |
 
 An absent file is a legible degraded state — the whole fleet reports

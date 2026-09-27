@@ -36,8 +36,10 @@ The `git-activity-exporter-build` WorkflowTemplate runs these steps in order:
 The Dockerfile packages Python 3.12 slim, `git`, `curl`, the pinned Python
 requirements, `src/`, `VERSION`, and `families.yaml`. It runs as non-root
 `appuser` (UID/GID 1000), exposes port 8080, and starts
-`python -m src.main`. The image's Docker healthcheck calls `/health`; the
-Kubernetes Deployment defines the authoritative cluster probes described below.
+`python -m src.main`. The image keeps `/app` as its working directory, so the
+default relative paths resolve to `/app/VERSION` and `/app/families.yaml`.
+The image's Docker healthcheck calls `/health`; the Kubernetes Deployment
+defines the authoritative cluster probes described below.
 
 The workflow passes the resolved version as a Kaniko build argument, but the
 image's embedded version comes from the `VERSION` file copied from the build
@@ -148,9 +150,12 @@ DEST_S3_ADDRESSING_STYLE=path
 
 `path` addressing is required for the reference Garage endpoint. Values not
 listed in the ConfigMap use the application defaults documented in
-[`configuration.md`](configuration.md). `FAMILIES_FILE` is not mounted by the
-Deployment, so the packaged `families.yaml` is used unless the workload is
-changed to provide another file.
+[`configuration.md`](configuration.md). The reference Deployment does not
+override `workingDir` or mount either runtime file, so the packaged
+`/app/families.yaml` and `/app/VERSION` are used. A workload that changes
+`workingDir` must set absolute `FAMILIES_FILE` and `VERSION_FILE` paths or
+provide both files at the new working directory; a mounted replacement should
+be read-only and the process must be restarted to load it.
 
 Neither credential Secret is populated in Git. The Forgejo token is mirrored
 by External Secrets from OpenBao path

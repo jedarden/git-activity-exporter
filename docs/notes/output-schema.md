@@ -527,7 +527,7 @@ change type, or lose one of the relations in the table without failing CI.
 
 | Field | Type | Null when | Notes |
 |---|---|---|---|
-| `version` | string | never | The exporter's own version (`VERSION_FILE`), `"unknown"` if unreadable. Identifies the writer, not the document format. |
+| `version` | string | never | The exporter's own version (`VERSION_FILE`), `"unknown"` if missing, unreadable, empty, or not UTF-8. Identifies the writer, not the document format. |
 | `cycle_id` | string | never | Exact `generated_at` compacted (`2026-09-06T05:00:00Z` → `20260906T050000Z`) plus eight lowercase hexadecimal characters from UUID4. It is identical to `current.json`'s `cycle_id`; the timestamp portion orders retention, with the suffix only breaking same-second ties. |
 | `generated_at` | string | never | RFC 3339 UTC with an explicit `Z`. When collection *began* — it can trail the pointer's landing by up to `cycle_seconds`. |
 | `window_days` | int | never | The window every Parquet file of the same cycle was cut to. |

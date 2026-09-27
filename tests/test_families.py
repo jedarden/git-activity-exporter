@@ -32,6 +32,22 @@ def test_malformed_family_file_is_an_error(tmp_path):
         families.load(str(path))
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "families: []\n",
+        "families:\n  platform: repo\n",
+        "families:\n  platform:\n    - [repo]\n",
+    ],
+)
+def test_structurally_invalid_family_file_is_an_error(tmp_path, contents):
+    path = tmp_path / "families.yaml"
+    path.write_text(contents)
+
+    with pytest.raises(ValueError, match="families|repo names"):
+        families.load(str(path))
+
+
 def test_shipped_families_file_is_valid():
     mapping = families.load("families.yaml")
     assert mapping["commitgraph"] == mapping["commitgraph-deprecated"] == "commitgraph"

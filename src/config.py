@@ -100,10 +100,11 @@ class Config:
 
 def _read_version(version_file):
     try:
-        with open(version_file) as f:
-            return f.read().strip()
-    except OSError:
+        with open(version_file, encoding="utf-8") as f:
+            version = f.read().strip()
+    except (OSError, UnicodeError):
         return "unknown"
+    return version or "unknown"
 
 
 def load() -> Config:
