@@ -33,17 +33,23 @@ commit:
    they are written once, before the commit, and never rewritten. An upload
    failure here aborts with the previous cycle still live; the orphaned
    prefix is swept by a later cycle's prune.
-3. **Mirror.** The staged payloads are copied to the fixed keys at the
-   prefix root — `hourly.parquet`, `commits.parquet`, `bead_events.parquet`,
-   then `meta.json` **last** — for consumers that predate the pointer. A
-   mirror failure rolls the fixed keys back to their previous state before
-   the cycle fails, so a failed publication never leaves a half-mirrored
-   set behind.
+3. **Recover and mirror.** Before staging a new cycle, the exporter resolves
+   `current.json` and fetches every immutable object it names. If the fixed
+   keys do not exactly match that complete cycle, it repairs them from the
+   fetched snapshot. It then copies the new staged payloads to the fixed keys
+   at the prefix root — `hourly.parquet`, `commits.parquet`,
+   `bead_events.parquet`, then `meta.json` **last** — for consumers that
+   predate the pointer. A process death can leave a partial mirror, but the
+   next cycle repeats recovery from the pointer rather than trusting those
+   keys.
 4. **Commit.** One atomic PUT of `current.json`:
    `{"schema_version", "cycle_id", "generated_at", "objects": {name → key}}`,
    where keys are relative to the prefix. This PUT is the only instant at
-   which the published dataset changes. A failure rolls the mirror back too
-   and the cycle fails with the previous cycle still committed.
+   which the pointer-resolved dataset changes. If its response is ambiguous,
+   the exporter reads the pointer: the exact pointer present in S3 wins. If
+   the new pointer is absent, recovery restores the fixed keys from the old
+   pointer; if the pod dies before resolution, restart performs the same
+   check.
 5. **Prune.** The committed cycle and the newest two others are kept
    (three cycles ≈ three poll intervals of grace for a reader that resolved
    the previous pointer); older prefixes are deleted, best-effort. "Newest"
@@ -68,10 +74,31 @@ eventually delete the cycle they name.
 
 The fixed keys remain for consumers that have not moved to the pointer
 (the static panel reads `hourly.parquet` + `meta.json` directly). They
-carry the pre-protocol guarantee plus the rollback rule; a reader landing
-between the mirror's PUTs can still interleave, exactly as it always
-could. `meta.json`'s `cycle_id` vs `current.json`'s tells such a reader it
-crossed a publication boundary. The pointer is the migration target.
+carry the pre-protocol ordering and are reconciled from the pointer after a
+restart; a reader landing between the mirror's PUTs can still interleave,
+exactly as it always could. `meta.json`'s `cycle_id` vs `current.json`'s
+tells such a reader it crossed a publication boundary. The pointer is the
+migration target.
+
+### Crash recovery
+
+Pod termination is treated as a loss of the client response, not as evidence
+that the S3 operation did not happen. S3 is queried after restart, and the
+durable pointer—not the fixed-key mirror and not pod memory—decides what is
+authoritative.
+
+| Interruption or ambiguous PUT | State left in S3 | Recovery rule |
+|---|---|---|
+| Staging `cycles/<cycle_id>/...` | The previous pointer remains authoritative; the new prefix may be partial or complete | Staged objects are write-once. Never retry by overwriting an existing object or reuse that cycle ID. The orphan prefix is inert and later pruning can delete it. |
+| Fixed-key mirror | The previous pointer remains authoritative; root fixed keys may be mixed | Before the next cycle, fetch every object named by the pointer and repair all fixed keys from that immutable set, with `meta.json` last. A restart never uses the mixed fixed keys as its source. |
+| Pointer commit | Either the old pointer or the new pointer may be present | If the PUT response is uncertain, read `current.json`. The exact pointer found there wins. On restart, fixed keys are reconciled from that pointer before another cycle is staged. |
+
+The recovery read happens before the next expensive repository scan and is
+idempotent. A failure while repairing fixed keys leaves the pointer-first read
+path safe; the next poll retries the same reconciliation. Thus a killed pod
+cannot make a pointer-resolved reader assemble objects from two cycles, and a
+complete orphaned stage cannot be mistaken for a commit merely because its
+PUTs reached S3.
 
 ## Single-writer deployment rule
 

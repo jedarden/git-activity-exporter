@@ -21,9 +21,11 @@ on a PVC, and publishes each cycle to an S3 prefix behind an atomic pointer:
 The same four data objects are mirrored to the prefix root (fixed keys,
 `meta.json` last) for consumers that have not moved to the pointer.
 Pointer-resolved reads are atomic — one whole cycle, never a mix of two —
-while a failed publication leaves the previous complete dataset live
-everywhere. The exporter implementation and its publication failure-path
-tests cover this protocol. Consumers should resolve `current.json` first;
+while a failed publication leaves the previous complete dataset authoritative.
+On restart, fixed keys are reconciled from the cycle named by `current.json`
+before the next cycle is staged, so an interrupted mirror is recoverable. The
+exporter implementation and its publication failure-path tests cover this
+protocol. Consumers should resolve `current.json` first;
 legacy fixed-key reads can cross a write boundary and must compare their
 `meta.json` `cycle_id` with the pointer. The protocol and its failure
 semantics are specified in

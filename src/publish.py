@@ -13,25 +13,30 @@ The protocol turns the single-object primitive into a whole-cycle commit:
   1. Generate every payload before any S3 write (done by the caller). A
      generation failure raises with nothing uploaded anywhere.
   2. Stage the payloads under ``cycles/<cycle_id>/`` -- a prefix no consumer
-     reads until it is pointed at. An upload failure here aborts with the
-     previous cycle still live everywhere; the orphaned prefix is inert and
-     swept by a later cycle's prune.
-  3. Snapshot the fixed keys in memory -- they are about to be overwritten,
-     and a later step may have to put them back.
+     reads until it is pointed at. Staged PUTs are write-once: an ambiguous
+     response is resolved with a GET and accepted only for an exact match;
+     an existing cycle prefix is never overwritten. An upload failure here
+     aborts with the previous cycle still live everywhere; the orphaned
+     prefix is inert and swept by a later cycle's prune.
+  3. Recover before mirroring. On every cycle boundary, read
+     ``current.json`` and fetch all immutable objects it names. If the fixed
+     keys do not exactly match that complete cycle, rebuild them from this
+     snapshot, with meta.json last. This is the durable rollback source: it
+     survives pod termination, unlike an in-memory snapshot.
   4. Mirror the staged payloads to the fixed keys, meta.json always last,
      for consumers that have not moved to the pointer (the static panel
-     reads hourly.parquet and meta.json directly). A failure here rolls the
-     fixed keys back to the step-3 snapshot and re-raises, so a failed
-     cycle never leaves a half-mirrored set behind.
+     reads hourly.parquet and meta.json directly). A process death can leave
+     these legacy keys mixed temporarily; the next cycle repairs them from
+     the pointer before staging anything else. Pointer-resolved readers are
+     unaffected because they never read these keys.
   5. Commit: PUT ``current.json`` naming the cycle and its object keys.
-     This one PUT is the only instant at which the published dataset
-     changes. The objects it names were completed in step 2 and are never
-     rewritten -- a cycle's payload is immutable once staged -- so a
-     consumer that reads the pointer and then the objects it names always
-     assembles exactly one whole cycle, whichever cycle that was. A pointer
-     failure rolls the fixed keys back too (undoing step 4's mirror) and
-     re-raises: after a failed cycle, the pointer and the fixed keys must
-     not name different cycles.
+     This one PUT is the only instant at which the pointer-resolved dataset
+     changes. If its response is ambiguous, a GET determines whether the
+     new pointer committed; if it did not, recovery restores fixed keys from
+     the previous pointer. If the pod dies before that GET, restart follows
+     whichever pointer S3 durably contains. The staged objects it names were
+     completed in step 2 and are never rewritten, so a pointer-first reader
+     always assembles exactly one whole cycle.
   6. Prune: keep the committed cycle plus the newest RETAINED_CYCLES-1
      cycle prefixes, delete the rest. Discovery and deletion failures are
      logged with the committed and failed cycle IDs, recorded in process-local
@@ -76,6 +81,16 @@ POINTER_SCHEMA_VERSION = 1
 RETAINED_CYCLES = 3
 
 META_NAME = "meta.json"
+
+# The production payload set is stable and is also needed to clean a partial
+# first publication when no pointer exists yet. Direct callers may supply a
+# different set; recovery takes the union with the pointer's names.
+DEFAULT_FIXED_NAMES = (
+    "hourly.parquet",
+    "commits.parquet",
+    "bead_events.parquet",
+    META_NAME,
+)
 
 
 class PublicationError(RuntimeError):
@@ -210,20 +225,115 @@ def pointer_bytes(cycle_id: str, generated_at: str, payload_names) -> bytes:
     return json.dumps(doc, indent=2).encode()
 
 
+def _read_pointer(s3, bucket: str, key: str):
+    raw = s3io.download_bytes(s3, bucket, key)
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw)
+        if not isinstance(doc, dict) or doc.get("schema_version") != POINTER_SCHEMA_VERSION:
+            raise ValueError("unsupported pointer schema")
+        cycle_id = doc["cycle_id"]
+        generated_at = doc["generated_at"]
+        validate_cycle_id(cycle_id, generated_at)
+        objects = doc["objects"]
+        if not isinstance(objects, dict) or not objects:
+            raise ValueError("pointer objects must be a non-empty object")
+        for name, object_key in objects.items():
+            if not isinstance(name, str) or not name or "/" in name:
+                raise ValueError("pointer object names must be simple names")
+            if object_key != f"cycles/{cycle_id}/{name}":
+                raise ValueError(f"pointer object path is not immutable: {name}")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+        raise PublicationError(f"invalid publication pointer {key}") from e
+    return doc
+
+
+def _ordered_names(names):
+    names = list(dict.fromkeys(names))
+    if META_NAME in names:
+        names.remove(META_NAME)
+        names.append(META_NAME)
+    return names
+
+
+def recover_publication(s3, bucket: str, prefix: str, expected_names=None):
+    """Reconcile fixed keys to the cycle named by the durable pointer.
+
+    A pod can die after any fixed-key PUT, so fixed keys are not recovery
+    input. On restart, fetch every immutable object named by ``current.json``
+    first and repair the root mirror from that complete snapshot. If no
+    pointer exists, the fixed names are removed because there is no committed
+    dataset that could make them authoritative.
+
+    The function is idempotent and writes nothing when the fixed keys already
+    match the authoritative cycle.
+    """
+    pointer_key = f"{prefix}/{POINTER_NAME}"
+    pointer = _read_pointer(s3, bucket, pointer_key)
+    expected_names = tuple(expected_names or ())
+    names = list(pointer["objects"] if pointer else ())
+    names.extend(name for name in expected_names if name not in names)
+    names = _ordered_names(names)
+    if not names:
+        return pointer["cycle_id"] if pointer else None
+
+    desired = {name: None for name in names}
+    if pointer:
+        for name, object_key in pointer["objects"].items():
+            desired[name] = s3io.fetch_object(s3, bucket, f"{prefix}/{object_key}")
+            if desired[name] is None:
+                raise PublicationError(
+                    f"pointer {pointer['cycle_id']} names missing object {object_key}"
+                )
+
+    current = {
+        name: s3io.fetch_object(s3, bucket, f"{prefix}/{name}")
+        for name in names
+    }
+    if current == desired:
+        return pointer["cycle_id"] if pointer else None
+
+    # Copy data first and the legacy meta marker last. A process death during
+    # this repair is safe because the next restart repeats it from the
+    # pointer, never from partially repaired fixed keys.
+    for name in _ordered_names(name for name in names if desired[name] is not None):
+        data, content_type = desired[name]
+        s3io.upload_bytes(
+            s3, bucket, f"{prefix}/{name}", data,
+            content_type or "application/octet-stream",
+        )
+    for name in _ordered_names(name for name in names if desired[name] is None):
+        if current[name] is not None:
+            s3io.delete_key(s3, bucket, f"{prefix}/{name}")
+    log.info(
+        "reconciled fixed publication keys to cycle %s",
+        pointer["cycle_id"] if pointer else "none",
+    )
+    return pointer["cycle_id"] if pointer else None
+
+
 def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
                   generated_at: str, retention: int = RETAINED_CYCLES) -> str:
     """Publish one cycle. Returns the pointer key.
 
     ``payloads`` is [(name, bytes, content_type), ...]; the names become
-    both the staged object names and the fixed-key names. On any failure the
-    exception chains the underlying cause, and the guarantee holds: the
-    previously committed cycle is still what the pointer names, and the
-    fixed keys hold it too.
+    both the staged object names and the fixed-key names. On a handled
+    failure the exception chains the underlying cause and recovery restores
+    the fixed keys from the pointer. If the pod terminates between S3 calls,
+    the next cycle performs the same recovery before publishing.
     """
     names = [name for name, _, _ in payloads]
     if len(set(names)) != len(names):
         raise PublicationError(f"duplicate payload names: {names}")
     validate_cycle_id(cycle_id, generated_at)
+
+    try:
+        recover_publication(s3, bucket, prefix, expected_names=names)
+    except Exception as e:
+        raise PublicationError(
+            f"publication recovery failed before staging {cycle_id}"
+        ) from e
 
     pointer_key = f"{prefix}/{POINTER_NAME}"
     base = f"{prefix}/cycles/{cycle_id}/"
@@ -241,33 +351,40 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
     # failure here needs no rollback anywhere.
     try:
         for name, data, content_type in payloads:
-            s3io.upload_bytes(s3, bucket, f"{base}{name}", data, content_type)
+            s3io.upload_immutable_bytes(
+                s3, bucket, f"{base}{name}", data, content_type
+            )
     except Exception as e:
         raise PublicationError(f"staging {base} failed; previous cycle untouched") from e
-
-    # Step 3: snapshot the fixed keys we are about to overwrite.
-    snapshot = {name: s3io.fetch_object(s3, bucket, f"{prefix}/{name}") for name in names}
 
     # Step 4: mirror to the fixed keys, meta.json last.
     try:
         for name, data, content_type in _meta_last(payloads):
             s3io.upload_bytes(s3, bucket, f"{prefix}/{name}", data, content_type)
     except Exception as e:
-        _restore_fixed(s3, bucket, prefix, snapshot)
+        _recover_after_failure(s3, bucket, prefix, "fixed-key mirror")
         raise PublicationError(
             "fixed-key mirror failed; fixed keys restored to the previous cycle"
         ) from e
 
     # Step 5: the commit. One atomic PUT.
+    committed_pointer = pointer_bytes(cycle_id, generated_at, names)
     try:
         s3io.upload_bytes(
             s3, bucket, pointer_key,
-            pointer_bytes(cycle_id, generated_at, names), "application/json",
+            committed_pointer, "application/json",
         )
     except Exception as e:
-        # The mirror already put the new cycle on the fixed keys; putting it
-        # back to the snapshot is what keeps both views on one cycle.
-        _restore_fixed(s3, bucket, prefix, snapshot)
+        # A PUT can have committed before its response was lost. Resolve the
+        # outcome from S3 before deciding that the previous pointer won.
+        try:
+            if s3io.download_bytes(s3, bucket, pointer_key) == committed_pointer:
+                report = _prune(s3, bucket, prefix, keep=cycle_id, retention=retention)
+                _record_prune_health(cycle_id, report)
+                return pointer_key
+        except Exception:
+            log.exception("could not resolve ambiguous pointer PUT for %s", cycle_id)
+        _recover_after_failure(s3, bucket, prefix, "pointer commit")
         raise PublicationError(
             "pointer write failed; fixed keys restored to the previous cycle"
         ) from e
@@ -277,24 +394,15 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
     return pointer_key
 
 
-def _restore_fixed(s3, bucket: str, prefix: str, snapshot: dict):
-    """Best-effort rollback of the fixed keys to their snapshotted state.
-
-    A key that had no object before gets deleted again. A rollback failure
-    is logged and leaves the next publish (or an operator) to clean up --
-    losing the original failure by raising from here would misreport why
-    the cycle failed.
-    """
-    for name, snap in snapshot.items():
-        key = f"{prefix}/{name}"
-        try:
-            if snap is None:
-                s3io.delete_key(s3, bucket, key)
-            else:
-                data, content_type = snap
-                s3io.upload_bytes(s3, bucket, key, data, content_type or "application/octet-stream")
-        except Exception:
-            log.exception("rollback of %s failed; the fixed keys may hold the aborted cycle", key)
+def _recover_after_failure(s3, bucket, prefix: str, phase: str):
+    """Restore from the pointer without masking the phase's original error."""
+    try:
+        recover_publication(s3, bucket, prefix, expected_names=DEFAULT_FIXED_NAMES)
+    except Exception:
+        log.exception(
+            "recovery after %s failed; fixed keys may remain mixed until restart",
+            phase,
+        )
 
 
 def _prune(s3, bucket: str, prefix: str, keep: str, retention: int):

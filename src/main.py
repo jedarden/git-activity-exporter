@@ -243,6 +243,17 @@ def build_meta(cfg, stats, generated_at: str, cycle_seconds: float, events, hour
 
 
 def _run_cycle(cfg, s3, family_map):
+    # A pod may have died after a fixed-key PUT but before the pointer commit.
+    # Reconcile from the durable pointer before doing another expensive scan;
+    # fixed keys are never trusted as recovery input.
+    try:
+        publish.recover_publication(
+            s3, cfg.dest.bucket, cfg.dest_prefix,
+            expected_names=publish.DEFAULT_FIXED_NAMES,
+        )
+    except Exception as e:
+        raise publish.PublicationError("publication recovery failed at cycle start") from e
+
     started = time.monotonic()
     generated_at = _now()
     reporting_window = _reporting_window(generated_at, cfg.window_days)

@@ -24,9 +24,14 @@ class FakeS3:
         self.objects = {}
         self.puts = []
         self._fault = None
+        self._after_put_fault = None
 
     def fail_when(self, fault):
         self._fault = fault
+
+    def fail_after_put_when(self, fault):
+        """Inject a response failure after a PUT has changed S3 state."""
+        self._after_put_fault = fault
 
     def _gate(self, op, key):
         if self._fault:
@@ -38,6 +43,10 @@ class FakeS3:
         self._gate("put", Key)
         self.objects[Key] = (bytes(Body), ContentType)
         self.puts.append(Key)
+        if self._after_put_fault:
+            error = self._after_put_fault("put", Key)
+            if error is not None:
+                raise error
 
     def get_object(self, Bucket, Key):
         self._gate("get", Key)

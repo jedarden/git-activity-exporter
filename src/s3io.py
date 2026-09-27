@@ -27,6 +27,10 @@ _TRANSIENT_ERROR_CODES = {
 }
 
 
+class ImmutableObjectError(RuntimeError):
+    """An immutable S3 object exists with bytes or metadata that differ."""
+
+
 def _is_transient(error: Exception) -> bool:
     if isinstance(error, ClientError):
         response = error.response or {}
@@ -82,9 +86,8 @@ def download_bytes(s3, bucket: str, key: str):
 def fetch_object(s3, bucket: str, key: str):
     """(body, content_type), or None if the object doesn't exist.
 
-    The publish protocol snapshots the fixed keys before overwriting them,
-    and putting a snapshot back must reproduce the content type too, not
-    just the bytes.
+    Publication recovery compares both bytes and content type so a repaired
+    fixed key has the same object metadata as its immutable source.
     """
     try:
         def get():
@@ -160,3 +163,48 @@ def upload_bytes(s3, bucket: str, key: str, data: bytes, content_type: str):
         f"S3 PUT s3://{bucket}/{key}",
     )
     log.info("uploaded %d bytes to s3://%s/%s", len(data), bucket, key)
+
+
+def upload_immutable_bytes(s3, bucket: str, key: str, data: bytes, content_type: str):
+    """Create an object without ever overwriting a different existing value.
+
+    A PUT can succeed at S3 and still lose its response to the caller. A
+    normal retry would then overwrite the staged object, which is harmless for
+    fixed keys but violates the cycle immutability guarantee. Check before the
+    PUT and, after an exception, accept the operation only when a GET finds
+    the exact requested bytes and content type. A retry is safe only when the
+    object is still absent.
+    """
+    data = bytes(data)
+
+    def operation():
+        existing = fetch_object(s3, bucket, key)
+        if existing is not None:
+            _assert_immutable_match(key, existing, data, content_type)
+            return
+
+        try:
+            s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+        except Exception as error:
+            # Resolve an ambiguous outcome before retrying. S3 is strongly
+            # read-after-write consistent, so an exact object means the PUT
+            # landed even if its response did not.
+            observed = fetch_object(s3, bucket, key)
+            if observed is not None:
+                try:
+                    _assert_immutable_match(key, observed, data, content_type)
+                except ImmutableObjectError as mismatch:
+                    raise mismatch from error
+                return
+            raise
+
+    _call(operation, f"S3 immutable PUT s3://{bucket}/{key}")
+    log.info("uploaded immutable %d bytes to s3://%s/%s", len(data), bucket, key)
+
+
+def _assert_immutable_match(key: str, observed, data: bytes, content_type: str):
+    observed_data, observed_content_type = observed
+    if observed_data != data or observed_content_type != content_type:
+        raise ImmutableObjectError(
+            f"immutable object s3://{key} already contains different data"
+        )

@@ -66,6 +66,10 @@ def transient_s3_error(code="InternalError", status=500):
     )
 
 
+def put_key(prefix, name):
+    return f"{PREFIX}/{prefix}/{name}"
+
+
 def read_via_pointer(s3):
     """The consumer read path: pointer first, then every object it names."""
     raw = s3io.download_bytes(s3, BUCKET, f"{PREFIX}/current.json")
@@ -272,6 +276,159 @@ def test_transient_staging_put_retries_then_publishes(monkeypatch):
     assert attempts["count"] == 3
     assert sleeps == [1, 2]
     assert_pointer_view_is("B", s3)
+
+
+def test_ambiguous_staged_put_is_verified_without_overwrite():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    attempts = {"n": 0}
+
+    def lose_staged_response(op, key):
+        if op == "put" and key == put_key(f"cycles/{cycle_id('B')}", "hourly.parquet"):
+            attempts["n"] += 1
+            return transient_s3_error()
+        return None
+
+    s3.fail_after_put_when(lose_staged_response)
+    do_publish(s3, "B")
+
+    assert attempts["n"] == 1
+    assert s3.puts.count(put_key(f"cycles/{cycle_id('B')}", "hourly.parquet")) == 1
+    assert_pointer_view_is("B", s3)
+
+
+def test_ambiguous_fixed_key_put_retries_same_mutable_value():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    attempts = {"n": 0}
+
+    def lose_mirror_response(op, key):
+        if op == "put" and key == f"{PREFIX}/hourly.parquet":
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return transient_s3_error()
+        return None
+
+    s3.fail_after_put_when(lose_mirror_response)
+    do_publish(s3, "B")
+
+    assert attempts["n"] == 2
+    assert_pointer_view_is("B", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("B")}
+
+
+def test_ambiguous_pointer_put_retries_same_commit():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    attempts = {"n": 0}
+
+    def lose_pointer_response(op, key):
+        if op == "put" and key == f"{PREFIX}/current.json":
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return transient_s3_error()
+        return None
+
+    s3.fail_after_put_when(lose_pointer_response)
+    do_publish(s3, "B")
+
+    assert attempts["n"] == 2
+    assert_pointer_view_is("B", s3)
+
+
+def test_restart_after_staging_termination_keeps_previous_pointer_and_orphan_recoverable():
+    s3 = FakeS3()
+
+    do_publish(s3, "A")
+    s3.fail_after_put_when(
+        lambda op, key: KeyboardInterrupt()
+        if op == "put"
+        and key == put_key(f"cycles/{cycle_id('B')}", "hourly.parquet")
+        else None
+    )
+    with pytest.raises(KeyboardInterrupt):
+        do_publish(s3, "B")
+
+    s3.fail_after_put_when(None)
+    assert_pointer_view_is("A", s3)
+    staged_key = put_key(f"cycles/{cycle_id('B')}", "hourly.parquet")
+    assert s3.objects[staged_key][0] == b"hourly-B"
+
+    do_publish(s3, "C")
+    assert_pointer_view_is("C", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("C")}
+    assert s3.objects[staged_key][0] == b"hourly-B", \
+        "the orphaned immutable stage must not be overwritten during restart"
+
+    # Later cycles can prune the incomplete orphan; it never blocks recovery
+    # and it is never treated as a committed cycle.
+    do_publish(s3, "D")
+    do_publish(s3, "E")
+    assert s3io.list_keys(
+        s3, BUCKET, f"{PREFIX}/cycles/{cycle_id('B')}/"
+    ) == []
+
+
+def test_restart_after_fixed_mirror_termination_repairs_from_previous_pointer():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    s3.fail_after_put_when(
+        lambda op, key: KeyboardInterrupt()
+        if op == "put" and key == f"{PREFIX}/hourly.parquet" else None
+    )
+    with pytest.raises(KeyboardInterrupt):
+        do_publish(s3, "B")
+
+    assert_pointer_view_is("A", s3)
+    assert fixed_keys(s3)["hourly.parquet"] == b"hourly-B"
+    s3.fail_after_put_when(None)
+
+    # This is the restarted pod's first cycle. Recovery happens before it
+    # stages C, so a legacy fixed-key reader is repaired from A, not from the
+    # partially mirrored B keys.
+    do_publish(s3, "C")
+    assert_pointer_view_is("C", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("C")}
+
+
+def test_restart_after_pointer_termination_keeps_previous_pointer_authoritative():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    s3.fail_when(
+        lambda op, key: KeyboardInterrupt()
+        if op == "put" and key == f"{PREFIX}/current.json" else None
+    )
+    with pytest.raises(KeyboardInterrupt):
+        do_publish(s3, "B")
+
+    assert_pointer_view_is("A", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("B")}
+    s3.fail_when(None)
+
+    do_publish(s3, "C")
+    assert_pointer_view_is("C", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("C")}
+
+
+def test_restart_after_ambiguous_pointer_commit_repairs_to_committed_pointer():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    s3.fail_after_put_when(
+        lambda op, key: KeyboardInterrupt()
+        if op == "put" and key == f"{PREFIX}/current.json" else None
+    )
+    with pytest.raises(KeyboardInterrupt):
+        do_publish(s3, "B")
+
+    # The response was lost after S3 committed. B, not the old A pointer, is
+    # authoritative; restart reconciles fixed keys from B before continuing.
+    assert_pointer_view_is("B", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("B")}
+    s3.fail_after_put_when(None)
+
+    do_publish(s3, "C")
+    assert_pointer_view_is("C", s3)
+    assert fixed_keys(s3) == {name: data for name, data, _ in payloads("C")}
 
 
 def test_exhausted_transient_pointer_put_rolls_fixed_keys_back(monkeypatch):
