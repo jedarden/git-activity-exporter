@@ -9,6 +9,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE = ROOT / "examples" / "self-hosting"
+VERSION = (ROOT / "VERSION").read_text().strip()
 
 
 def _load_families_in_new_process(path):
@@ -47,7 +48,7 @@ def test_self_hosting_profile_is_opt_in_and_non_author_specific():
     compose = yaml.safe_load((PROFILE / "compose.yaml").read_text())
     services = compose["services"]
     assert services["exporter"]["profiles"] == ["self-hosting"]
-    assert services["exporter"]["image"].endswith(":0.1.29}")
+    assert services["exporter"]["image"].endswith(f":{VERSION}" + "}")
     assert ":latest" not in services["exporter"]["image"]
     assert services["exporter"]["environment"] == {
         "FORGE_BASE_URL": "http://forgejo-fixture:8081",
@@ -80,6 +81,7 @@ def test_self_hosting_kubernetes_profile_has_pinned_single_writer_and_pvc():
         "configmap.reloader.stakater.com/reload": "git-activity-exporter-families",
     }
     container = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"].endswith(f":{VERSION}")
     assert re.fullmatch(r"[^:]+:[0-9]+\.[0-9]+\.[0-9]+", container["image"])
     assert ":latest" not in container["image"]
 

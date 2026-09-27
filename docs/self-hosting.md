@@ -28,7 +28,7 @@ Decide these values before editing the workload:
 | Forgejo owner | `analytics` | `FORGE_OWNER` |
 | S3 bucket | `analytics-git-activity` | `DEST_S3_BUCKET` |
 | S3 prefix | `exports/git-activity` | `DEST_S3_PREFIX` |
-| Image | `registry.example/analytics/git-activity-exporter:0.1.31` | Deployment `image` |
+| Image | `registry.example/analytics/git-activity-exporter:0.1.34` | Deployment `image` |
 | Mirror volume | a writable 20 GiB or larger RWO PVC | `CLONE_ROOT` and the volume mount |
 
 Use a bucket/prefix dedicated to this exporter. Only one exporter replica may
@@ -157,6 +157,16 @@ IMAGE=registry.example/analytics/git-activity-exporter:${VERSION}
 docker build --tag "$IMAGE" .
 docker push "$IMAGE"
 ```
+
+The committed Compose fixture, Kubernetes example, and release references in
+this guide are checked against `VERSION`. Run the check after changing the
+version, or use its write mode to update those references together:
+
+```bash
+python scripts/check-release-drift.py --write
+```
+
+The check also rejects explicit `:latest` image tags.
 
 The Dockerfile contains `git`, the Python dependencies, the exporter, and the
 default `VERSION`/`families.yaml`. The deployment-specific family file and

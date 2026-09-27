@@ -99,7 +99,7 @@ done
 [[ "$REVISION" =~ ^[0-9a-fA-F]{7,64}$ ]] ||
     fail "--revision must be a commit SHA (7-64 hexadecimal characters)"
 [[ "$EXPECTED_IMAGE" =~ ^[^[:space:]@]+:[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-    fail "--image must end in an immutable semver tag such as :0.1.31"
+    fail "--image must end in an immutable semver tag such as :1.2.3"
 [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || fail "--timeout must be a positive integer"
 [[ "$LOCAL_PORT" =~ ^[1-9][0-9]*$ ]] || fail "--local-port must be a positive integer"
 

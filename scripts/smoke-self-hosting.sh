@@ -9,6 +9,8 @@ PROJECT=${COMPOSE_PROJECT_NAME:-git-activity-exporter-self-hosting-$$}
 SMOKE_TMP=$(mktemp -d)
 FIXTURE_ROOT="$SMOKE_TMP/fixture"
 
+python "$ROOT/scripts/check-release-drift.py"
+
 cleanup() {
     EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
         docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
