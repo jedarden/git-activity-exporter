@@ -147,6 +147,120 @@ def test_pointer_document_shape():
         assert not key.startswith(PREFIX), "keys are relative to the prefix, not absolute"
 
 
+def test_absent_pointer_bootstraps_without_pruning_existing_cycles():
+    s3 = FakeS3()
+    orphan = f"{PREFIX}/cycles/{cycle_id('A')}/diagnostic.txt"
+    s3.objects[orphan] = (b"keep until a valid pointer exists", "text/plain")
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert s3.objects[orphan][0] == b"keep until a valid pointer exists"
+
+
+@pytest.mark.parametrize(
+    "pointer_document",
+    [
+        b"not-json",
+        json.dumps({"schema_version": publish.POINTER_SCHEMA_VERSION + 1}).encode(),
+    ],
+    ids=("malformed", "unsupported-schema"),
+)
+def test_unusable_pointer_bootstraps_and_skips_destructive_pruning(pointer_document):
+    s3 = FakeS3()
+    pointer_key = f"{PREFIX}/current.json"
+    s3.objects[pointer_key] = (pointer_document, "application/json")
+    preserved = f"{PREFIX}/cycles/{cycle_id('A')}/operator-note"
+    s3.objects[preserved] = (b"preserve", "text/plain")
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert s3.objects[preserved][0] == b"preserve"
+
+
+def test_pointer_outside_configured_prefix_is_never_fetched_or_pruned():
+    s3 = FakeS3()
+    pointer = json.loads(publish.pointer_bytes(
+        cycle_id("A"), identity("A")[0], [name for name, _, _ in payloads("A")]
+    ))
+    pointer["objects"]["hourly.parquet"] = "../outside/hourly.parquet"
+    s3.objects[f"{PREFIX}/current.json"] = (
+        json.dumps(pointer).encode(), "application/json"
+    )
+    outside = f"{PREFIX}/../outside/hourly.parquet"
+    s3.objects[outside] = (b"must not be read", "application/octet-stream")
+    preserved = f"{PREFIX}/cycles/{cycle_id('A')}/operator-note"
+    s3.objects[preserved] = (b"preserve", "text/plain")
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert s3.objects[outside][0] == b"must not be read"
+    assert s3.objects[preserved][0] == b"preserve"
+    assert ("get", outside) not in s3.calls
+
+
+def test_unusable_pointer_is_retained_until_a_complete_stage_exists():
+    s3 = FakeS3()
+    pointer_key = f"{PREFIX}/current.json"
+    invalid_pointer = b"{broken"
+    s3.objects[pointer_key] = (invalid_pointer, "application/json")
+    s3.fail_when(
+        lambda op, key: RuntimeError("stage boom")
+        if op == "put"
+        and key == put_key(f"cycles/{cycle_id('B')}", "meta.json")
+        else None
+    )
+
+    with pytest.raises(publish.PublicationError):
+        do_publish(s3, "B")
+
+    assert s3.objects[pointer_key][0] == invalid_pointer
+    assert s3io.list_keys(s3, BUCKET, f"{PREFIX}/cycles/{cycle_id('B')}/")
+
+
+def test_missing_pointer_object_is_not_used_as_rollback_source():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    del s3.objects[put_key(f"cycles/{cycle_id('A')}", "hourly.parquet")]
+    preserved = put_key(f"cycles/{cycle_id('A')}", "commits.parquet")
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert s3.objects[preserved][0] == b"commits-A"
+    assert s3io.list_keys(s3, BUCKET, f"{PREFIX}/cycles/{cycle_id('A')}/")
+
+
+def test_pointer_missing_configured_object_name_is_not_used_as_rollback_source():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    pointer_key = f"{PREFIX}/current.json"
+    pointer = json.loads(s3.objects[pointer_key][0])
+    del pointer["objects"]["bead_events.parquet"]
+    s3.objects[pointer_key] = (json.dumps(pointer).encode(), "application/json")
+    preserved = put_key(f"cycles/{cycle_id('A')}", "commits.parquet")
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert s3.objects[preserved][0] == b"commits-A"
+
+
+def test_pointer_meta_mismatch_is_not_used_as_rollback_source():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    meta_key = put_key(f"cycles/{cycle_id('A')}", "meta.json")
+    replacement_meta = next(data for name, data, _ in payloads("B") if name == "meta.json")
+    s3.objects[meta_key] = (replacement_meta, "application/json")
+
+    do_publish(s3, "B")
+
+    assert_pointer_view_is("B", s3)
+    assert s3.objects[meta_key][0] == replacement_meta
+
+
 def test_cycle_id_format_names_generated_at(monkeypatch):
     class FixedUUID:
         hex = "0123456789abcdef0123456789abcdef"

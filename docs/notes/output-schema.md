@@ -64,6 +64,45 @@ commit:
    warning's cycle IDs to investigate. The immutable cycle's `meta.json` does
    not repeat this post-commit status.
 
+### Bootstrap and invalid-pointer recovery
+
+`current.json` is the only durable commit marker. Recovery never infers a
+committed dataset from the fixed keys or from an orphaned `cycles/` prefix.
+The following rules apply before each collection and publication attempt:
+
+- **Absent on first publication:** an absent pointer is bootstrap state. The
+  exporter leaves existing fixed keys and cycle prefixes untouched, stages all
+  payloads under a new cycle ID, and mirrors the fixed keys only after every
+  staged upload has completed. It writes `current.json` last. Because there
+  was no authoritative pointer to retain or prune, retention cleanup is
+  skipped for that first commit; a later cycle with a valid pointer can prune
+  old prefixes normally.
+- **Malformed, unsupported, or out-of-prefix:** the pointer bytes are kept for
+  diagnosis, but no object key from the document is fetched. Pointer keys must
+  be relative to the configured prefix and exactly equal
+  `cycles/<cycle_id>/<object-name>`; absolute keys, `..` traversal, another
+  prefix, and a cycle/name mismatch are unusable. No existing fixed key or
+  cycle prefix is deleted during recovery, and retention cleanup is skipped.
+  A later complete staged cycle may replace the unusable pointer atomically.
+- **Missing or mismatched named objects:** a structurally valid pointer is
+  usable only when it names the configured object set, every named immutable
+  object exists, and `meta.json` repeats the pointer's `cycle_id` and
+  `generated_at`. A missing object, a missing object name, or metadata from a
+  different cycle makes the pointer unusable. The exporter does not use that
+  snapshot to repair fixed keys or prune; it preserves the pointer and old
+  cycle objects while bootstrapping a replacement.
+- **Incomplete replacement:** an unusable pointer is not replaced merely
+  because a new cycle started. If any staged upload fails, the old pointer
+  remains byte-for-byte unchanged and the new cycle is not published. Only a
+  complete staged set can be mirrored and followed by the one atomic pointer
+  PUT. A handled mirror or pointer failure restores the fixed keys to their
+  pre-bootstrap state when no valid pointer was available.
+
+When a valid pointer and every object it names are present, recovery retains
+the existing behavior: it fetches that immutable snapshot first, repairs the
+fixed keys with `meta.json` last, and permits best-effort retention pruning
+only after the replacement pointer commits.
+
 **Consumers should read pointer-first:** GET `current.json`, then the
 objects its `objects` mapping names, resolving keys against the prefix the
 pointer came from. Because a cycle's staged objects are immutable and the
@@ -92,6 +131,7 @@ authoritative.
 | Staging `cycles/<cycle_id>/...` | The previous pointer remains authoritative; the new prefix may be partial or complete | Staged objects are write-once. Never retry by overwriting an existing object or reuse that cycle ID. The orphan prefix is inert and later pruning can delete it. |
 | Fixed-key mirror | The previous pointer remains authoritative; root fixed keys may be mixed | Before the next cycle, fetch every object named by the pointer and repair all fixed keys from that immutable set, with `meta.json` last. A restart never uses the mixed fixed keys as its source. |
 | Pointer commit | Either the old pointer or the new pointer may be present | If the PUT response is uncertain, read `current.json`. The exact pointer found there wins. On restart, fixed keys are reconciled from that pointer before another cycle is staged. |
+| Absent or unusable `current.json` | No trusted pointer exists; fixed keys and cycle prefixes may contain legacy, partial, or diagnostic objects | Do not dereference or prune them. Bootstrap only after a complete new staged cycle exists; retain the old pointer bytes if present and replace them only at the final atomic PUT. A handled failed bootstrap restores the fixed keys to their pre-attempt bytes. |
 
 The recovery read happens before the next expensive repository scan and is
 idempotent. A failure while repairing fixed keys leaves the pointer-first read

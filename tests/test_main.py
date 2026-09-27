@@ -217,6 +217,12 @@ def test_prune_failure_still_reports_a_published_cycle(monkeypatch):
     cfg = _cycle_cfg()
     s3 = RecordingS3()
     _stub_collect(monkeypatch)
+    main.publish.reset_prune_health()
+
+    # Bootstrap intentionally skips retention cleanup: there is no valid
+    # pointer yet. Establish one committed cycle before exercising the normal
+    # best-effort prune path.
+    main._run_cycle(cfg, s3, {})
 
     old_cycle = "20260923T000000Z-01234567"
     s3.objects[f"{cfg.dest_prefix}/cycles/{old_cycle}/leftover"] = (
