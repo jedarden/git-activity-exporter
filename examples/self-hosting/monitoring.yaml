@@ -1,0 +1,128 @@
+---
+# Optional Prometheus Operator wiring for kubernetes.yaml. The exporter keeps
+# /health as a JSON liveness contract; /metrics is the numeric alert surface.
+# If the target cluster uses a different rule selector, retain the resources
+# and change the selector label (for example, `release`) to match it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-activity-exporter
+  namespace: git-activity-exporter
+  labels:
+    app: git-activity-exporter
+    app.kubernetes.io/name: git-activity-exporter
+spec:
+  selector:
+    app: git-activity-exporter
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: health
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: git-activity-exporter
+  namespace: git-activity-exporter
+  labels:
+    app.kubernetes.io/name: git-activity-exporter
+    app.kubernetes.io/component: monitoring
+    prometheus: kube-prometheus
+    release: kube-prometheus-stack-ardenone-cluster
+spec:
+  selector:
+    matchLabels:
+      app: git-activity-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: git-activity-exporter
+  namespace: git-activity-exporter
+  labels:
+    app.kubernetes.io/name: git-activity-exporter
+    app.kubernetes.io/component: alerts
+    prometheus: kube-prometheus
+    release: kube-prometheus-stack-ardenone-cluster
+    role: alert-rules
+spec:
+  groups:
+    - name: git-activity-exporter.cycle
+      interval: 30s
+      rules:
+        - alert: GitActivityExporterPublicationStale
+          expr: |
+            (
+              git_activity_exporter_last_successful_publication_timestamp_seconds{namespace="git-activity-exporter"} == 0
+              and
+              time() - git_activity_exporter_process_start_time_seconds{namespace="git-activity-exporter"}
+                > 2 * git_activity_exporter_poll_interval_seconds{namespace="git-activity-exporter"}
+            )
+            or
+            (
+              git_activity_exporter_last_successful_publication_timestamp_seconds{namespace="git-activity-exporter"} > 0
+              and
+              time() - git_activity_exporter_last_successful_publication_timestamp_seconds{namespace="git-activity-exporter"}
+                > 2 * git_activity_exporter_poll_interval_seconds{namespace="git-activity-exporter"}
+            )
+          for: 10m
+          labels:
+            severity: critical
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity publication is stale"
+            description: "No complete publication has committed within two configured poll intervals. Inspect /health for last_cycle_outcome and the cycle runbook."
+            runbook: "docs/notes/deployment.md#cycle-alert-runbook"
+
+        - alert: GitActivityExporterWithheldCycles
+          expr: |
+            increase(
+              git_activity_exporter_cycle_attempts_total{namespace="git-activity-exporter",outcome="withheld"}[2h]
+            ) >= 2
+          for: 10m
+          labels:
+            severity: warning
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity cycles are being withheld"
+            description: "At least two cycles were withheld in the last two hours because the repository failure-rate guard rejected partial data."
+            runbook: "docs/notes/deployment.md#cycle-alert-runbook"
+
+        - alert: GitActivityExporterPruneFailures
+          expr: git_activity_exporter_prune_consecutive_failures{namespace="git-activity-exporter"} >= 1
+          for: 15m
+          labels:
+            severity: warning
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity cycle pruning is failing"
+            description: "Post-publication S3 cleanup has failed at least once and remains consecutive for 15 minutes; new publications may still be succeeding."
+            runbook: "docs/notes/deployment.md#cycle-alert-runbook"
+
+        - alert: GitActivityExporterPublicationFailures
+          expr: git_activity_exporter_publication_failures_consecutive{namespace="git-activity-exporter"} >= 2
+          for: 10m
+          labels:
+            severity: critical
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity publication has failed repeatedly"
+            description: "At least two publication attempts failed consecutively. The previous complete current.json remains authoritative."
+            runbook: "docs/notes/deployment.md#cycle-alert-runbook"
+
+        - alert: GitActivityExporterMetricsMissing
+          expr: absent(git_activity_exporter_up{namespace="git-activity-exporter"})
+          for: 5m
+          labels:
+            severity: critical
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity exporter metrics are missing"
+            description: "Prometheus has not received the exporter metrics surface for five minutes; check the pod, ServiceMonitor, and target status."
+            runbook: "docs/notes/deployment.md#cycle-alert-runbook"

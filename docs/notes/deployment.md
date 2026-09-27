@@ -343,6 +343,96 @@ would restart the pod forever before its first cycle finished. A later failed
 or withheld cycle does not clear readiness; use the health payload for
 freshness and outcome, and inspect the published `meta.json` for coverage.
 
+## Operational monitoring
+
+The exporter exposes two complementary monitoring surfaces:
+
+- `/health` is the JSON liveness and freshness snapshot. It is suitable for a
+  read-only probe and for an operator's first diagnosis.
+- `/metrics` is a dependency-free Prometheus exposition endpoint. It exports
+  publication age, withheld and failed cycle counters, consecutive prune
+  failures, and consecutive publication failures. It does not expose tokens,
+  S3 endpoints, repository names, or error text.
+
+Apply the optional Prometheus Operator resources in
+[`examples/self-hosting/monitoring.yaml`](../../examples/self-hosting/monitoring.yaml)
+alongside the workload, or carry their equivalent `Service`, `ServiceMonitor`,
+and `PrometheusRule` resources into the GitOps deployment. The rule selector
+labels must match the target Prometheus instance. The reference thresholds are:
+
+| Signal | Alert threshold | Severity | Why it matters |
+|---|---|---|---|
+| Last successful publication | No publication after two poll intervals, or published age over two poll intervals; hold 10m | critical | The pointer is no longer fresh. |
+| Withheld cycles | At least two in a rolling two-hour window; hold 10m | warning | The failure-rate guard is repeatedly refusing partial data. |
+| `prune.consecutive_failures` | At least one for 15m | warning | New data can publish while old cycle cleanup is stuck. |
+| Publication failures | At least two consecutive attempts; hold 10m | critical | The previous complete pointer remains live while new writes fail. |
+| Monitoring scrape | `/metrics` absent for 5m | critical | The alert surface itself is blind. |
+
+For the default `POLL_INTERVAL_SECONDS=3600`, the two-hour windows represent
+two attempts. A single transient withheld cycle or prune error is intentionally
+visible in `/health` and logs but does not page. The startup grace applies only
+to the no-publication state; once a publication exists, its age is measured
+from its `generated_at` timestamp.
+
+### Cycle alert runbook
+
+Use read-only access while investigating. Do not delete S3 objects, edit a
+Secret, restart the Deployment manually, or use `kubectl apply`, `patch`,
+`rollout`, or `set image` against this ArgoCD-managed workload.
+
+1. **Confirm the alert and classify the cycle.** Check the Prometheus alert
+   expression and target status, then inspect the live pod without exposing
+   credentials:
+
+   ```bash
+   kubectl -n git-activity-exporter get pods -l app=git-activity-exporter
+   kubectl -n git-activity-exporter logs deployment/git-activity-exporter --since=2h
+   kubectl -n git-activity-exporter port-forward deployment/git-activity-exporter 18080:8080
+   curl --fail http://127.0.0.1:18080/health
+   curl --fail http://127.0.0.1:18080/metrics
+   ```
+
+   Stop the port-forward when finished. `last_cycle_outcome=withheld` means
+   the failure-rate guard protected the previous dataset; `failed` means the
+   attempt raised outside that guard. A non-zero
+   `prune.consecutive_failures` is post-commit cleanup only and does not make
+   the latest publication invalid.
+
+2. **For withheld cycles**, find the `cycle withheld` warning and the preceding
+   `repo ... failed` lines. Check the affected Forgejo repositories, token
+   refresh status, and the `MAX_FAILURE_RATE` value in the committed ConfigMap.
+   Correct the Forgejo/network/volume/configuration cause through GitOps or
+   the credential's managed source, then wait for the next poll. Do not lower
+   `MAX_FAILURE_RATE` or publish the partial output just to clear an alert;
+   verify the next `/health` outcome is `published` and inspect its `meta.json`
+   coverage.
+
+3. **For stale or failed cycles**, check whether the log says `publication
+   failed` or only `cycle failed`. For a publication failure, read the current
+   pointer and its metadata through the normal read-only S3/dashboard path and
+   confirm that they still name one complete cycle. Check the S3 endpoint,
+   bucket/prefix, addressing style, and the read/write permission preflight;
+   fix inputs declaratively and wait for a retry. For collection or payload
+   failures, inspect the sanitized error and the repository/PVC symptoms; a
+   restart is not the first recovery step because `/health` is deliberately
+   live while a cycle retries.
+
+4. **For prune failures**, use the warning's committed and affected cycle IDs
+   to identify the retained prefix. Verify that the writer still has the
+   configured list and delete permissions and that the S3 service is healthy.
+   Leave old prefixes in place while investigating; pruning is best effort and
+   the next successful cleanup will retry them. The alert clears when
+   `prune.consecutive_failures` returns to zero.
+
+5. **Close the incident only after recovery is observable.** The health
+   payload must show `last_cycle_outcome: "published"` with a timestamp newer
+   than two poll intervals, the publication-failure streak must be zero, and
+   any prune alert must have cleared. Confirm the Prometheus target is still
+   scraping and record the relevant sanitized log line and GitOps/secret
+   change in the incident. If the pod itself is unhealthy, correct the image,
+   configuration, Secret source, PVC, or resource request in Git and let ArgoCD
+   reconcile; use the safe rollback procedure below for a bad release.
+
 ## Argo and GitOps reconciliation
 
 There are two related Argo paths:

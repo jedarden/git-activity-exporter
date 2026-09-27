@@ -18,6 +18,11 @@ _published = threading.Event()
 _cycle_state_lock = threading.Lock()
 _last_successful_cycle_at = None
 _last_cycle_outcome = None
+_cycle_attempts = {"published": 0, "withheld": 0, "failed": 0}
+_publication_failures_total = 0
+_consecutive_publication_failures = 0
+_poll_interval_seconds = 3600
+_process_start_time_seconds = time.time()
 _current_reporting_window = ContextVar("reporting_window", default=None)
 
 
@@ -27,9 +32,15 @@ class CycleWithheld(RuntimeError):
 
 def _reset_cycle_state():
     global _last_successful_cycle_at, _last_cycle_outcome
+    global _publication_failures_total, _consecutive_publication_failures
+    global _poll_interval_seconds
     with _cycle_state_lock:
         _last_successful_cycle_at = None
         _last_cycle_outcome = None
+        _cycle_attempts.update(published=0, withheld=0, failed=0)
+        _publication_failures_total = 0
+        _consecutive_publication_failures = 0
+        _poll_interval_seconds = 3600
     publish.reset_prune_health()
 
 
@@ -40,10 +51,30 @@ def _record_cycle_outcome(outcome: str, successful_cycle_at: Optional[str] = Non
     it describes the newest cycle that actually committed a complete dataset.
     """
     global _last_successful_cycle_at, _last_cycle_outcome
+    global _consecutive_publication_failures
     with _cycle_state_lock:
         _last_cycle_outcome = outcome
+        _cycle_attempts[outcome] += 1
         if outcome == "published":
             _last_successful_cycle_at = successful_cycle_at
+            # A complete publication is the recovery boundary for a run of
+            # publication errors. Withheld cycles do not reset this counter:
+            # they are not successful publications either.
+            _consecutive_publication_failures = 0
+
+
+def _record_publication_failure():
+    """Record a failed publication separately from collection failures."""
+    global _publication_failures_total, _consecutive_publication_failures
+    with _cycle_state_lock:
+        _publication_failures_total += 1
+        _consecutive_publication_failures += 1
+
+
+def _set_poll_interval_seconds(seconds: int):
+    global _poll_interval_seconds
+    with _cycle_state_lock:
+        _poll_interval_seconds = seconds
 
 
 def _health_snapshot():
@@ -54,6 +85,66 @@ def _health_snapshot():
         }
     snapshot["prune"] = publish.prune_health()
     return snapshot
+
+
+def _timestamp_seconds(value: Optional[str]) -> float:
+    if value is None:
+        return 0.0
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def _metrics_payload() -> bytes:
+    """Render the small exporter state surface in Prometheus text format."""
+    with _cycle_state_lock:
+        successful_at = _last_successful_cycle_at
+        outcome = _last_cycle_outcome
+        attempts = dict(_cycle_attempts)
+        publication_failures_total = _publication_failures_total
+        consecutive_publication_failures = _consecutive_publication_failures
+        poll_interval_seconds = _poll_interval_seconds
+
+    prune = publish.prune_health()
+    lines = [
+        "# HELP git_activity_exporter_up Process health; this endpoint is live.",
+        "# TYPE git_activity_exporter_up gauge",
+        "git_activity_exporter_up 1",
+        "# HELP git_activity_exporter_process_start_time_seconds Unix start time.",
+        "# TYPE git_activity_exporter_process_start_time_seconds gauge",
+        f"git_activity_exporter_process_start_time_seconds {_process_start_time_seconds:.3f}",
+        "# HELP git_activity_exporter_poll_interval_seconds Configured post-cycle sleep.",
+        "# TYPE git_activity_exporter_poll_interval_seconds gauge",
+        f"git_activity_exporter_poll_interval_seconds {poll_interval_seconds}",
+        "# HELP git_activity_exporter_last_successful_publication_timestamp_seconds Unix timestamp of the latest committed publication, or 0 before the first one.",
+        "# TYPE git_activity_exporter_last_successful_publication_timestamp_seconds gauge",
+        f"git_activity_exporter_last_successful_publication_timestamp_seconds {_timestamp_seconds(successful_at):.3f}",
+        "# HELP git_activity_exporter_cycle_attempts_total Cycle attempts by terminal outcome.",
+        "# TYPE git_activity_exporter_cycle_attempts_total counter",
+    ]
+    for name in ("published", "withheld", "failed"):
+        lines.append(
+            f'git_activity_exporter_cycle_attempts_total{{outcome="{name}"}} {attempts[name]}'
+        )
+    lines.extend([
+        "# HELP git_activity_exporter_last_cycle_outcome Current terminal outcome, one for the current outcome.",
+        "# TYPE git_activity_exporter_last_cycle_outcome gauge",
+    ])
+    for name in ("published", "withheld", "failed"):
+        lines.append(
+            f'git_activity_exporter_last_cycle_outcome{{outcome="{name}"}} {int(outcome == name)}'
+        )
+    lines.extend([
+        "# HELP git_activity_exporter_publication_failures_total Failed publication attempts since process start.",
+        "# TYPE git_activity_exporter_publication_failures_total counter",
+        f"git_activity_exporter_publication_failures_total {publication_failures_total}",
+        "# HELP git_activity_exporter_publication_failures_consecutive Consecutive failed publication attempts.",
+        "# TYPE git_activity_exporter_publication_failures_consecutive gauge",
+        f"git_activity_exporter_publication_failures_consecutive {consecutive_publication_failures}",
+        "# HELP git_activity_exporter_prune_consecutive_failures Consecutive failed post-publication prune attempts.",
+        "# TYPE git_activity_exporter_prune_consecutive_failures gauge",
+        f"git_activity_exporter_prune_consecutive_failures {prune['consecutive_failures']}",
+        "",
+    ])
+    return "\n".join(lines).encode()
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -69,6 +160,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps(_health_snapshot(), separators=(",", ":")).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif self.path == "/metrics":
+            body = _metrics_payload()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -364,6 +463,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     _serve_health(cfg.health_port)
+    _set_poll_interval_seconds(cfg.poll_interval_seconds)
 
     s3_permissions_checked = False
     while not stop.is_set():
@@ -388,10 +488,17 @@ def main():
             log.warning("cycle withheld: %s", e)
         except Exception as error:
             _record_cycle_outcome("failed")
-            log.error(
-                "cycle failed, will retry next interval: %s",
-                s3io.redact_credentials(str(error), cfg.dest),
-            )
+            if isinstance(error, publish.PublicationError):
+                _record_publication_failure()
+                log.error(
+                    "publication failed, will retry next interval: %s",
+                    s3io.redact_credentials(str(error), cfg.dest),
+                )
+            else:
+                log.error(
+                    "cycle failed, will retry next interval: %s",
+                    s3io.redact_credentials(str(error), cfg.dest),
+                )
         stop.wait(cfg.poll_interval_seconds)
 
 

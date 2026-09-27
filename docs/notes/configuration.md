@@ -45,6 +45,7 @@ response. Once the server is bound, these are the complete contracts:
 | Request | Status | Payload | Meaning |
 |---|---:|---|---|
 | `GET /health` | `200` | JSON health snapshot | The process is alive. This does not depend on collection or publication success. |
+| `GET /metrics` | `200` | Prometheus text exposition | Numeric freshness, cycle-outcome, prune, and publication-failure signals for the monitoring stack. |
 | `GET /ready`, before the first successful cycle | `503` | empty, zero-byte body | The process has not yet completed a publication cycle in this process lifetime. |
 | `GET /ready`, after the first successful cycle | `200` | empty, zero-byte body | A cycle has completed in this process lifetime. |
 | `GET` any other path | `404` | empty, zero-byte body | Not an exporter endpoint. |
@@ -79,15 +80,34 @@ therefore returns `404`.
 ### Staleness alert
 
 Poll `/health` at least once per `POLL_INTERVAL_SECONDS`. Alert when
-`last_successful_cycle_at` is null beyond startup grace or when its age exceeds
-`2 * POLL_INTERVAL_SECONDS`. The two-interval allowance covers one missed
-cycle; a cycle that routinely takes as long as the interval is already degraded
-and should page sooner according to the operator's normal cycle-duration
-budget. Use `last_cycle_outcome` to distinguish a `withheld` publication from
-an unexpected `failed` cycle when diagnosing the alert. Separately alert when
-`prune.consecutive_failures` is non-zero for the operator's chosen tolerance;
-this detects an S3 cleanup permission or availability problem even while new
-cycles continue publishing.
+`last_successful_cycle_at` is null beyond a startup grace of two poll intervals
+or when its age exceeds `2 * POLL_INTERVAL_SECONDS`. The two-interval allowance
+covers one missed cycle; a cycle that routinely takes as long as the interval
+is already degraded and should page sooner according to the operator's normal
+cycle-duration budget. The reference Prometheus rule in
+[`examples/self-hosting/monitoring.yaml`](../../examples/self-hosting/monitoring.yaml)
+uses a 10-minute evaluation hold after the threshold is crossed. Use
+`last_cycle_outcome` to distinguish a `withheld` publication from an
+unexpected `failed` cycle when diagnosing the alert.
+
+The `/metrics` endpoint makes the remaining signals alertable without parsing
+JSON or log text:
+
+- `git_activity_exporter_cycle_attempts_total{outcome="withheld"}` alerts after
+  two withheld cycles in a rolling two-hour window. This is the default
+  one-hour-poll deployment threshold; adjust the rule window if the poll
+  interval changes materially.
+- `git_activity_exporter_prune_consecutive_failures >= 1` alerts after 15
+  minutes. This detects an S3 cleanup permission or availability problem even
+  while new cycles continue publishing.
+- `git_activity_exporter_publication_failures_consecutive >= 2` alerts after
+  10 minutes. A successful publication resets the streak; the total counter is
+  retained for the process lifetime.
+
+The application logs remain the diagnosis surface. A withheld cycle logs
+`cycle withheld`, a failed publication logs `publication failed`, and failed
+cleanup logs include the committed and affected cycle IDs. These messages are
+safe to ship to the cluster log collector; they do not contain credentials.
 
 ### Readiness transitions
 

@@ -126,6 +126,38 @@ def test_health_reports_last_success_and_current_outcome(health_server):
     }
 
 
+def test_metrics_expose_freshness_outcomes_and_failure_streaks(health_server):
+    main._set_poll_interval_seconds(120)
+    main._record_cycle_outcome("withheld")
+    main._record_cycle_outcome("failed")
+    main._record_publication_failure()
+    main._record_publication_failure()
+
+    status, headers, body = _get(health_server, "/metrics")
+
+    assert status == 200
+    assert headers["Content-Type"] == "text/plain; version=0.0.4"
+    text = body.decode()
+    assert "git_activity_exporter_last_successful_publication_timestamp_seconds 0.000" in text
+    assert "git_activity_exporter_poll_interval_seconds 120" in text
+    assert 'git_activity_exporter_cycle_attempts_total{outcome="withheld"} 1' in text
+    assert 'git_activity_exporter_cycle_attempts_total{outcome="failed"} 1' in text
+    assert 'git_activity_exporter_last_cycle_outcome{outcome="failed"} 1' in text
+    assert "git_activity_exporter_publication_failures_total 2" in text
+    assert "git_activity_exporter_publication_failures_consecutive 2" in text
+    assert "git_activity_exporter_prune_consecutive_failures 0" in text
+
+
+def test_successful_publication_resets_publication_failure_streak(health_server):
+    main._record_publication_failure()
+    main._record_cycle_outcome("published", "2026-09-27T12:00:00Z")
+
+    _, _, body = _get(health_server, "/metrics")
+    text = body.decode()
+    assert "git_activity_exporter_publication_failures_total 1" in text
+    assert "git_activity_exporter_publication_failures_consecutive 0" in text
+
+
 def test_readiness_transitions_across_failures_withholding_and_recovery(
     monkeypatch, health_server
 ):

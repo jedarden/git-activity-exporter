@@ -195,6 +195,12 @@ the example-specific values:
 6. Keep `CLONE_ROOT: /data/mirrors`, one replica, and the `Recreate` strategy.
 7. Keep the Reloader annotation, or configure an equivalent automatic rollout
    mechanism for `git-activity-exporter-families`.
+8. If the cluster runs Prometheus Operator, copy
+   [`examples/self-hosting/monitoring.yaml`](../examples/self-hosting/monitoring.yaml)
+   alongside the workload. Adjust its Prometheus selector labels to match your
+   instance. It adds the internal metrics Service, the `/metrics`
+   `ServiceMonitor`, and the cycle alerts; do not apply the file on a cluster
+   without the `monitoring.coreos.com` CRDs.
 
 The example expects two Secrets, with these keys:
 
