@@ -97,6 +97,10 @@ transition rules for `/health` and `/ready`. Treat the committed defaults and
 The [deployment and release workflow](docs/notes/deployment.md) documents the
 Argo build, image versioning, runtime inputs, PVC, probes, GitOps handoff,
 post-reconcile verification, and safe image-pin rollback.
+A [browser-facing data-path contract](docs/notes/deployment.md#browser-facing-dashboard-data-path)
+documents the authenticated website endpoint, pointer resolution, S3 read
+permissions, CORS boundary, cache headers, and whole-cycle consistency
+expectations exercised by the self-hosting smoke.
 A complete [self-hosting setup guide](docs/self-hosting.md) walks through
 replacing the author's Forgejo owner, family map, S3 destination, credentials,
 and deployment settings, then validating the first successful cycle.

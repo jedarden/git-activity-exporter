@@ -74,19 +74,32 @@ done
 S3_PORT=$(EXPORTER_IMAGE="$IMAGE" FIXTURE_ROOT="$FIXTURE_ROOT" \
     docker compose --project-name "$PROJECT" --file "$PROFILE_DIR/compose.yaml" \
     port s3-fixture 9000 | sed -n '1s/.*://p')
-BASE_URL="http://127.0.0.1:$S3_PORT/reuser-git-activity/exports/reuser"
-curl --fail --silent "$BASE_URL/current.json" > "$SMOKE_TMP/current.json"
+BROWSER_HOST=dashboard.example.test
+BROWSER_BASE_URL="http://127.0.0.1:$S3_PORT/git-activity/data"
+# The Host header selects the fixture's website handler. The path is the same
+# path the authenticated dashboard browser uses; the fixture maps it to the
+# objects written through the S3 API above. No S3 credentials are sent here.
+curl --fail --silent --show-error \
+    --header "Host: $BROWSER_HOST" \
+    "$BROWSER_BASE_URL/current.json" > "$SMOKE_TMP/current.json"
 
-python - "$BASE_URL" "$SMOKE_TMP/current.json" <<'PY'
+python - "$BROWSER_BASE_URL" "$BROWSER_HOST" "$SMOKE_TMP/current.json" <<'PY'
 import io
 import json
 import re
 import sys
-from urllib.request import urlopen
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 import pyarrow.parquet as pq
 
-base_url, pointer_path = sys.argv[1:]
+browser_base, browser_host, pointer_path = sys.argv[1:]
+
+
+def browser_open(url, method="GET"):
+    return urlopen(Request(url, method=method, headers={"Host": browser_host}), timeout=10)
+
+
 pointer = json.loads(open(pointer_path).read())
 assert set(pointer["objects"]) == {
     "hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json"
@@ -94,9 +107,16 @@ assert set(pointer["objects"]) == {
 assert re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}", pointer["cycle_id"])
 assert pointer["cycle_id"].startswith(pointer["generated_at"].replace("-", "").replace(":", ""))
 
+pointer_url = f"{browser_base}/current.json"
+with browser_open(pointer_url) as response:
+    assert response.headers["Cache-Control"] == "no-cache, max-age=0, must-revalidate"
+
 objects = {}
 for name, relative_key in pointer["objects"].items():
-    with urlopen(f"{base_url}/{relative_key}", timeout=10) as response:
+    object_url = urljoin(pointer_url, relative_key)
+    assert f"/cycles/{pointer['cycle_id']}/" in object_url
+    with browser_open(object_url) as response:
+        assert response.headers["Cache-Control"] == "public, max-age=31536000, immutable"
         objects[name] = response.read()
 
 meta = json.loads(objects["meta.json"])

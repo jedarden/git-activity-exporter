@@ -21,6 +21,13 @@ services:
     profiles: [self-hosting]
     image: ${EXPORTER_IMAGE:-git-activity-exporter-self-hosting:0.1.35}
     command: [python, /fixture/mock-s3.py]
+    environment:
+      # The smoke sends browser-shaped requests with this Host header. The
+      # fixture maps the website path to the same objects the S3 API stores.
+      WEBSITE_HOST: dashboard.example.test
+      WEBSITE_BUCKET: reuser-git-activity
+      WEBSITE_SOURCE_PREFIX: exports/reuser
+      WEBSITE_PATH_PREFIX: /git-activity/data
     ports:
       - 127.0.0.1::9000
     volumes:

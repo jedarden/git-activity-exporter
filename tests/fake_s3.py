@@ -22,6 +22,7 @@ class FakeS3:
 
     def __init__(self):
         self.objects = {}
+        self.cache_controls = {}
         self.puts = []
         self.calls = []
         self._fault = None
@@ -40,10 +41,11 @@ class FakeS3:
             if err is not None:
                 raise err
 
-    def put_object(self, Bucket, Key, Body, ContentType):
+    def put_object(self, Bucket, Key, Body, ContentType, CacheControl=None):
         self.calls.append(("put", Key))
         self._gate("put", Key)
         self.objects[Key] = (bytes(Body), ContentType)
+        self.cache_controls[Key] = CacheControl
         self.puts.append(Key)
         if self._after_put_fault:
             error = self._after_put_fault("put", Key)

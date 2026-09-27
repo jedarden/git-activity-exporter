@@ -82,6 +82,12 @@ POINTER_SCHEMA_VERSION = 1
 #: previous pointer and is still reading, at a few MiB per generation.
 RETAINED_CYCLES = 3
 
+# Browser consumers fetch the pointer on every refresh, while cycle-scoped
+# objects are immutable and have a unique URL. These S3 metadata values are
+# also honored by the Garage website endpoint used by the dashboard.
+POINTER_CACHE_CONTROL = "no-cache, max-age=0, must-revalidate"
+IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
 META_NAME = "meta.json"
 
 # The production payload set is stable and is also needed to clean a partial
@@ -403,6 +409,7 @@ def _reconcile_publication(s3, bucket: str, prefix: str, expected_names=None):
         s3io.upload_bytes(
             s3, bucket, f"{prefix}/{name}", data,
             content_type or "application/octet-stream",
+            cache_control=POINTER_CACHE_CONTROL,
         )
     for name in _ordered_names(name for name in names if desired[name] is None):
         if current[name] is not None:
@@ -440,6 +447,7 @@ def _restore_fixed_snapshot(s3, bucket: str, prefix: str, snapshot):
         s3io.upload_bytes(
             s3, bucket, f"{prefix}/{name}", data,
             content_type or "application/octet-stream",
+            cache_control=POINTER_CACHE_CONTROL,
         )
     for name in _ordered_names(name for name, value in snapshot.items() if value is None):
         if s3io.fetch_object(s3, bucket, f"{prefix}/{name}") is not None:
@@ -509,7 +517,8 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
     try:
         for name, data, content_type in payloads:
             s3io.upload_immutable_bytes(
-                s3, bucket, f"{base}{name}", data, content_type
+                s3, bucket, f"{base}{name}", data, content_type,
+                cache_control=IMMUTABLE_CACHE_CONTROL,
             )
     except Exception as e:
         raise PublicationError(f"staging {base} failed; previous cycle untouched") from e
@@ -517,7 +526,10 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
     # Step 4: mirror to the fixed keys, meta.json last.
     try:
         for name, data, content_type in _meta_last(payloads):
-            s3io.upload_bytes(s3, bucket, f"{prefix}/{name}", data, content_type)
+            s3io.upload_bytes(
+                s3, bucket, f"{prefix}/{name}", data, content_type,
+                cache_control=POINTER_CACHE_CONTROL,
+            )
     except Exception as e:
         _recover_after_failure(
             s3, bucket, prefix, "fixed-key mirror", bootstrap_snapshot
@@ -532,6 +544,7 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
         s3io.upload_bytes(
             s3, bucket, pointer_key,
             committed_pointer, "application/json",
+            cache_control=POINTER_CACHE_CONTROL,
         )
     except Exception as e:
         # A PUT can have committed before its response was lost. Resolve the

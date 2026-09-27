@@ -259,15 +259,37 @@ def list_keys(s3, bucket: str, prefix: str) -> list:
             return out
 
 
-def upload_bytes(s3, bucket: str, key: str, data: bytes, content_type: str):
+def upload_bytes(
+    s3,
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str,
+    cache_control: str = None,
+):
+    kwargs = {
+        "Bucket": bucket,
+        "Key": key,
+        "Body": data,
+        "ContentType": content_type,
+    }
+    if cache_control is not None:
+        kwargs["CacheControl"] = cache_control
     _call(
-        lambda: s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type),
+        lambda: s3.put_object(**kwargs),
         f"S3 PUT s3://{bucket}/{key}",
     )
     log.info("uploaded %d bytes to s3://%s/%s", len(data), bucket, key)
 
 
-def upload_immutable_bytes(s3, bucket: str, key: str, data: bytes, content_type: str):
+def upload_immutable_bytes(
+    s3,
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str,
+    cache_control: str = None,
+):
     """Create an object without ever overwriting a different existing value.
 
     A PUT can succeed at S3 and still lose its response to the caller. A
@@ -286,7 +308,15 @@ def upload_immutable_bytes(s3, bucket: str, key: str, data: bytes, content_type:
             return
 
         try:
-            s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+            kwargs = {
+                "Bucket": bucket,
+                "Key": key,
+                "Body": data,
+                "ContentType": content_type,
+            }
+            if cache_control is not None:
+                kwargs["CacheControl"] = cache_control
+            s3.put_object(**kwargs)
         except Exception as error:
             # Resolve an ambiguous outcome before retrying. S3 is strongly
             # read-after-write consistent, so an exact object means the PUT

@@ -161,6 +161,91 @@ those credentials at their source; do not edit a generated or reflected
 Secret by hand. The Deployment and ExternalSecret carry the Stakater Reloader
 annotation so a source Secret or ConfigMap change restarts the pod.
 
+## Browser-facing dashboard data path
+
+The dashboard reads this export through the Garage website endpoint, not the
+S3 API endpoint. The browser-facing URL is:
+
+```text
+https://dashboard.ardenone.com/git-activity/data/current.json
+```
+
+The `dashboard-site` Garage bucket is exposed by the `dashboard-site`
+IngressRoute on Garage's website port `3902`; its `globalAlias` is
+`dashboard.ardenone.com`, and the route is protected by the dashboard's
+Authentik forward-auth middleware. A browser with a valid dashboard session
+therefore fetches the page and data from one origin. The S3 API at
+`https://s3.ardenone.com` (Garage port `3900`) is for the exporter and other
+writers; it is not a browser data endpoint and its access key must never reach
+page JavaScript.
+
+The exporter writes through `dashboard-write-key`, whose bucket permission is
+read/write because publication recovery reads old objects and publication
+prunes old cycle prefixes. The browser does not use that key: website reads
+are authorized by the dashboard host's Authentik session and then served from
+the bucket's website view. This separates the writer's S3 permissions from
+the browser's read-only surface.
+
+### Pointer-first browser read
+
+The consumer must fetch the pointer from the same website path and resolve
+each `objects` value relative to that pointer URL. The values are relative to
+`DEST_S3_PREFIX`, so the following is the complete shape (the dashboard page
+uses the equivalent `window.location.origin` URL):
+
+```js
+const pointerURL = new URL('/git-activity/data/current.json', window.location.origin)
+const pointer = await fetch(pointerURL, { cache: 'no-store' }).then(r => {
+  if (!r.ok) throw new Error(`current.json: HTTP ${r.status}`)
+  return r.json()
+})
+
+const objectURL = name => new URL(pointer.objects[name], pointerURL)
+const payload = await Promise.all(
+  Object.entries(pointer.objects).map(async ([name, key]) => {
+    const response = await fetch(objectURL(name), { cache: 'force-cache' })
+    if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`)
+    return [name, await response.arrayBuffer()]
+  }),
+)
+```
+
+`current.json` is written with `Cache-Control: no-cache, max-age=0,
+must-revalidate`; the explicit `no-store` fetch also prevents a browser from
+reusing an old pointer during a refresh. Pointer-named cycle objects have
+unique immutable URLs and are written with
+`Cache-Control: public, max-age=31536000, immutable`. The legacy fixed keys
+are also `no-cache`; they are not part of the atomic browser read path.
+
+No CORS configuration is required for this path: the page and its data share
+the `dashboard.ardenone.com` origin. Do not switch the consumer to
+`s3.ardenone.com` merely because it is the S3 endpoint; that would turn a
+same-origin read into a cross-origin request and would require an explicit,
+origin-restricted Garage CORS policy for `GET`/`HEAD` and the response headers
+the Parquet reader needs. If a future dashboard is hosted on another origin,
+add that exact origin to the bucket's CORS policy and smoke-test its preflight
+before changing this URL contract; never compensate with browser S3
+credentials or an unrestricted wildcard when credentials are involved.
+
+The read is consistent at the publication level. A single atomic PUT changes
+`current.json`; every cycle object it names was uploaded before that PUT and
+is immutable. A browser therefore reads one complete cycle, either the old
+pointer or the new pointer, even while a publication is in flight. It must
+not cache the pointer URL across refreshes or mix in fixed-key objects. Three
+cycle prefixes are retained, which gives a reader that has already resolved a
+previous pointer time to finish; a 404 for a named cycle object is a failed
+snapshot and should cause the consumer to retry the pointer/object set rather
+than fall back to fixed keys.
+
+The self-hosting smoke profile exercises this exact website-shaped path. Its
+fixture maps `/git-activity/data/current.json` and every relative pointer key
+to the objects written through the S3 API, checks the cache headers, and
+successfully reads and parses all three Parquet objects plus `meta.json`:
+
+```bash
+scripts/smoke-self-hosting.sh
+```
+
 ## PVC and single-writer requirements
 
 The exporter stores bare shallow repository mirrors under `/data/mirrors`.

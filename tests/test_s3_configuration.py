@@ -67,9 +67,11 @@ class RecordingS3(FakeS3):
         super().__init__()
         self.put_calls = []
 
-    def put_object(self, Bucket, Key, Body, ContentType):
-        self.put_calls.append({"Bucket": Bucket, "Key": Key})
-        return super().put_object(Bucket, Key, Body, ContentType)
+    def put_object(self, Bucket, Key, Body, ContentType, CacheControl=None):
+        self.put_calls.append(
+            {"Bucket": Bucket, "Key": Key, "CacheControl": CacheControl}
+        )
+        return super().put_object(Bucket, Key, Body, ContentType, CacheControl)
 
 
 @pytest.mark.parametrize("style", ["path", "virtual"])
@@ -118,4 +120,10 @@ def test_configured_prefix_generates_documented_object_keys(
 
     assert [call["Bucket"] for call in s3.put_calls] == ["activity-bucket"] * 9
     assert [call["Key"] for call in s3.put_calls] == expected_keys
+    assert [call["CacheControl"] for call in s3.put_calls[:4]] == [
+        "public, max-age=31536000, immutable"
+    ] * 4
+    assert [call["CacheControl"] for call in s3.put_calls[4:]] == [
+        "no-cache, max-age=0, must-revalidate"
+    ] * 5
     assert all("//" not in call["Key"] for call in s3.put_calls)
