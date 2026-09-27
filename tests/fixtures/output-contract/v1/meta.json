@@ -1,0 +1,25 @@
+{
+  "version": "0.1.32",
+  "cycle_id": "20260927T120000Z-1234abcd",
+  "generated_at": "2026-09-27T12:00:00Z",
+  "window_days": 90,
+  "repos_total": 2,
+  "repos_scanned": 2,
+  "repos_failed": [],
+  "repo_errors": {},
+  "repos_stale": [],
+  "repos_partial_history": [],
+  "mirrors_pruned": [],
+  "repos_with_bead_data": 2,
+  "git_timeout_seconds": 600,
+  "cycle_seconds": 12.3,
+  "bead_epoch_utc": "2026-09-27T12:01:00Z",
+  "attribution_epoch": {
+    "attributed-repo": "2026-09-27T12:11:00Z"
+  },
+  "bulk_bead_cells": 0,
+  "unassigned_repos": [],
+  "trim_max_lines": 5000,
+  "trim_max_files": 200,
+  "excluded_path_patterns": ["(^|/)\\.beads/", "\\.(min\\.js|min\\.css|map)$"]
+}

@@ -1,0 +1,41 @@
+{
+  "schema": "git-activity-exporter.ledger-fixture.v1",
+  "attempts": [
+    {
+      "attempt_id": "attempt-redispatch",
+      "workspace_uuid": "11111111-2222-3333-4444-555555555555",
+      "issue_id": "gitact-redispatch",
+      "started_at": "2026-09-27T12:00:30Z",
+      "finished_at": "2026-09-27T12:04:30Z",
+      "expected_worker": "worker-b",
+      "expected_claim": "2026-09-27T12:03:00Z",
+      "expected_close": "2026-09-27T12:04:00Z",
+      "expected_commit": {
+        "repo": "fixture-repo",
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "attempt_id": "attempt-attributed",
+      "workspace_uuid": "66666666-7777-8888-9999-000000000000",
+      "issue_id": "gitact-attributed",
+      "started_at": "2026-09-27T12:09:30Z",
+      "finished_at": "2026-09-27T12:11:30Z",
+      "expected_worker": "worker-c",
+      "expected_claim": "2026-09-27T12:10:00Z",
+      "expected_close": "2026-09-27T12:11:00Z",
+      "expected_commit": {
+        "repo": "attributed-repo",
+        "sha": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    }
+  ],
+  "rules": {
+    "bead_event_identity": ["workspace_uuid", "issue_id", "actor"],
+    "bead_event_time": "ts_utc is inside [started_at, finished_at] with consumer-defined clock skew",
+    "worker_identity": "take actor from the matching claimed event; never infer it from a system close",
+    "commit_identity": ["repo", "sha"],
+    "sha_format": "40 lowercase hexadecimal characters",
+    "cycle_scope": "resolve current.json before reading any named object"
+  }
+}

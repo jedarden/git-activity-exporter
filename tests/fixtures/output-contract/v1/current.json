@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "cycle_id": "20260927T120000Z-1234abcd",
+  "generated_at": "2026-09-27T12:00:00Z",
+  "objects": {
+    "hourly.parquet": "cycles/20260927T120000Z-1234abcd/hourly.parquet",
+    "commits.parquet": "cycles/20260927T120000Z-1234abcd/commits.parquet",
+    "bead_events.parquet": "cycles/20260927T120000Z-1234abcd/bead_events.parquet",
+    "meta.json": "cycles/20260927T120000Z-1234abcd/meta.json"
+  }
+}

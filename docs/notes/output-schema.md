@@ -488,6 +488,24 @@ How the factory attempt ledger joins this exporter's objects to the attempt
 ledger and to CI runs. These are the keys the data stack can rely on; none of
 them requires re-reading a forensic file.
 
+### Versioned consumer fixture
+
+[`tests/fixtures/output-contract/v1/`](../../tests/fixtures/output-contract/v1/)
+is a checked-in, pointer-resolved publication for downstream readers. It
+contains `current.json`, its complete `cycles/<cycle_id>/` object set, the
+legacy fixed-key mirror, all three Parquet files with non-empty rows, a
+contract manifest, and ledger-join examples. The fixture version is independent
+of the exporter release version: a breaking output change gets a new `vN`
+directory, while v1 remains readable by older consumers.
+
+The dashboard-site consumer should resolve `current.json` first and read only
+the four objects it names. The declarative-config factory-ledger consumer
+should use the same cycle-scoped objects and replay `ledger/joins.json` to
+prove the `workspace_uuid` + `issue_id` + claim actor/time-window join and the
+`repo` + full-SHA commit bridge. `tests/test_output_contract_fixture.py`
+checks the producer-side bytes, but does not substitute for those consumers'
+native reader tests.
+
 ### Bead events ↔ attempt ledger: (`workspace_uuid`, `issue_id`, `actor`, time window)
 
 | Ledger field | This file | Match |

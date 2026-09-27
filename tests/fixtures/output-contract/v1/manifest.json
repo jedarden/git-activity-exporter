@@ -1,0 +1,69 @@
+{
+  "contract": "git-activity-exporter.output",
+  "fixture_version": 1,
+  "pointer": "current.json",
+  "fixed_objects": ["hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json"],
+  "cycle_id": "20260927T120000Z-1234abcd",
+  "generated_at": "2026-09-27T12:00:00Z",
+  "parquet_schemas": {
+    "hourly.parquet": [
+      ["hour_utc", "string"],
+      ["hour_epoch", "int64"],
+      ["repo", "string"],
+      ["family", "string"],
+      ["worker", "string"],
+      ["commits", "int64"],
+      ["bulk_commits", "int64"],
+      ["lines_added", "int64"],
+      ["lines_deleted", "int64"],
+      ["lines_added_raw", "int64"],
+      ["lines_deleted_raw", "int64"],
+      ["files_changed", "int64"],
+      ["beads_closed", "int64"],
+      ["beads_closed_bulk", "int64"],
+      ["beads_claimed", "int64"],
+      ["beads_released", "int64"],
+      ["beads_reopened", "int64"],
+      ["workers_active", "int64"]
+    ],
+    "commits.parquet": [
+      ["sha", "string"],
+      ["repo", "string"],
+      ["family", "string"],
+      ["ts_utc", "string"],
+      ["hour_utc", "string"],
+      ["author_email", "string"],
+      ["subject", "string"],
+      ["bead_id", "string"],
+      ["lines_added", "int64"],
+      ["lines_deleted", "int64"],
+      ["files_changed", "int64"],
+      ["lines_added_raw", "int64"],
+      ["lines_deleted_raw", "int64"],
+      ["is_bulk", "bool"]
+    ],
+    "bead_events.parquet": [
+      ["ts_utc", "string"],
+      ["hour_utc", "string"],
+      ["repo", "string"],
+      ["family", "string"],
+      ["workspace_uuid", "string"],
+      ["issue_id", "string"],
+      ["kind", "string"],
+      ["actor", "string"],
+      ["resulting_status", "string"],
+      ["is_bulk_import", "bool"]
+    ]
+  },
+  "ledger_joins": {
+    "bead_events": {
+      "exact_keys": ["workspace_uuid", "issue_id", "actor"],
+      "time_column": "ts_utc",
+      "time_match": "attempt start/end window"
+    },
+    "commits": {
+      "exact_keys": ["repo", "sha"],
+      "sha_format": "40 lowercase hexadecimal characters"
+    }
+  }
+}
