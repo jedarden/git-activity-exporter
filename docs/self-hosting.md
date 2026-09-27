@@ -28,7 +28,7 @@ Decide these values before editing the workload:
 | Forgejo owner | `analytics` | `FORGE_OWNER` |
 | S3 bucket | `analytics-git-activity` | `DEST_S3_BUCKET` |
 | S3 prefix | `exports/git-activity` | `DEST_S3_PREFIX` |
-| Image | `registry.example/analytics/git-activity-exporter:0.1.41` | Deployment `image` |
+| Image | `registry.example/analytics/git-activity-exporter:0.1.42` | Deployment `image` |
 | Mirror volume | a writable 20 GiB or larger RWO PVC | `CLONE_ROOT` and the volume mount |
 
 Use a bucket/prefix dedicated to this exporter. Only one exporter replica may
