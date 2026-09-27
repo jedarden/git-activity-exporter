@@ -45,6 +45,11 @@ class FakeResponse:
         return self.payload
 
 
+class MalformedJSONResponse(FakeResponse):
+    def json(self):
+        raise json.JSONDecodeError("malformed", "{", 1)
+
+
 class ResponseSequence:
     """Responses for one page, consumed once per attempt."""
 
@@ -89,6 +94,8 @@ class FakeForge:
                     raise item
                 if isinstance(item, int):
                     return FakeResponse({"data": []}, status=item)
+                if isinstance(item, FakeResponse):
+                    return item
                 return FakeResponse(item)
 
         monkeypatch.setattr(forge.requests, "Session", FakeSession)
@@ -167,6 +174,50 @@ def test_empty_result_is_a_single_request_returning_no_repos(monkeypatch):
     out, f = list_repos_with_pages(monkeypatch, [{"ok": True, "data": []}])
     assert out == []
     assert [c["params"]["page"] for c in f.calls] == [1]
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ([], "JSON object"),
+        ({}, "data field"),
+        ({"data": {}}, "data field"),
+        ({"data": ["repo"]}, "entry 0"),
+        ({"data": [{"name": "repo-1"}]}, "full_name"),
+        ({"data": [repo(1) | {"clone_url": None}]}, "clone_url"),
+        ({"data": [repo(1) | {"empty": "false"}]}, "empty"),
+        ({"data": [repo(1)], "ok": False}, "unsuccessful"),
+    ],
+)
+def test_successful_response_schema_errors_fail_without_retry(monkeypatch, payload, message):
+    f = FakeForge([payload]).install(monkeypatch)
+
+    with pytest.raises(forge.EnumerationError, match=message):
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert len(f.calls) == 1
+
+
+def test_malformed_json_fails_without_retry(monkeypatch):
+    f = FakeForge([MalformedJSONResponse(None)]).install(monkeypatch)
+
+    with pytest.raises(forge.EnumerationError, match="malformed JSON"):
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert len(f.calls) == 1
+
+
+@pytest.mark.parametrize("duplicate_field", ["name", "full_name"])
+def test_duplicate_repositories_fail_the_complete_walk(monkeypatch, duplicate_field):
+    first = repo(1)
+    second = repo(2)
+    second[duplicate_field] = first[duplicate_field]
+    f = FakeForge([{"data": [first, second]}]).install(monkeypatch)
+
+    with pytest.raises(forge.EnumerationError, match="duplicate"):
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert len(f.calls) == 1
 
 
 def test_denylist_filters_the_completed_walk(monkeypatch):
@@ -353,6 +404,37 @@ def test_enumeration_error_fails_the_cycle_before_any_prune_or_publish(monkeypat
     with pytest.raises(requests.HTTPError):
         main._run_cycle(_cfg(tmp_path), s3, {})
 
+    assert s3.puts == []
+    assert s3.objects == {}
+    assert (tmp_path / "survivor.git").exists()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        MalformedJSONResponse(None),
+        [],
+        {"data": [{"name": "repo-1"}]},
+        {"data": [repo(1), repo(1)]},
+    ],
+)
+def test_invalid_enumeration_response_fails_before_prune_or_publish(
+    monkeypatch, tmp_path, response
+):
+    FakeForge([response]).install(monkeypatch)
+    _mirror(tmp_path, "survivor")
+    s3 = FakeS3()
+    prune_calls = []
+    monkeypatch.setattr(
+        main.gitscan,
+        "prune_orphans",
+        lambda *args: prune_calls.append(args) or ["unexpected"],
+    )
+
+    with pytest.raises(forge.EnumerationError):
+        main._run_cycle(_cfg(tmp_path), s3, {})
+
+    assert prune_calls == []
     assert s3.puts == []
     assert s3.objects == {}
     assert (tmp_path / "survivor.git").exists()

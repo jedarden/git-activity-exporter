@@ -17,6 +17,11 @@ from . import retry
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
+REQUIRED_REPOSITORY_STRING_FIELDS = ("name", "full_name", "clone_url")
+
+
+class EnumerationError(RuntimeError):
+    """The Forgejo response was successful but not a valid repo listing."""
 
 
 def _is_transient(error: Exception) -> bool:
@@ -35,12 +40,62 @@ def _is_transient(error: Exception) -> bool:
     return False
 
 
+def _validated_page(resp, page: int):
+    """Decode and validate one successful Forgejo enumeration response.
+
+    A malformed or changed response must not look like an empty fleet: the
+    caller uses the result to prune mirrors. Keep this validation outside the
+    retry operation because a schema or JSON parsing error will not be fixed by
+    repeating the same successful response.
+    """
+    try:
+        payload = resp.json()
+    except ValueError as error:
+        raise EnumerationError(
+            f"Forgejo repository enumeration page {page} returned malformed JSON"
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise EnumerationError(
+            f"Forgejo repository enumeration page {page} must be a JSON object"
+        )
+    if "ok" in payload and payload["ok"] is not True:
+        raise EnumerationError(
+            f"Forgejo repository enumeration page {page} has an unsuccessful ok field"
+        )
+    if "data" not in payload or not isinstance(payload["data"], list):
+        raise EnumerationError(
+            f"Forgejo repository enumeration page {page} has no list-valued data field"
+        )
+
+    for index, repository in enumerate(payload["data"]):
+        if not isinstance(repository, dict):
+            raise EnumerationError(
+                f"Forgejo repository enumeration page {page} entry {index} "
+                "must be a JSON object"
+            )
+        missing = [
+            field for field in REQUIRED_REPOSITORY_STRING_FIELDS
+            if not isinstance(repository.get(field), str) or not repository[field].strip()
+        ]
+        if "empty" not in repository or not isinstance(repository["empty"], bool):
+            missing.append("empty")
+        if missing:
+            fields = ", ".join(missing)
+            raise EnumerationError(
+                f"Forgejo repository enumeration page {page} entry {index} "
+                f"has missing or invalid required field(s): {fields}"
+            )
+    return payload["data"]
+
+
 def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=()):
     """Every non-empty repo owned by `owner`, newest API page first."""
     session = requests.Session()
     session.headers.update({"Authorization": f"token {token}"})
 
     repos, page = [], 1
+    seen_names, seen_full_names = set(), set()
     while True:
         def get_page():
             resp = session.get(
@@ -59,7 +114,21 @@ def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=())
             is_retryable=_is_transient,
             label=f"Forgejo repository enumeration page {page}",
         )
-        batch = resp.json().get("data") or []
+        batch = _validated_page(resp, page)
+        for repository in batch:
+            name = repository["name"]
+            full_name = repository["full_name"]
+            if name in seen_names:
+                raise EnumerationError(
+                    f"Forgejo repository enumeration contains duplicate name {name!r}"
+                )
+            if full_name in seen_full_names:
+                raise EnumerationError(
+                    "Forgejo repository enumeration contains duplicate full_name "
+                    f"{full_name!r}"
+                )
+            seen_names.add(name)
+            seen_full_names.add(full_name)
         if not batch:
             break
         repos.extend(batch)

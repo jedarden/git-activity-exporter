@@ -24,6 +24,18 @@ anything its live set omits, so a walk that stopped at page 1 would make
 every later page look deleted upstream. `REPO_DENYLIST` is applied to the
 completed listing, never used to cut the walk short.
 
+**Successful responses are validated before they reach the cycle.** Each page
+must be a JSON object with a list-valued `data` field. Every entry must be an
+object with non-empty string `name`, `full_name`, and `clone_url` fields; when
+present, `empty` must be a boolean; in the Forgejo repository schema it is
+required. If the response includes `ok`, it must be `true`. Repository names
+and full names must each be unique across the complete walk. Malformed JSON, an
+invalid successful response, a missing or wrongly typed required field, an
+unsuccessful `ok`, or a duplicate entry is a non-retryable enumeration failure.
+It fails the cycle before mirrors are scanned or pruned and before anything is
+published; it must never be treated as an empty enumeration. A valid
+`data: []` page remains the explicitly handled successful-empty case below.
+
 **Visibility is what the token can see; there is no client-side filter.**
 The search endpoint applies Forgejo's own access rules, so the enumerated
 fleet is "repos owned by `FORGE_OWNER` that `FORGE_TOKEN` may read" —
