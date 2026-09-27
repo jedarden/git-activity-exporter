@@ -86,8 +86,8 @@ acceptable.
 
 See `docs/notes/configuration.md`. The exporter's
 [liveness and readiness contract](docs/notes/configuration.md#health-endpoints)
-defines the exact statuses, empty response bodies, and publication transition
-rules for `/health` and `/ready`. Treat the committed defaults and
+defines the exact statuses, `/health` freshness snapshot, and publication
+transition rules for `/health` and `/ready`. Treat the committed defaults and
 `families.yaml` as the author's example deployment; set `FORGE_BASE_URL`,
 `FORGE_OWNER`, and your own family mapping in addition to the required
 `FORGE_TOKEN` and `DEST_S3_*` credentials.

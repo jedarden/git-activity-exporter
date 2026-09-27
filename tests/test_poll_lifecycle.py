@@ -20,8 +20,10 @@ from src import main
 @pytest.fixture(autouse=True)
 def reset_published():
     main._published.clear()
+    main._reset_cycle_state()
     yield
     main._published.clear()
+    main._reset_cycle_state()
 
 
 class ScriptedStop:
@@ -174,3 +176,17 @@ def test_a_restarted_process_repolls_immediately_and_starts_unready(monkeypatch)
 
     assert _kinds(events) == ["health", "cycle", "cycle-failed", "wait"]
     assert not main._published.is_set()
+
+
+def test_readiness_stays_ready_across_subsequent_failures(monkeypatch):
+    events = _drive(
+        monkeypatch,
+        [None, RuntimeError("publication failed"), RuntimeError("withheld")],
+    )
+
+    assert main._published.is_set()
+    assert _kinds(events) == [
+        "health", "cycle", "cycle-ok", "wait",
+        "cycle", "cycle-failed", "wait",
+        "cycle", "cycle-failed", "wait",
+    ]

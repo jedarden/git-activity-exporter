@@ -44,15 +44,35 @@ response. Once the server is bound, these are the complete contracts:
 
 | Request | Status | Payload | Meaning |
 |---|---:|---|---|
-| `GET /health` | `200` | empty, zero-byte body | The process is alive. This does not depend on collection or publication success. |
+| `GET /health` | `200` | JSON health snapshot | The process is alive. This does not depend on collection or publication success. |
 | `GET /ready`, before the first successful cycle | `503` | empty, zero-byte body | The process has not yet completed a publication cycle in this process lifetime. |
 | `GET /ready`, after the first successful cycle | `200` | empty, zero-byte body | A cycle has completed in this process lifetime. |
 | `GET` any other path | `404` | empty, zero-byte body | Not an exporter endpoint. |
 
-There is no JSON payload and no `Content-Type` header on these responses. The
-status code is the entire application contract. These are exact GET paths; a
-trailing slash or query string is a different path and therefore returns
-`404`.
+`/health` returns `Content-Type: application/json` with exactly these fields:
+
+```json
+{"last_successful_cycle_at":"2026-09-27T12:00:00Z","last_cycle_outcome":"published"}
+```
+
+Before the first cycle attempt, both values are `null`. `last_successful_cycle_at`
+is the `generated_at` timestamp from the newest cycle whose complete publication
+committed. It remains unchanged when a later cycle is `withheld` or `failed`.
+`last_cycle_outcome` is the most recent attempt: `published`, `withheld` (the
+`MAX_FAILURE_RATE` guard rejected it), or `failed` (another cycle exception).
+The `/ready` response remains empty and has no `Content-Type` header. These are
+exact GET paths; a trailing slash or query string is a different path and
+therefore returns `404`.
+
+### Staleness alert
+
+Poll `/health` at least once per `POLL_INTERVAL_SECONDS`. Alert when
+`last_successful_cycle_at` is null beyond startup grace or when its age exceeds
+`2 * POLL_INTERVAL_SECONDS`. The two-interval allowance covers one missed
+cycle; a cycle that routinely takes as long as the interval is already degraded
+and should page sooner according to the operator's normal cycle-duration
+budget. Use `last_cycle_outcome` to distinguish a `withheld` publication from
+an unexpected `failed` cycle when diagnosing the alert.
 
 ### Readiness transitions
 
@@ -73,9 +93,10 @@ Readiness is a process-lifetime latch, not a report on the newest cycle:
 5. **Later failure or withheld publication:** after readiness has been
    achieved, a later failed or withheld cycle does not clear it. `/ready`
    stays `200` and `/health` stays `200`; the previous complete publication
-   remains live. Use `meta.json`'s `generated_at`, `repos_failed`, `repos_stale`,
-   and `repos_partial_history` to assess current publication freshness and
-   coverage.
+   remains live. Use `/health`'s `last_successful_cycle_at` and
+   `last_cycle_outcome` for probe-level freshness and outcome; use `meta.json`'s
+   `generated_at`, `repos_failed`, `repos_stale`, and `repos_partial_history`
+   for publication coverage details.
 6. **Recovery:** a successful cycle after pre-readiness failures transitions
    `/ready` from `503` to `200`. Recovery after readiness has already been
    achieved has no observable endpoint transition; it remains `200`.

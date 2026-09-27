@@ -114,13 +114,16 @@ The container port is named `health` and is 8080. The Deployment uses:
   failure threshold 240.
 
 `/health` returns 200 once the process has bound its server, even while the
-first cold cycle is cloning the fleet. `/ready` returns 503 until the process
-has completed its first successful publication, then remains 200 for that
-process lifetime. This separation is intentional: a cold start can exceed
-ordinary probe windows, and using publication readiness as liveness would
-restart the pod forever before its first cycle finished. A later failed or
-withheld cycle does not clear readiness; inspect the published `meta.json` and
-pod logs for freshness and coverage.
+first cold cycle is cloning the fleet. Its JSON payload reports
+`last_successful_cycle_at` and `last_cycle_outcome`; alert when the timestamp
+is older than two `POLL_INTERVAL_SECONDS` intervals as documented in
+[`configuration.md`](configuration.md#staleness-alert). `/ready` returns 503
+until the process has completed its first successful publication, then remains
+200 for that process lifetime. This separation is intentional: a cold start
+can exceed ordinary probe windows, and using publication readiness as liveness
+would restart the pod forever before its first cycle finished. A later failed
+or withheld cycle does not clear readiness; use the health payload for
+freshness and outcome, and inspect the published `meta.json` for coverage.
 
 ## Argo and GitOps reconciliation
 

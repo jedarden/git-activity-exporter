@@ -1,4 +1,5 @@
 import http.client
+import json
 import logging
 import threading
 from http.server import ThreadingHTTPServer
@@ -29,8 +30,10 @@ def _probe(server):
 @pytest.fixture(autouse=True)
 def reset_published():
     main._published.clear()
+    main._reset_cycle_state()
     yield
     main._published.clear()
+    main._reset_cycle_state()
 
 
 @pytest.fixture
@@ -46,9 +49,8 @@ def health_server():
         thread.join(timeout=2)
 
 
-def test_endpoint_status_and_empty_payload_contract(health_server):
+def test_endpoint_status_and_payload_contract(health_server):
     for path, expected_status in (
-        ("/health", 200),
         ("/ready", 503),
         ("/missing", 404),
         ("/ready/", 404),
@@ -59,11 +61,45 @@ def test_endpoint_status_and_empty_payload_contract(health_server):
         assert body == b""
         assert "Content-Type" not in headers
 
+    status, headers, body = _get(health_server, "/health")
+    assert status == 200
+    assert headers["Content-Type"] == "application/json"
+    assert json.loads(body) == {
+        "last_successful_cycle_at": None,
+        "last_cycle_outcome": None,
+    }
+
     main._published.set()
     status, headers, body = _get(health_server, "/ready")
     assert status == 200
     assert body == b""
     assert "Content-Type" not in headers
+
+
+def test_health_reports_last_success_and_current_outcome(health_server):
+    main._record_cycle_outcome("published", "2026-09-27T12:00:00Z")
+    status, _, body = _get(health_server, "/health")
+    assert status == 200
+    assert json.loads(body) == {
+        "last_successful_cycle_at": "2026-09-27T12:00:00Z",
+        "last_cycle_outcome": "published",
+    }
+
+    main._record_cycle_outcome("withheld")
+    status, _, body = _get(health_server, "/health")
+    assert status == 200
+    assert json.loads(body) == {
+        "last_successful_cycle_at": "2026-09-27T12:00:00Z",
+        "last_cycle_outcome": "withheld",
+    }
+
+    main._record_cycle_outcome("failed")
+    status, _, body = _get(health_server, "/health")
+    assert status == 200
+    assert json.loads(body) == {
+        "last_successful_cycle_at": "2026-09-27T12:00:00Z",
+        "last_cycle_outcome": "failed",
+    }
 
 
 def test_readiness_transitions_across_failures_withholding_and_recovery(
@@ -72,10 +108,10 @@ def test_readiness_transitions_across_failures_withholding_and_recovery(
     outcomes = iter(
         [
             RuntimeError("forge enumeration failed"),
-            RuntimeError("withheld: repository failure rate exceeded limit"),
+            main.CycleWithheld("repository failure rate exceeded limit"),
             None,
             RuntimeError("publication failed after readiness"),
-            RuntimeError("withheld: repository failure rate exceeded limit"),
+            main.CycleWithheld("repository failure rate exceeded limit"),
             None,
         ]
     )

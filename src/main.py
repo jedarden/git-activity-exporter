@@ -15,7 +15,42 @@ from .window import ReportingWindow
 log = logging.getLogger(__name__)
 
 _published = threading.Event()
+_cycle_state_lock = threading.Lock()
+_last_successful_cycle_at = None
+_last_cycle_outcome = None
 _current_reporting_window = ContextVar("reporting_window", default=None)
+
+
+class CycleWithheld(RuntimeError):
+    """The cycle completed collection but was rejected by the publish guard."""
+
+
+def _reset_cycle_state():
+    global _last_successful_cycle_at, _last_cycle_outcome
+    with _cycle_state_lock:
+        _last_successful_cycle_at = None
+        _last_cycle_outcome = None
+
+
+def _record_cycle_outcome(outcome: str, successful_cycle_at: Optional[str] = None):
+    """Publish the operator-facing state used by the health endpoint.
+
+    A failed or withheld cycle must not move the freshness timestamp backward:
+    it describes the newest cycle that actually committed a complete dataset.
+    """
+    global _last_successful_cycle_at, _last_cycle_outcome
+    with _cycle_state_lock:
+        _last_cycle_outcome = outcome
+        if outcome == "published":
+            _last_successful_cycle_at = successful_cycle_at
+
+
+def _health_snapshot():
+    with _cycle_state_lock:
+        return {
+            "last_successful_cycle_at": _last_successful_cycle_at,
+            "last_cycle_outcome": _last_cycle_outcome,
+        }
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -28,7 +63,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
     # finishes a first clone, and the pod would never become useful.
     def do_GET(self):
         if self.path == "/health":
+            body = json.dumps(_health_snapshot(), separators=(",", ":")).encode()
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         elif self.path == "/ready":
             self.send_response(200 if _published.is_set() else 503)
         else:
@@ -242,7 +283,7 @@ def _run_cycle(cfg, s3, family_map):
         total = stats["repos_total"]
         failure_rate = len(failed) / total
         if failure_rate > cfg.max_failure_rate:
-            raise RuntimeError(
+            raise CycleWithheld(
                 f"{len(failed)}/{total} repo(s) failed this cycle "
                 f"({failure_rate:.0%} > {cfg.max_failure_rate:.0%} limit); refusing to "
                 f"publish over the previous cycle's data. First failures: {failed[:3]}"
@@ -281,6 +322,7 @@ def _run_cycle(cfg, s3, family_map):
 
     publish.publish_cycle(s3, cfg.dest.bucket, cfg.dest_prefix, payloads,
                           cycle_id=cycle_id, generated_at=generated_at)
+    return generated_at
 
 
 def main():
@@ -303,9 +345,14 @@ def main():
 
     while not stop.is_set():
         try:
-            _run_cycle(cfg, s3, family_map)
+            generated_at = _run_cycle(cfg, s3, family_map)
+            _record_cycle_outcome("published", generated_at)
             _published.set()
+        except CycleWithheld as e:
+            _record_cycle_outcome("withheld")
+            log.warning("cycle withheld: %s", e)
         except Exception:
+            _record_cycle_outcome("failed")
             log.exception("cycle failed, will retry next interval")
         stop.wait(cfg.poll_interval_seconds)
 
