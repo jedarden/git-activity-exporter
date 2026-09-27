@@ -156,6 +156,26 @@ Commit rows use the Git author timestamp from `%at` and are filtered in Python
 against the same interval, so the published timestamp and the boundary test
 use the same clock.
 
+### Hourly bucket contract
+
+The hourly fact table uses the source event time, never the mirror-fetch time,
+scan time, or publication time. For Git, that source time is the commit's
+author timestamp (`%at`), not its committer timestamp. Git supplies `%at` as
+integer Unix seconds, so it is already an absolute UTC instant. For a bead,
+the source time is the forensic event object's `time` field. An offset-bearing
+ISO 8601 value is converted to its UTC instant; a decimal Unix-second value is
+interpreted as UTC. An ISO 8601 value without an offset is rejected as
+ambiguous rather than being interpreted in the exporter host's local timezone.
+
+After normalization, both sources use the same rule: the UTC epoch seconds are
+grouped by integer division by 3,600, and the resulting hour is rendered as
+`YYYY-MM-DDTHH:00:00Z`. Thus, for example, `01:30-04:00` belongs to the
+`05:00Z` bucket. The event's normalized second is also the value used for the
+reporting-window test, so the bucket and inclusion decision cannot disagree.
+The window remains half-open: an event exactly at
+`generated_at - WINDOW_DAYS` is included, while one exactly at `generated_at`
+is excluded, even when both fall in the same partial UTC hour.
+
 ## Failure semantics
 
 Specified here because every one of these used to be an accident of

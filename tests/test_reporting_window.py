@@ -61,6 +61,20 @@ def test_offset_timestamps_are_compared_as_utc_instants():
     assert [event["issue_id"] for event in events] == ["start"]
 
 
+def test_bead_offset_timestamp_is_bucketed_by_its_utc_hour():
+    window = ReportingWindow.from_anchor(
+        datetime(2026, 9, 6, 6, 0, tzinfo=UTC), 1
+    )
+    events = beads.parse_events(
+        _event("offset", "2026-09-06T01:30:00-04:00", 1), "repo", window
+    )
+
+    assert aggregate.bead_event_rows(events, {})[0]["hour_utc"] == "2026-09-06T05:00:00Z"
+    assert aggregate.build_hourly([], events, {})[0]["hour_epoch"] == int(
+        datetime(2026, 9, 6, 5, tzinfo=UTC).timestamp()
+    ) // 3600
+
+
 def test_dst_window_is_elapsed_utc_not_local_calendar_time():
     eastern = ZoneInfo("America/New_York")
     anchor = datetime(2026, 3, 8, 3, 30, tzinfo=eastern)
@@ -118,6 +132,24 @@ def test_commit_scan_uses_the_same_inclusive_start_and_exclusive_end(monkeypatch
 
     assert [commit["sha"] for commit in commits] == ["start", "last"]
     assert calls[0][0][0:2] == ["git", "-C"]
+
+
+def test_git_author_timestamp_is_bucketed_by_its_utc_hour(monkeypatch):
+    window = ReportingWindow.from_anchor(
+        datetime(2026, 9, 6, 6, 0, tzinfo=UTC), 1
+    )
+    author_time = datetime(2026, 9, 6, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+    output = _commit_line("offset-author", author_time)
+
+    monkeypatch.setattr(gitscan, "_run", lambda args, timeout: output)
+    commits = gitscan.scan_commits(
+        "/mirror", "repo", 1, [], 60, reporting_window=window
+    )
+    gitscan.mark_bulk(commits, 5000, 200)
+
+    rows = aggregate.build_hourly(commits, [], {})
+    assert rows[0]["hour_utc"] == "2026-09-06T05:00:00Z"
+    assert aggregate.commit_rows(commits, {})[0]["hour_utc"] == "2026-09-06T05:00:00Z"
 
 
 def test_git_filters_author_time_when_committer_time_differs(tmp_path):
