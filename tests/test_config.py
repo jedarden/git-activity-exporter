@@ -146,3 +146,44 @@ def test_denylist_is_trimmed_comma_separated_names(isolated_env, monkeypatch):
     monkeypatch.setenv("REPO_DENYLIST", " repo-one, repo-two ,, repo-three, ")
 
     assert config.load().repo_denylist == ["repo-one", "repo-two", "repo-three"]
+
+
+def test_excluded_patterns_are_trimmed_literal_comma_tokens(isolated_env, monkeypatch):
+    monkeypatch.setenv(
+        "EXCLUDED_PATH_PATTERNS", r" ^src/ , , \.min\.js$ , ^vendor/ , "
+    )
+
+    assert config.load().excluded_path_patterns == [
+        r"^src/",
+        r"\.min\.js$",
+        r"^vendor/",
+    ]
+
+
+def test_excluded_patterns_do_not_treat_backslash_comma_as_an_escape(
+    isolated_env, monkeypatch
+):
+    monkeypatch.setenv("EXCLUDED_PATH_PATTERNS", r"^foo\,bar$,^baz/")
+
+    assert config.load().excluded_path_patterns == ["^foo\\", "bar$", "^baz/"]
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , , "])
+def test_blank_excluded_patterns_use_the_defaults(isolated_env, monkeypatch, raw):
+    monkeypatch.setenv("EXCLUDED_PATH_PATTERNS", raw)
+
+    assert config.load().excluded_path_patterns == list(config.DEFAULT_EXCLUDED_PATHS)
+
+
+def test_custom_excluded_patterns_replace_the_defaults(isolated_env, monkeypatch):
+    monkeypatch.setenv("EXCLUDED_PATH_PATTERNS", r"^generated/")
+
+    assert config.load().excluded_path_patterns == [r"^generated/"]
+
+
+def test_invalid_excluded_pattern_is_not_compiled_during_config_load(
+    isolated_env, monkeypatch
+):
+    monkeypatch.setenv("EXCLUDED_PATH_PATTERNS", "[")
+
+    assert config.load().excluded_path_patterns == ["["]

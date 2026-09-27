@@ -16,7 +16,7 @@ everything else has a default.
 | `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | date-based history bound; existing mirrors deepen on fetch when a wider window is requested — [shallow-mirror behavior](data-sources.md#git--bounded-window-explicit-coverage) |
 | `TRIM_MAX_LINES` | `5000` | strict upper bound on a commit's filtered `lines_added + lines_deleted`; above it the commit is flagged bulk — [commit bulk contract](output-schema.md#commit-bulk-and-filtered-loc-contract) |
 | `TRIM_MAX_FILES` | `200` | strict upper bound on a commit's filtered `files_changed`; above it the commit is flagged bulk — [commit bulk contract](output-schema.md#commit-bulk-and-filtered-loc-contract) |
-| `EXCLUDED_PATH_PATTERNS` | [the four defaults](#default-excluded-path-patterns) | regexes, comma-separated; replaces the default list wholesale |
+| `EXCLUDED_PATH_PATTERNS` | [the four defaults](#default-excluded-path-patterns) | Python `re.search` regexes, literal comma-separated; see the [matching contract](#excluded-path-matching-contract) |
 | `BEAD_BULK_CLOSE_THRESHOLD` | `150` | closures per `(repo, hour)` above which the cell is flagged |
 | `BEAD_BULK_HOUR_SHARE` | `0.5` | share of an hour's fleet-wide closures already flagged before the whole hour is treated as bulk |
 | `MAX_FAILURE_RATE` | `0.2` | fraction of repos that may fail before the cycle is withheld instead of published |
@@ -314,6 +314,35 @@ filter is why `lines_*` tracks work rather than checkpoint churn, and why
 
 The list lives in `config.DEFAULT_EXCLUDED_PATHS`; `tests/test_docs.py`
 fails if this block and the code drift apart.
+
+## Excluded-path matching contract
+
+`EXCLUDED_PATH_PATTERNS` is parsed as a literal comma-separated list. Each
+comma is a separator; surrounding whitespace is stripped and empty entries are
+dropped. A backslash does not escape a comma for this parser: backslashes are
+left in the token for Python's regular-expression parser. Consequently, a
+pattern containing a literal comma cannot be represented in this environment
+variable. For example, `^foo\,bar$` is split into `^foo\` and `bar$`, not
+one pattern matching `foo,bar`.
+
+If the setting is unset, blank, or contains only commas and whitespace, the
+four defaults above are used. Otherwise, the non-empty custom list replaces
+the defaults wholesale.
+
+Each token is compiled as a Python regular expression and matched with
+`re.search`, case-sensitively and without implicit anchors. Patterns are
+ORed: a path is excluded when any pattern searches successfully. Regex syntax
+and escapes are passed through unchanged; this is not a glob or shell-escape
+language. An invalid expression is not compiled during configuration loading.
+When scanning begins, compilation raises Python's `re.error` and the scan
+fails rather than silently ignoring the bad pattern or restoring the defaults.
+
+The searched string is the exact path field emitted by Git's `--numstat`
+output: a repository-relative Git path, using Git's `/` separators. The
+scanner does not call `normpath`, make paths absolute, collapse `.` or `..`,
+convert backslashes to `/`, or case-fold the path before matching. Thus the
+regex must describe the path string Git supplies; anchors such as `^` and `$`
+have their ordinary regular-expression meaning.
 
 ## The families file
 

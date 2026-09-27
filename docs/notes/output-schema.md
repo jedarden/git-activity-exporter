@@ -547,7 +547,7 @@ change type, or lose one of the relations in the table without failing CI.
 | `unassigned_repos` | list[string] | never (may be empty) | Sorted and unique. Repos with activity in the window whose `families.yaml` mapping is missing; a scanned repo with no window activity cannot appear. |
 | `trim_max_lines` | int | never | The bulk-commit LOC bound behind `is_bulk`. |
 | `trim_max_files` | int | never | The bulk-commit file-count bound behind `is_bulk`. |
-| `excluded_path_patterns` | list[string] | never | The `re.search` patterns separating `lines_*` from `lines_*_raw`, as configured (defaults in [configuration.md](configuration.md#default-excluded-path-patterns)). |
+| `excluded_path_patterns` | list[string] | never | The `re.search` patterns separating `lines_*` from `lines_*_raw`, as configured (see the [excluded-path matching contract](configuration.md#excluded-path-matching-contract); defaults in [configuration.md](configuration.md#default-excluded-path-patterns)). |
 
 ### Freshness, coverage, and withheld cycles
 

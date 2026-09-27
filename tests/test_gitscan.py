@@ -54,6 +54,65 @@ def test_default_exclusions_catch_the_dominant_contaminator():
     assert not excluded("src/beads_client.rs")
 
 
+def _scan_paths(monkeypatch, paths, patterns):
+    anchor = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
+    header = gitscan._FIELD_SEP.join(
+        ("C", "sha", str(int(anchor.timestamp()) - 1), "dev@example.com", "", "subject")
+    )
+    output = "\n".join([header, *(f"2\t1\t{path}" for path in paths)])
+    monkeypatch.setattr(gitscan, "_run", lambda *args, **kwargs: output)
+    return gitscan.scan_commits(
+        "/mirror",
+        "repo",
+        1,
+        patterns,
+        60,
+        reporting_window=ReportingWindow.from_anchor(anchor, 1),
+    )[0]
+
+
+def test_excluded_patterns_search_the_exact_git_path_case_sensitively(monkeypatch):
+    commit = _scan_paths(
+        monkeypatch,
+        ["src/generated.tmp", "src/Generated.tmp", "docs/generated.tmp.bak"],
+        [r"generated\.tmp"],
+    )
+
+    assert commit["files_changed_raw"] == 3
+    assert commit["files_changed"] == 1
+    assert commit["lines_added_raw"] == 6
+    assert commit["lines_added"] == 2
+
+
+def test_excluded_patterns_are_ored_and_honor_anchors(monkeypatch):
+    commit = _scan_paths(
+        monkeypatch,
+        ["src/keep.py", "assets/app.js.map", "docs/readme.md"],
+        [r"^src/", r"\.map$"],
+    )
+
+    assert commit["files_changed_raw"] == 3
+    assert commit["files_changed"] == 1
+    assert commit["lines_added"] == 2
+
+
+def test_excluded_patterns_do_not_normalize_or_convert_path_separators(monkeypatch):
+    commit = _scan_paths(
+        monkeypatch,
+        ["./src/file.py", r"src\\file.py", "src/file.py"],
+        [r"^\./src/", r"^src/"],
+    )
+
+    assert commit["files_changed_raw"] == 3
+    assert commit["files_changed"] == 1
+    assert commit["lines_added"] == 2
+
+
+def test_invalid_excluded_expression_raises_when_the_scanner_compiles(monkeypatch):
+    with pytest.raises(re.error):
+        _scan_paths(monkeypatch, ["src/file.py"], ["["])
+
+
 def test_mark_bulk_flags_but_does_not_drop():
     commits = [
         {"lines_added": 10, "lines_deleted": 5, "files_changed": 3},
