@@ -14,6 +14,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from .clone_policy import validate_clone_url
 from . import retry
 from .window import ReportingWindow, as_utc
 
@@ -180,7 +181,8 @@ def mirror_path(clone_root: str, repo_name: str) -> str:
 
 
 def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, timeout: int,
-                  window_start: Optional[datetime] = None):
+                  window_start: Optional[datetime] = None,
+                  forge_base_url: Optional[str] = None):
     """Clone or refresh one bare mirror. Returns (path, refreshed).
 
     refreshed is False when the mirror is served stale -- currently only a
@@ -195,6 +197,10 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     extend it until the cutoff is reached or the attempt budget is exhausted;
     widening the reporting window does not require --unshallow or a re-clone.
     """
+    if forge_base_url is None:
+        raise ValueError("forge_base_url is required to validate clone_url")
+    validate_clone_url(repo["clone_url"], forge_base_url)
+
     path = mirror_path(clone_root, repo["name"])
     reference = (
         as_utc(window_start) if window_start is not None else datetime.now(timezone.utc)

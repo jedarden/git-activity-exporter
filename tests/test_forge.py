@@ -204,6 +204,25 @@ def test_successful_response_schema_errors_fail_without_retry(monkeypatch, paylo
     assert len(f.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "clone_url",
+    [
+        "file:///tmp/secret-repo",
+        "ssh://git@forge/test-owner/repo-1.git",
+        "http://forge/test-owner/repo-1.git",
+        "https://unexpected.example/test-owner/repo-1.git",
+        "https://x-access-token:secret@forge/test-owner/repo-1.git",
+    ],
+)
+def test_clone_url_must_use_the_configured_forgejo_origin(monkeypatch, clone_url):
+    f = FakeForge([{"data": [repo(1) | {"clone_url": clone_url}]}]).install(monkeypatch)
+
+    with pytest.raises(forge.EnumerationError, match="unsafe clone_url"):
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert len(f.calls) == 1
+
+
 def test_malformed_json_fails_without_retry(monkeypatch):
     f = FakeForge([MalformedJSONResponse(None)]).install(monkeypatch)
 

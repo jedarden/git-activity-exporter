@@ -223,7 +223,7 @@ def test_cycle_window_is_shared_by_git_and_bead_reads(monkeypatch, tmp_path):
     monkeypatch.setattr(
         main.gitscan,
         "ensure_mirror",
-        lambda *args: mirror_starts.append(args[-1]) or ("/mirror", True),
+        lambda *args: mirror_starts.append(args[-2]) or ("/mirror", True),
     )
     monkeypatch.setattr(
         main.gitscan,

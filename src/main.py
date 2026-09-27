@@ -235,7 +235,8 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
         try:
             path, refreshed = gitscan.ensure_mirror(
                 repo, cfg.clone_root, cfg.forge_token, cfg.shallow_since_days,
-                cfg.git_timeout_seconds, reporting_window.start
+                cfg.git_timeout_seconds, reporting_window.start,
+                cfg.forge_base_url,
             )
             history_complete = gitscan.mirror_history_complete(
                 path, reporting_window.start, cfg.shallow_since_days,

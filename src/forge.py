@@ -12,6 +12,11 @@ import re
 
 import requests
 
+from .clone_policy import (
+    CloneURLPolicyError,
+    validate_clone_url,
+    validate_forge_base_url,
+)
 from . import retry
 
 log = logging.getLogger(__name__)
@@ -40,7 +45,7 @@ def _is_transient(error: Exception) -> bool:
     return False
 
 
-def _validated_page(resp, page: int):
+def _validated_page(resp, page: int, base_url: str):
     """Decode and validate one successful Forgejo enumeration response.
 
     A malformed or changed response must not look like an empty fleet: the
@@ -86,11 +91,25 @@ def _validated_page(resp, page: int):
                 f"Forgejo repository enumeration page {page} entry {index} "
                 f"has missing or invalid required field(s): {fields}"
             )
+        try:
+            validate_clone_url(repository["clone_url"], base_url)
+        except CloneURLPolicyError as error:
+            raise EnumerationError(
+                f"Forgejo repository enumeration page {page} entry {index} "
+                f"has an unsafe clone_url: {error}"
+            ) from error
     return payload["data"]
 
 
 def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=()):
     """Every non-empty repo owned by `owner`, newest API page first."""
+    try:
+        # Validate the configured source before sending the API credential or
+        # accepting any clone URL from its response.
+        validate_forge_base_url(base_url)
+    except CloneURLPolicyError as error:
+        raise EnumerationError(f"unsafe Forgejo base URL: {error}") from error
+
     session = requests.Session()
     session.headers.update({"Authorization": f"token {token}"})
 
@@ -114,7 +133,7 @@ def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=())
             is_retryable=_is_transient,
             label=f"Forgejo repository enumeration page {page}",
         )
-        batch = _validated_page(resp, page)
+        batch = _validated_page(resp, page, base_url)
         for repository in batch:
             name = repository["name"]
             full_name = repository["full_name"]

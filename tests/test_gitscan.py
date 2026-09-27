@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src import beads, gitscan
+from src.clone_policy import CloneURLPolicyError
 from src.config import DEFAULT_EXCLUDED_PATHS
 from src.window import ReportingWindow
 
@@ -201,6 +202,53 @@ def _repo(name="x"):
     return {"name": name, "clone_url": f"https://git.ardenone.com/jedarden/{name}.git"}
 
 
+def _ensure(repo, clone_root, token, shallow_since_days, timeout, window_start=None):
+    return gitscan.ensure_mirror(
+        repo,
+        clone_root,
+        token,
+        shallow_since_days,
+        timeout,
+        window_start,
+        "https://git.ardenone.com",
+    )
+
+
+def test_untrusted_clone_endpoint_is_rejected_before_git_receives_credentials(
+    tmp_path, monkeypatch
+):
+    remote_calls = []
+    credential_calls = []
+
+    monkeypatch.setattr(
+        gitscan,
+        "_run_remote",
+        lambda *args, **kwargs: remote_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        gitscan,
+        "_credential_env",
+        lambda token: credential_calls.append(token) or {},
+    )
+
+    with pytest.raises(CloneURLPolicyError, match="host"):
+        gitscan.ensure_mirror(
+            {
+                "name": "sensitive",
+                "clone_url": "https://attacker.example/sensitive.git",
+            },
+            str(tmp_path),
+            "SUPERSECRET",
+            100,
+            60,
+            forge_base_url="https://git.ardenone.com",
+        )
+
+    assert remote_calls == []
+    assert credential_calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
 def _fake_clone(target):
     """Stand in for `git clone` by materializing the target it points at."""
     os.makedirs(target, exist_ok=True)
@@ -234,7 +282,7 @@ def _commit_fixture(path, name, content, date, subject):
     _git(path, "commit", "-q", "--no-verify", "-m", subject, date=date)
 
 
-def test_existing_shallow_mirror_is_deepened_for_wider_window(tmp_path):
+def test_existing_shallow_mirror_is_deepened_for_wider_window(tmp_path, monkeypatch):
     source = tmp_path / "source"
     subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
     _git(source, "config", "user.name", "fixture")
@@ -262,9 +310,10 @@ def test_existing_shallow_mirror_is_deepened_for_wider_window(tmp_path):
     ).returncode != 0
 
     inode = os.stat(mirror).st_ino
+    monkeypatch.setattr(gitscan, "validate_clone_url", lambda *args: None)
     path, refreshed = gitscan.ensure_mirror(
         {"name": "history", "clone_url": source.as_uri()},
-        str(tmp_path), "token", 100, 60, window_start,
+        str(tmp_path), "token", 100, 60, window_start, source.as_uri(),
     )
 
     assert path == str(mirror)
@@ -305,7 +354,7 @@ def test_fetch_timeout_keeps_mirror_and_serves_it_stale(tmp_path, monkeypatch):
         raise gitscan.GitTimeout(f"git fetch timed out after {timeout}s")
 
     monkeypatch.setattr(gitscan, "_run", fake_run)
-    out_path, refreshed = gitscan.ensure_mirror(_repo(), str(tmp_path), "tok", 100, 600)
+    out_path, refreshed = _ensure(_repo(), str(tmp_path), "tok", 100, 600)
 
     assert out_path == str(path)
     assert refreshed is False, "a fetch timeout must surface as stale, not failure"
@@ -324,7 +373,7 @@ def test_fetch_corruption_reclones(tmp_path, monkeypatch):
         return ""
 
     monkeypatch.setattr(gitscan, "_run", fake_run)
-    out_path, refreshed = gitscan.ensure_mirror(_repo(), str(tmp_path), "tok", 100, 600)
+    out_path, refreshed = _ensure(_repo(), str(tmp_path), "tok", 100, 600)
 
     assert out_path == str(path)
     assert refreshed is True
@@ -341,7 +390,7 @@ def test_authentication_failure_keeps_existing_mirror_without_reclone(tmp_path, 
 
     monkeypatch.setattr(gitscan, "_run", fail)
     with pytest.raises(gitscan.GitAuthenticationError):
-        gitscan.ensure_mirror(_repo(), str(tmp_path), "tok", 100, 600)
+        _ensure(_repo(), str(tmp_path), "tok", 100, 600)
 
     assert len(calls) == 1, "an auth failure must not fall through to a re-clone"
     assert path.is_dir(), "the last known-good mirror must be preserved"
@@ -359,7 +408,7 @@ def test_clone_timeout_excludes_repo_and_cleans_its_tmp(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gitscan, "_run", fake_run)
     with pytest.raises(gitscan.GitTimeout):
-        gitscan.ensure_mirror(_repo(), str(tmp_path), "tok", 100, 600)
+        _ensure(_repo(), str(tmp_path), "tok", 100, 600)
 
     assert not (tmp_path / "x.git.tmp").exists(), "partial clone pack must not sit on the PVC"
     assert not (tmp_path / "x.git").exists()
@@ -375,7 +424,7 @@ def test_dormant_repo_still_falls_back_to_depth_one(tmp_path, monkeypatch):
         return ""
 
     monkeypatch.setattr(gitscan, "_run", fake_run)
-    out_path, refreshed = gitscan.ensure_mirror(_repo(), str(tmp_path), "tok", 100, 600)
+    out_path, refreshed = _ensure(_repo(), str(tmp_path), "tok", 100, 600)
 
     assert refreshed is True
     assert (tmp_path / "x.git").is_dir()

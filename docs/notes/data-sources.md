@@ -36,6 +36,18 @@ It fails the cycle before mirrors are scanned or pruned and before anything is
 published; it must never be treated as an empty enumeration. A valid
 `data: []` page remains the explicitly handled successful-empty case below.
 
+The `clone_url` field has a stricter safety contract than its required
+non-empty-string shape. It must be an absolute `http` or `https` URL using the
+same scheme, hostname, and effective port as `FORGE_BASE_URL`; it must include
+a path and must not contain userinfo, a query, or a fragment. This rejects
+`file://`, `ssh://`, other local URLs, and clone endpoints on another host
+before Git is invoked. The clone boundary repeats the check as defense in
+depth. An HTTP clone URL is accepted only when `FORGE_BASE_URL` is explicitly
+HTTP, which supports an intentionally private in-cluster Forgejo deployment;
+the default and production profile use HTTPS. The exporter never places
+`FORGE_TOKEN` in the URL, and an unsafe enumeration is fatal rather than
+falling through to a credentialed clone attempt.
+
 **Visibility is what the token can see; there is no client-side filter.**
 The search endpoint applies Forgejo's own access rules, so the enumerated
 fleet is "repos owned by `FORGE_OWNER` that `FORGE_TOKEN` may read" —

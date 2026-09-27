@@ -163,6 +163,11 @@ def _make_cycle_fixture(tmp_path, monkeypatch):
             return Response({"data": []})
 
     monkeypatch.setattr(forge.requests, "Session", Session)
+    # These fixtures clone local file:// repositories. Production Forgejo
+    # enumeration and the clone boundary reject local URLs by policy; the
+    # policy has dedicated tests, while this fixture focuses on cycle I/O.
+    monkeypatch.setattr(forge, "validate_clone_url", lambda *args: None)
+    monkeypatch.setattr(main.gitscan, "validate_clone_url", lambda *args: None)
     monkeypatch.setattr(main, "_now", lambda: GENERATED_AT)
 
     clone_root = tmp_path / "mirrors"
@@ -470,6 +475,10 @@ def test_mirror_lifecycle_prunes_orphans_and_reclones_an_emptied_repo(tmp_path, 
             return Response(payload)
 
     monkeypatch.setattr(forge.requests, "Session", Session)
+    # See the equivalent local-fixture note above: this lifecycle fixture
+    # intentionally uses file:// clone sources.
+    monkeypatch.setattr(forge, "validate_clone_url", lambda *args: None)
+    monkeypatch.setattr(main.gitscan, "validate_clone_url", lambda *args: None)
     monkeypatch.setattr(main, "_now", lambda: GENERATED_AT)
 
     clone_root = tmp_path / "mirrors"
