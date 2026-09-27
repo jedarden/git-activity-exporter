@@ -32,6 +32,8 @@ spec:
               parameters:
                 - name: version
                   value: "{{steps.resolve-version.outputs.parameters.version}}"
+                - name: verified-image
+                  value: "{{steps.smoke.outputs.parameters.verified-image}}"
         - - name: verify-rollout
             template: verify-rollout
             arguments:
@@ -61,12 +63,17 @@ spec:
           cd /tmp/repo
 
           VERSION_CHANGED=$(git diff --name-only HEAD~1 HEAD -- VERSION 2>/dev/null | grep -c '^VERSION$' || true)
+          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          LAST_AUTO_BUMP=$(git log -1 --format=%s | sed -n \
+            's/^ci: auto-bump version to //p')
 
-          if [ "$VERSION_CHANGED" -gt 0 ] 2>/dev/null; then
-            VERSION=$(cat VERSION | tr -d '[:space:]')
+          if [ "$LAST_AUTO_BUMP" = "$CURRENT" ]; then
+            VERSION="$CURRENT"
+            echo "Reusing existing auto-bump commit for ${VERSION}"
+          elif [ "$VERSION_CHANGED" -gt 0 ] 2>/dev/null; then
+            VERSION="$CURRENT"
             echo "VERSION changed in commit — using ${VERSION}"
           else
-            CURRENT=$(cat VERSION | tr -d '[:space:]')
             MAJOR=$(echo "$CURRENT" | cut -d. -f1)
             MINOR=$(echo "$CURRENT" | cut -d. -f2)
             PATCH=$(echo "$CURRENT" | cut -d. -f3)
@@ -101,18 +108,35 @@ spec:
         args:
           - |
             set -eu
+            IMAGE="ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}"
             test "$(tr -d '[:space:]' < /app/VERSION)" = "{{inputs.parameters.version}}"
+            printf '%s\n' "$IMAGE" > /tmp/verified-image
+      outputs:
+        parameters:
+          - name: verified-image
+            valueFrom:
+              path: /tmp/verified-image
     - name: promote
       inputs:
         parameters:
           - name: version
+          - name: verified-image
+      retryStrategy:
+        limit: "2"
+        retryPolicy: Always
+        backoff:
+          duration: 5s
+          factor: "2"
       script:
         image: alpine/git:v2.54.0
         command: [sh]
         source: |
           set -eu
           VERSION="{{inputs.parameters.version}}"
+          VERIFIED_IMAGE="{{inputs.parameters.verified-image}}"
+          IMAGE="ronaldraygun/git-activity-exporter:${VERSION}"
           printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          test "$VERIFIED_IMAGE" = "$IMAGE"
           git clone --branch main --depth 1 \
             "https://git.ardenone.com/jedarden/declarative-config.git" \
             /tmp/declarative-config
@@ -130,6 +154,12 @@ spec:
             "^[[:space:]]+image: ronaldraygun/git-activity-exporter:${VERSION}[[:space:]]*$" \
             "$MANIFEST"
           git add "$MANIFEST"
+          if git diff --cached --quiet; then
+            git rev-parse HEAD > /tmp/gitops-revision
+            echo "GitOps already references ${VERSION}"
+            exit 0
+          fi
+          test "$(git diff --cached --name-only)" = "$MANIFEST"
           git diff --cached --check
           git config user.email "github@jedarden.com"
           git config user.name "Argo Workflows CI"
@@ -161,6 +191,12 @@ spec:
       inputs:
         parameters:
           - name: version
+      retryStrategy:
+        limit: "2"
+        retryPolicy: Always
+        backoff:
+          duration: 5s
+          factor: "2"
       container:
         image: gcr.io/kaniko-project/executor:v1.23.2
         args:

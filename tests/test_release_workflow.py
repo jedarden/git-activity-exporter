@@ -36,6 +36,12 @@ def _workflow() -> dict:
     return _manifest(WORKFLOW_RELATIVE, "git-activity-exporter-workflow.yml")
 
 
+def _fixture_workflow() -> dict:
+    return yaml.safe_load(
+        (FIXTURES / "git-activity-exporter-workflow.yml").read_text()
+    )
+
+
 def _sensor() -> dict:
     return _manifest(SENSOR_RELATIVE, "git-activity-exporter-sensor.yml")
 
@@ -122,7 +128,7 @@ def _run_resolve_version(
 ) -> str:
     """Run the WorkflowTemplate's resolver against a local bare Git repo."""
     script = _templates(workflow)["resolve-version"]["script"]["source"]
-    checkout = root / "resolve-checkout"
+    checkout = root / f"resolve-checkout-{expected_version_path.name}"
     clone_pattern = re.compile(
         r'git clone --branch \{\{workflow\.parameters\.branch\}\} \\\n'
         r'\s+"https://git\.ardenone\.com/\{\{workflow\.parameters\.git-repo\}\}\.git" \\\n'
@@ -171,11 +177,17 @@ def _gitops_repository(root: Path) -> Path:
 
 
 def _run_promotion(
-    workflow: dict, root: Path, gitops_origin: Path, version: str
+    workflow: dict,
+    root: Path,
+    gitops_origin: Path,
+    version: str,
+    *,
+    attempt: str = "first",
+    verified_image: str | None = None,
 ) -> tuple[str, str]:
     """Run the promotion script locally and return its revision and image."""
     script = _templates(workflow)["promote"]["script"]["source"]
-    checkout = root / "gitops-checkout"
+    checkout = root / f"gitops-checkout-{attempt}"
     clone_pattern = re.compile(
         r'git clone --branch main --depth 1 \\\n'
         r'\s+"https://git\.ardenone\.com/jedarden/declarative-config\.git" \\\n'
@@ -192,7 +204,13 @@ def _run_promotion(
     script = script.replace(
         'VERSION="{{inputs.parameters.version}}"', f'VERSION="{version}"'
     )
-    revision_path = root / "gitops-revision"
+    expected_image = f"ronaldraygun/git-activity-exporter:{version}"
+    if 'VERIFIED_IMAGE="{{inputs.parameters.verified-image}}"' in script:
+        script = script.replace(
+            'VERIFIED_IMAGE="{{inputs.parameters.verified-image}}"',
+            f'VERIFIED_IMAGE="{verified_image or expected_image}"',
+        )
+    revision_path = root / f"gitops-revision-{attempt}"
     script = script.replace("/tmp/gitops-revision", str(revision_path))
     result = subprocess.run(
         ["sh", "-c", script],
@@ -218,6 +236,46 @@ def _run_promotion(
     )
     assert image, promoted_manifest
     return revision, image.group(1)
+
+
+def _run_promotion_expect_failure(
+    workflow: dict,
+    root: Path,
+    gitops_origin: Path,
+    version: str,
+    verified_image: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run promotion with an intentionally unverified image reference."""
+    script = _templates(workflow)["promote"]["script"]["source"]
+    checkout = root / "gitops-checkout-unverified"
+    clone_pattern = re.compile(
+        r'git clone --branch main --depth 1 \\\n'
+        r'\s+"https://git\.ardenone\.com/jedarden/declarative-config\.git" \\\n'
+        r'\s+/tmp/declarative-config'
+    )
+    script, replacements = clone_pattern.subn(
+        "git clone --branch main --depth 1 "
+        f"{shlex.quote(str(gitops_origin))} {shlex.quote(str(checkout))}",
+        script,
+        count=1,
+    )
+    assert replacements == 1, script
+    script = script.replace("/tmp/declarative-config", str(checkout))
+    script = script.replace(
+        'VERSION="{{inputs.parameters.version}}"', f'VERSION="{version}"'
+    )
+    script = script.replace(
+        'VERIFIED_IMAGE="{{inputs.parameters.verified-image}}"',
+        f'VERIFIED_IMAGE="{verified_image}"',
+    )
+    return subprocess.run(
+        ["sh", "-c", script],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
 
 
 def test_failed_tests_cannot_reach_the_version_bump():
@@ -292,6 +350,159 @@ def test_resolved_version_drives_both_embedded_version_and_image_tag():
     )
     assert "echo \"$VERSION\" > /tmp/version" in templates["resolve-version"]["script"]["source"]
     assert "COPY VERSION ." in (ROOT / "Dockerfile").read_text()
+
+
+def test_partial_release_retries_keep_the_resolved_version_and_verification_gate():
+    workflow = _fixture_workflow()
+    templates = _templates(workflow)
+    build_steps = templates["build"]["steps"]
+
+    assert [group[0]["name"] for group in build_steps] == [
+        "test",
+        "resolve-version",
+        "docker-build",
+        "smoke",
+        "promote",
+        "verify-rollout",
+    ]
+    assert build_steps[2][0]["arguments"]["parameters"][0]["value"] == (
+        "{{steps.resolve-version.outputs.parameters.version}}"
+    )
+    assert build_steps[4][0]["arguments"]["parameters"][0]["value"] == (
+        "{{steps.resolve-version.outputs.parameters.version}}"
+    )
+    assert build_steps[4][0]["arguments"]["parameters"][1]["value"] == (
+        "{{steps.smoke.outputs.parameters.verified-image}}"
+    )
+
+    for name in ("docker-build", "promote"):
+        retry = templates[name]["retryStrategy"]
+        assert retry["retryPolicy"] == "Always"
+        assert retry["limit"] == "2"
+
+    smoke = templates["smoke"]
+    assert smoke["outputs"]["parameters"][0]["name"] == "verified-image"
+    assert 'printf \'%s\\n\' "$IMAGE" > /tmp/verified-image' in smoke[
+        "container"
+    ]["args"][0]
+
+    promote = templates["promote"]
+    promote_source = promote["script"]["source"]
+    assert 'test "$VERIFIED_IMAGE" = "$IMAGE"' in promote_source
+    assert "git diff --cached --quiet" in promote_source
+    assert 'git rev-parse HEAD > /tmp/gitops-revision' in promote_source
+
+
+def test_resolver_reuses_an_auto_bump_on_retry_without_a_duplicate_commit(tmp_path):
+    workflow = _fixture_workflow()
+    application_origin = _application_origin(tmp_path, explicit_version_change=False)
+
+    first = _run_resolve_version(
+        workflow, tmp_path, application_origin, tmp_path / "first-version"
+    )
+    second = _run_resolve_version(
+        workflow, tmp_path, application_origin, tmp_path / "second-version"
+    )
+
+    assert first == second == "1.2.4"
+    commits = _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "log",
+        "--format=%s",
+        "main",
+    ).splitlines()
+    assert commits.count("ci: auto-bump version to 1.2.4") == 1
+
+
+def test_promotion_retry_reuses_existing_gitops_revision(tmp_path):
+    workflow = _fixture_workflow()
+    gitops_origin = _gitops_repository(tmp_path)
+
+    first_revision, first_image = _run_promotion(
+        workflow, tmp_path, gitops_origin, "1.2.4", attempt="promotion-first"
+    )
+    retry_revision, retry_image = _run_promotion(
+        workflow, tmp_path, gitops_origin, "1.2.4", attempt="promotion-retry"
+    )
+
+    assert retry_revision == first_revision
+    assert retry_image == first_image == (
+        "ronaldraygun/git-activity-exporter:1.2.4"
+    )
+    assert _git(
+        tmp_path,
+        "--git-dir",
+        str(gitops_origin),
+        "log",
+        "--format=%s",
+        "main",
+    ).splitlines().count("ci(git-activity-exporter): promote image to 1.2.4") == 1
+
+
+def test_gitops_promotion_failure_can_retry_the_same_verified_release(tmp_path):
+    workflow = _fixture_workflow()
+    gitops_origin = _gitops_repository(tmp_path)
+
+    with pytest.raises(AssertionError):
+        _run_promotion(
+            workflow,
+            tmp_path,
+            tmp_path / "temporarily-unavailable.git",
+            "1.2.4",
+            attempt="promotion-failed",
+        )
+
+    revision, image = _run_promotion(
+        workflow,
+        tmp_path,
+        gitops_origin,
+        "1.2.4",
+        attempt="promotion-retry-after-push-failure",
+    )
+
+    assert image == "ronaldraygun/git-activity-exporter:1.2.4"
+    assert revision == _git(
+        tmp_path, "--git-dir", str(gitops_origin), "rev-parse", "main"
+    )
+
+
+def test_promotion_rejects_an_unverified_image(tmp_path):
+    workflow = _fixture_workflow()
+    gitops_origin = _gitops_repository(tmp_path)
+
+    result = _run_promotion_expect_failure(
+        workflow,
+        tmp_path,
+        gitops_origin,
+        "1.2.4",
+        "ronaldraygun/git-activity-exporter:1.2.3",
+    )
+
+    assert result.returncode != 0
+    assert "git-activity-exporter:1.2.4" not in _git(
+        tmp_path,
+        "--git-dir",
+        str(gitops_origin),
+        "show",
+        "main:k8s/ardenone-cluster/git-activity-exporter/deployment.yml",
+    )
+
+
+def test_partial_release_recovery_is_documented():
+    deployment = (ROOT / "docs" / "notes" / "deployment.md").read_text()
+    _, _, recovery = deployment.partition("## Recovery after a partial release")
+    assert recovery, "deployment.md lost the partial-release recovery section"
+    recovery = " ".join(recovery.split())
+    for phrase in (
+        "reuses that version instead of creating a second auto-bump commit",
+        "Retry `promote`",
+        "Promotion fails closed",
+        "does not create a duplicate commit",
+        "A successful promotion is still not a completed release",
+    ):
+        assert phrase in recovery, f"release recovery contract missing: {phrase}"
 
 
 @pytest.mark.parametrize(

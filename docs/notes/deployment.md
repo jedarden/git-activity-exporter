@@ -46,7 +46,8 @@ image's embedded version comes from the `VERSION` file copied from the build
 context. Because an automatic bump is pushed before the Kaniko step, the
 source version and image tag agree. The workflow serializes releases with the
 `git-activity-exporter-release` mutex so version write-back and promotion do
-not race one another.
+not race one another. The resolved version is a workflow output passed to every
+later stage; retries do not recalculate it.
 
 ## Self-hosting smoke profile
 
@@ -130,6 +131,42 @@ workflow step applies, patches, restarts, or rolls back a live resource, and
 the image remains pinned to `ronaldraygun/git-activity-exporter:<version>`.
 The repository-owned verification helper below remains the detailed release
 check for the live probes and successful publication.
+
+## Recovery after a partial release
+
+The release has two durable recovery anchors: the `VERSION` commit in the
+application repository and the semver image tag in the registry. The resolved
+version is captured once by `resolve-version` and is passed unchanged to the
+image build, smoke check, promotion, and rollout verification steps.
+
+If `VERSION` was pushed but the image build or registry push failed:
+
+1. Retry the failed `docker-build` step (or retry the workflow while it is
+   still holding the release mutex). Do not edit or increment `VERSION`.
+2. The resolver recognizes the existing `ci: auto-bump version to <version>`
+   commit when it is re-entered, and reuses that version instead of creating a
+   second auto-bump commit. An explicit `VERSION` commit is likewise reused.
+3. The retry builds and pushes the same `:<version>` tag. Promotion remains
+   unreachable until the image smoke check succeeds.
+
+If the image was pushed and smoke-verified but GitOps promotion failed:
+
+1. Retry `promote`; do not start another version bump or build a different
+   image. Promotion receives both the resolved version and the smoke step's
+   exact verified image reference.
+2. Promotion fails closed unless those references are exactly
+   `ronaldraygun/git-activity-exporter:<version>`. A registry tag existing by
+   itself is not verification.
+3. If the earlier push actually reached `declarative-config` but the workflow
+   lost the result, the retry sees that the manifest already names the version,
+   reuses the existing GitOps `HEAD`, and does not create a duplicate commit.
+
+An image build or push failure never gets promoted, and a smoke failure never
+gets promoted. A successful promotion is still not a completed release until
+`verify-rollout` confirms the exact GitOps revision and image are reconciled by
+ArgoCD. Use the workflow's retry/resume operation so these outputs and gates
+remain attached to the same release attempt; do not manually promote an image
+that skipped smoke verification.
 
 ## Runtime packaging and inputs
 
