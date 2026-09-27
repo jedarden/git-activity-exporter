@@ -67,6 +67,12 @@ def test_endpoint_status_and_payload_contract(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": None,
         "last_cycle_outcome": None,
+        "prune": {
+            "last_outcome": None,
+            "failures_total": 0,
+            "consecutive_failures": 0,
+            "last_failure_cycle_id": None,
+        },
     }
 
     main._published.set()
@@ -83,6 +89,12 @@ def test_health_reports_last_success_and_current_outcome(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": "2026-09-27T12:00:00Z",
         "last_cycle_outcome": "published",
+        "prune": {
+            "last_outcome": None,
+            "failures_total": 0,
+            "consecutive_failures": 0,
+            "last_failure_cycle_id": None,
+        },
     }
 
     main._record_cycle_outcome("withheld")
@@ -91,6 +103,12 @@ def test_health_reports_last_success_and_current_outcome(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": "2026-09-27T12:00:00Z",
         "last_cycle_outcome": "withheld",
+        "prune": {
+            "last_outcome": None,
+            "failures_total": 0,
+            "consecutive_failures": 0,
+            "last_failure_cycle_id": None,
+        },
     }
 
     main._record_cycle_outcome("failed")
@@ -99,6 +117,12 @@ def test_health_reports_last_success_and_current_outcome(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": "2026-09-27T12:00:00Z",
         "last_cycle_outcome": "failed",
+        "prune": {
+            "last_outcome": None,
+            "failures_total": 0,
+            "consecutive_failures": 0,
+            "last_failure_cycle_id": None,
+        },
     }
 
 

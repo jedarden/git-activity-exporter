@@ -47,7 +47,16 @@ commit:
 5. **Prune.** The committed cycle and the newest two others are kept
    (three cycles ≈ three poll intervals of grace for a reader that resolved
    the previous pointer); older prefixes are deleted, best-effort. "Newest"
-   means the cycle ID order defined below, not S3 modification time.
+   means the cycle ID order defined below, not S3 modification time. A
+   discovery/listing failure or a cycle-prefix deletion failure emits a
+   `WARNING` with the committed cycle, the affected cycle when known, and the
+   exception; the old prefix is left for a later cycle. These failures never
+   turn a committed publication into a failed cycle. `/health` reports
+   `prune.last_outcome`, the process-lifetime `prune.failures_total`, and
+   consecutive failed prune attempts in `prune.consecutive_failures`;
+   operators should alert on a non-zero consecutive count and use the
+   warning's cycle IDs to investigate. The immutable cycle's `meta.json` does
+   not repeat this post-commit status.
 
 **Consumers should read pointer-first:** GET `current.json`, then the
 objects its `objects` mapping names, resolving keys against the prefix the

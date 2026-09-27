@@ -30,6 +30,7 @@ def _reset_cycle_state():
     with _cycle_state_lock:
         _last_successful_cycle_at = None
         _last_cycle_outcome = None
+    publish.reset_prune_health()
 
 
 def _record_cycle_outcome(outcome: str, successful_cycle_at: Optional[str] = None):
@@ -47,10 +48,12 @@ def _record_cycle_outcome(outcome: str, successful_cycle_at: Optional[str] = Non
 
 def _health_snapshot():
     with _cycle_state_lock:
-        return {
+        snapshot = {
             "last_successful_cycle_at": _last_successful_cycle_at,
             "last_cycle_outcome": _last_cycle_outcome,
         }
+    snapshot["prune"] = publish.prune_health()
+    return snapshot
 
 
 class _HealthHandler(BaseHTTPRequestHandler):

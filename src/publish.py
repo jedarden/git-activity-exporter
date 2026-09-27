@@ -33,9 +33,10 @@ The protocol turns the single-object primitive into a whole-cycle commit:
      re-raises: after a failed cycle, the pointer and the fixed keys must
      not name different cycles.
   6. Prune: keep the committed cycle plus the newest RETAINED_CYCLES-1
-     cycle prefixes, delete the rest. Deletion failures are logged, never
-     fatal -- a leftover old cycle costs a few MiB, a failed publication
-     costs the protocol.
+     cycle prefixes, delete the rest. Discovery and deletion failures are
+     logged with the committed and failed cycle IDs, recorded in process-local
+     health state, and never fatal -- a leftover old cycle costs a few MiB, a
+     failed publication costs the protocol.
 
 Fixed-key consumers keep one residual race the pointer removes: a reader
 landing between step 4's PUTs can interleave, exactly as it always could.
@@ -48,7 +49,9 @@ Single-writer by deployment: one exporter replica publishes this prefix.
 import json
 import logging
 import re
+import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 
 from . import s3io
@@ -77,6 +80,56 @@ META_NAME = "meta.json"
 
 class PublicationError(RuntimeError):
     """A cycle could not be published; the previous cycle remains live."""
+
+
+@dataclass(frozen=True)
+class PruneReport:
+    """The best-effort cleanup result for one committed cycle."""
+
+    outcome: str
+    failed_cycle_ids: tuple = ()
+
+
+_prune_state_lock = threading.Lock()
+_prune_state = {
+    "last_outcome": None,
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "last_failure_cycle_id": None,
+}
+
+
+def reset_prune_health():
+    """Reset process-local cleanup observability, primarily for test setup."""
+    with _prune_state_lock:
+        _prune_state.update(
+            last_outcome=None,
+            failures_total=0,
+            consecutive_failures=0,
+            last_failure_cycle_id=None,
+        )
+
+
+def prune_health() -> dict:
+    """Return the process-local cleanup state for the health endpoint.
+
+    Pruning happens after the pointer commit, so this state is intentionally
+    process-local rather than part of the immutable cycle metadata.
+    """
+    with _prune_state_lock:
+        return dict(_prune_state)
+
+
+def _record_prune_health(keep: str, report: PruneReport):
+    failed = report.outcome == "failed"
+    with _prune_state_lock:
+        _prune_state["last_outcome"] = report.outcome
+        if failed:
+            _prune_state["failures_total"] += 1
+            _prune_state["consecutive_failures"] += 1
+            _prune_state["last_failure_cycle_id"] = keep
+        else:
+            _prune_state["consecutive_failures"] = 0
 
 
 def _validate_generated_at(generated_at: str) -> None:
@@ -219,7 +272,8 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
             "pointer write failed; fixed keys restored to the previous cycle"
         ) from e
 
-    _prune(s3, bucket, prefix, keep=cycle_id, retention=retention)
+    report = _prune(s3, bucket, prefix, keep=cycle_id, retention=retention)
+    _record_prune_health(cycle_id, report)
     return pointer_key
 
 
@@ -264,13 +318,25 @@ def _prune(s3, bucket: str, prefix: str, keep: str, retention: int):
             reverse=True,
         )
     except Exception:
-        log.warning("could not list cycles; leaving cleanup for the next cycle")
-        return
+        log.warning(
+            "cycle prune discovery failed for keep=%s; cleanup deferred",
+            keep,
+            exc_info=True,
+        )
+        return PruneReport("failed", (keep,))
     doomed = [cid for cid in ids if cid != keep][max(0, retention - 1):]
+    failed = []
     for cid in doomed:
         try:
             for key in s3io.list_keys(s3, bucket, f"{base}{cid}/"):
                 s3io.delete_key(s3, bucket, key)
             log.info("pruned cycle %s", cid)
         except Exception:
-            log.warning("could not prune cycle %s; leaving it for the next cycle", cid)
+            failed.append(cid)
+            log.warning(
+                "cycle prune deletion failed for keep=%s cycle=%s; cleanup deferred",
+                keep,
+                cid,
+                exc_info=True,
+            )
+    return PruneReport("failed" if failed else "succeeded", tuple(failed))

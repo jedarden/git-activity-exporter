@@ -52,7 +52,7 @@ response. Once the server is bound, these are the complete contracts:
 `/health` returns `Content-Type: application/json` with exactly these fields:
 
 ```json
-{"last_successful_cycle_at":"2026-09-27T12:00:00Z","last_cycle_outcome":"published"}
+{"last_successful_cycle_at":"2026-09-27T12:00:00Z","last_cycle_outcome":"published","prune":{"last_outcome":"succeeded","failures_total":0,"consecutive_failures":0,"last_failure_cycle_id":null}}
 ```
 
 Before the first cycle attempt, both values are `null`. `last_successful_cycle_at`
@@ -60,6 +60,18 @@ is the `generated_at` timestamp from the newest cycle whose complete publication
 committed. It remains unchanged when a later cycle is `withheld` or `failed`.
 `last_cycle_outcome` is the most recent attempt: `published`, `withheld` (the
 `MAX_FAILURE_RATE` guard rejected it), or `failed` (another cycle exception).
+The `prune` object is process-local because pruning runs after the pointer
+commit and therefore cannot be added to the immutable cycle's `meta.json`.
+`last_outcome` is `null` before the first committed cycle and then is either
+`succeeded` or `failed`; a failed outcome means cycle discovery or at least one
+cycle-prefix deletion failed, not that publication failed. `failures_total`
+counts failed prune attempts since process start, while
+`consecutive_failures` resets to zero after a fully successful prune. The
+`last_failure_cycle_id` remains the most recent committed cycle whose cleanup
+failed, including after cleanup recovers. A non-zero consecutive count is an
+operator alert signal; the application log contains the affected prefix and
+exception for each failed attempt. A prune failure leaves `/health` at `200`,
+keeps `last_cycle_outcome` at `published`, and does not clear `/ready`.
 The `/ready` response remains empty and has no `Content-Type` header. These are
 exact GET paths; a trailing slash or query string is a different path and
 therefore returns `404`.
@@ -72,7 +84,10 @@ Poll `/health` at least once per `POLL_INTERVAL_SECONDS`. Alert when
 cycle; a cycle that routinely takes as long as the interval is already degraded
 and should page sooner according to the operator's normal cycle-duration
 budget. Use `last_cycle_outcome` to distinguish a `withheld` publication from
-an unexpected `failed` cycle when diagnosing the alert.
+an unexpected `failed` cycle when diagnosing the alert. Separately alert when
+`prune.consecutive_failures` is non-zero for the operator's chosen tolerance;
+this detects an S3 cleanup permission or availability problem even while new
+cycles continue publishing.
 
 ### Readiness transitions
 

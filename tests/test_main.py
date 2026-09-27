@@ -213,6 +213,41 @@ def test_run_cycle_publishes_one_cycle_through_the_pointer(monkeypatch):
     assert set(staged) == {"hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json"}
 
 
+def test_prune_failure_still_reports_a_published_cycle(monkeypatch):
+    cfg = _cycle_cfg()
+    s3 = RecordingS3()
+    _stub_collect(monkeypatch)
+
+    old_cycle = "20260923T000000Z-01234567"
+    s3.objects[f"{cfg.dest_prefix}/cycles/{old_cycle}/leftover"] = (
+        b"orphaned", "application/octet-stream"
+    )
+    real_publish = main.publish.publish_cycle
+
+    def publish_with_one_cycle_retention(*args, **kwargs):
+        kwargs["retention"] = 1
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(main.publish, "publish_cycle", publish_with_one_cycle_retention)
+    s3.fail_when(lambda op, key: RuntimeError("delete boom")
+                 if op == "delete" else None)
+
+    generated_at = main._run_cycle(cfg, s3, {})
+    main._record_cycle_outcome("published", generated_at)
+
+    health = main._health_snapshot()
+    assert health["last_cycle_outcome"] == "published"
+    assert health["last_successful_cycle_at"] == generated_at
+    assert health["prune"] == {
+        "last_outcome": "failed",
+        "failures_total": 1,
+        "consecutive_failures": 1,
+        "last_failure_cycle_id": json.loads(
+            s3.objects[f"{cfg.dest_prefix}/current.json"][0]
+        )["cycle_id"],
+    }
+
+
 def test_publish_failure_marks_the_cycle_failed(monkeypatch):
     """A publication failure must surface as a cycle failure so main()'s
     retry loop treats the cycle as not-published, not as success."""

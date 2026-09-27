@@ -86,6 +86,13 @@ def fixed_keys(s3):
     }
 
 
+@pytest.fixture(autouse=True)
+def reset_prune_health():
+    publish.reset_prune_health()
+    yield
+    publish.reset_prune_health()
+
+
 def assert_pointer_view_is(tag, s3):
     ptr, got = read_via_pointer(s3)
     assert ptr["cycle_id"] == cycle_id(tag)
@@ -389,15 +396,24 @@ def test_prune_uses_valid_id_order_and_ignores_foreign_prefixes():
     assert s3io.list_keys(s3, BUCKET, f"{base}{foreign}/")
 
 
-def test_prune_failure_is_not_fatal():
+def test_prune_failure_is_not_fatal(caplog):
     s3 = FakeS3()
     do_publish(s3, "A")
     do_publish(s3, "B")
     s3.fail_when(lambda op, key: RuntimeError("delete boom")
                  if op == "delete" else None)
-    do_publish(s3, "C")
+    with caplog.at_level("WARNING", logger=publish.__name__):
+        do_publish(s3, "C", retention=2)
     assert_pointer_view_is("C", s3)
     assert fixed_keys(s3) == {name: data for name, data, _ in payloads("C")}
+    assert publish.prune_health() == {
+        "last_outcome": "failed",
+        "failures_total": 1,
+        "consecutive_failures": 1,
+        "last_failure_cycle_id": cycle_id("C"),
+    }
+    assert [record for record in caplog.records
+            if "cycle prune deletion failed" in record.getMessage()]
     s3.fail_when(None)
     assert s3io.list_prefixes(s3, BUCKET, f"{PREFIX}/cycles/") == [
         f"{PREFIX}/cycles/{cycle_id(tag)}/" for tag in ("A", "B", "C")
@@ -414,10 +430,40 @@ def test_prune_listing_failure_is_not_fatal():
 
     assert_pointer_view_is("B", s3)
     assert fixed_keys(s3) == {name: data for name, data, _ in payloads("B")}
+    assert publish.prune_health() == {
+        "last_outcome": "failed",
+        "failures_total": 1,
+        "consecutive_failures": 1,
+        "last_failure_cycle_id": cycle_id("B"),
+    }
     s3.fail_when(None)
     assert s3io.list_prefixes(s3, BUCKET, f"{PREFIX}/cycles/") == [
         f"{PREFIX}/cycles/{cycle_id(tag)}/" for tag in ("A", "B")
     ]
+
+
+def test_repeated_prune_failures_are_counted_and_logged(caplog):
+    s3 = FakeS3()
+    for tag in ("A", "B", "C"):
+        do_publish(s3, tag)
+    s3.fail_when(lambda op, key: RuntimeError("delete boom")
+                 if op == "delete" and cycle_id("A") in key else None)
+
+    with caplog.at_level("WARNING", logger=publish.__name__):
+        do_publish(s3, "D")
+        do_publish(s3, "E")
+
+    assert publish.prune_health() == {
+        "last_outcome": "failed",
+        "failures_total": 2,
+        "consecutive_failures": 2,
+        "last_failure_cycle_id": cycle_id("E"),
+    }
+    warnings = [record.getMessage() for record in caplog.records
+                if "cycle prune deletion failed" in record.getMessage()]
+    assert len(warnings) == 2
+    assert cycle_id("D") in warnings[0]
+    assert cycle_id("E") in warnings[1]
 
 
 def test_orphaned_staging_prefix_from_a_failed_cycle_is_swept():
