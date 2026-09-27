@@ -68,7 +68,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: exporter
-          image: ronaldraygun/git-activity-exporter:0.1.48
+          image: ronaldraygun/git-activity-exporter:0.1.49
           imagePullPolicy: IfNotPresent
           ports:
             - name: health
