@@ -69,9 +69,10 @@ The profile makes every reuser-specific input visible:
 - a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.41`).
 
 The repository's release-drift check compares these committed image
-references with `VERSION` and rejects `:latest` references. It runs as part of
-the test gate and can also update the references after an intentional version
-bump:
+references with `VERSION`, rejects mutable `:latest` or untagged references,
+and covers the Dockerfile, release WorkflowTemplate fixture, Kubernetes
+manifests, and examples. It runs as part of the test gate and can also update
+the versioned references after an intentional version bump:
 
 ```bash
 python scripts/check-release-drift.py --write

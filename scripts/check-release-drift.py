@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate versioned self-hosting image references.
+"""Validate versioned release image references.
 
 The release workflow treats VERSION as the source of truth for the published
 image. The self-hosting examples are committed documentation and fixtures, so
-their literal image tags must move with that source version as well.
+their literal image tags must move with that source version as well. Every
+image in the release manifests also needs an explicit non-latest tag or digest.
 """
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ EXPORTER_IMAGE = re.compile(
     r":(?P<tag>[A-Za-z0-9][A-Za-z0-9._-]*)"
 )
 YAML_IMAGE_FIELD = re.compile(r"^\s*image:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+DOCKER_FROM = re.compile(
+    r"^\s*FROM(?:\s+--platform=\S+)?\s+(?P<value>\S+)", re.MULTILINE
+)
+IMAGE_DESTINATION = re.compile(r"--destination=(?P<value>[^\s'\"]+)")
 
 VERSIONED_FILES = (
     Path("examples/self-hosting/compose.yaml"),
@@ -28,8 +33,14 @@ VERSIONED_FILES = (
     Path("docs/notes/deployment.md"),
 )
 LATEST_SCAN_FILES = (
-    *VERSIONED_FILES,
+    Path("docs/self-hosting.md"),
+    Path("docs/notes/deployment.md"),
     Path("scripts/smoke-self-hosting.sh"),
+)
+PINNED_IMAGE_FILES = (
+    Path("Dockerfile"),
+    Path("examples"),
+    Path("tests/fixtures/git-activity-exporter-workflow.yml"),
 )
 TEXT_SUFFIXES = {".md", ".py", ".sh", ".yaml", ".yml"}
 
@@ -112,6 +123,78 @@ def _check_latest_references(root: Path) -> list[str]:
     return errors
 
 
+def _image_value(value: str) -> str:
+    """Resolve the concrete image in a YAML/Compose value when possible."""
+    value = value.split("#", 1)[0].strip().strip("'\"")
+    default = re.search(r":-([^}]+)}", value)
+    if default:
+        return default.group(1)
+    return value
+
+
+def _check_image_reference(
+    relative_path: Path, text: str, position: int, value: str
+) -> str | None:
+    image = _image_value(value)
+    line = _line_number(text, position)
+    if not image or image.startswith("$"):
+        return f"{relative_path}:{line}: image reference {value!r} has no concrete tag"
+
+    name, separator, digest = image.partition("@")
+    last_component = name.rsplit("/", 1)[-1]
+    if ":" not in last_component and not separator:
+        return f"{relative_path}:{line}: image reference {image!r} has no tag"
+
+    tag = last_component.rsplit(":", 1)[1] if ":" in last_component else ""
+    if tag.lower() == "latest":
+        return f"{relative_path}:{line}: image references :latest (mutable tag {image!r})"
+    if separator and not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9+.-]*:[0-9a-fA-F]+", digest
+    ):
+        return f"{relative_path}:{line}: image reference {image!r} has invalid digest"
+    return None
+
+
+def _check_pinned_image_references(root: Path) -> list[str]:
+    errors: list[str] = []
+    discovered: set[Path] = set()
+
+    for relative_path in PINNED_IMAGE_FILES:
+        paths = list(_text_files(root, relative_path))
+        if not paths:
+            errors.append(f"{relative_path}: file or directory is missing")
+            continue
+
+        for discovered_path, path in paths:
+            if discovered_path in discovered:
+                continue
+            discovered.add(discovered_path)
+            text = path.read_text(encoding="utf-8")
+
+            if discovered_path.name == "Dockerfile":
+                references = [
+                    (match.start("value"), match.group("value"))
+                    for match in DOCKER_FROM.finditer(text)
+                ]
+            else:
+                references = [
+                    (match.start("value"), match.group("value"))
+                    for match in YAML_IMAGE_FIELD.finditer(text)
+                ]
+                references.extend(
+                    (match.start("value"), match.group("value"))
+                    for match in IMAGE_DESTINATION.finditer(text)
+                )
+
+            for position, value in references:
+                error = _check_image_reference(
+                    discovered_path, text, position, value
+                )
+                if error:
+                    errors.append(error)
+    return errors
+
+
 def _rewrite_versioned_files(root: Path, version: str) -> list[Path]:
     changed: list[Path] = []
     for relative_path in VERSIONED_FILES:
@@ -146,9 +229,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         version = _read_version(root)
+        image_errors = _check_pinned_image_references(root)
         latest_errors = _check_latest_references(root)
-        if latest_errors:
-            for error in latest_errors:
+        if image_errors or latest_errors:
+            for error in (*image_errors, *latest_errors):
                 print(f"ERROR: {error}", file=sys.stderr)
             return 1
 
@@ -167,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
-    print(f"self-hosting release references match VERSION {version}")
+    print(f"release image references match VERSION {version}")
     return 0
 
 

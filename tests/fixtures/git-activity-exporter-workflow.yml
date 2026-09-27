@@ -41,14 +41,18 @@ spec:
                 - name: gitops-revision
                   value: "{{steps.promote.outputs.parameters.gitops-revision}}"
     - name: test
-      retryStrategy:
-        retryPolicy: OnError
       script:
+        image: python:3.12.11-slim
+        command: [sh]
         source: |
           set -e
           python -m pytest tests/ -q
+      retryStrategy:
+        retryPolicy: OnError
     - name: resolve-version
       script:
+        image: alpine/git:v2.54.0
+        command: [sh]
         source: |
           set -e
           git config user.name "Argo Workflows CI"
@@ -65,6 +69,8 @@ spec:
         parameters:
           - name: version
       script:
+        image: alpine/git:v2.54.0
+        command: [sh]
         source: |
           set -eu
           VERSION="{{inputs.parameters.version}}"
@@ -87,6 +93,8 @@ spec:
           - name: version
           - name: gitops-revision
       script:
+        image: alpine/k8s:1.37.0
+        command: [sh]
         source: |
           set -eu
           printf '%s\n' "{{inputs.parameters.version}}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
@@ -98,6 +106,7 @@ spec:
         parameters:
           - name: version
       container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
         args:
           - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}
           - --destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}

@@ -35,6 +35,40 @@ def _sensor() -> dict:
     return _manifest(SENSOR_RELATIVE, "git-activity-exporter-sensor.yml")
 
 
+def _deployment_resources() -> list[dict]:
+    sibling = ROOT.parent / "declarative-config" / (
+        "k8s/ardenone-cluster/git-activity-exporter/deployment.yml"
+    )
+    path = (
+        sibling
+        if sibling.is_file()
+        else ROOT / "examples" / "self-hosting" / "kubernetes.yaml"
+    )
+    return [resource for resource in yaml.safe_load_all(path.read_text()) if resource]
+
+
+def _image_fields(value):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "image" and isinstance(nested, str):
+                yield nested
+            yield from _image_fields(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _image_fields(nested)
+
+
+def _assert_explicit_image_pin(image: str) -> None:
+    image_without_digest, separator, digest = image.partition("@")
+    if separator:
+        assert digest.startswith("sha256:"), image
+        assert digest.removeprefix("sha256:"), image
+        return
+    last_component = image_without_digest.rsplit("/", 1)[-1]
+    assert ":" in last_component, f"image has no tag: {image}"
+    assert last_component.rsplit(":", 1)[1].lower() != "latest", image
+
+
 def _templates(workflow: dict) -> dict[str, dict]:
     return {template["name"]: template for template in workflow["spec"]["templates"]}
 
@@ -111,6 +145,20 @@ def test_resolved_version_drives_both_embedded_version_and_image_tag():
     )
     assert "echo \"$VERSION\" > /tmp/version" in templates["resolve-version"]["script"]["source"]
     assert "COPY VERSION ." in (ROOT / "Dockerfile").read_text()
+
+
+def test_release_workflow_and_kubernetes_manifests_use_explicit_image_pins():
+    workflow_images = list(_image_fields(_workflow()))
+    deployment_images = [
+        image
+        for resource in _deployment_resources()
+        for image in _image_fields(resource)
+    ]
+
+    assert workflow_images
+    assert deployment_images
+    for image in (*workflow_images, *deployment_images):
+        _assert_explicit_image_pin(image)
 
 
 def test_ci_writeback_author_is_excluded_from_build_trigger():
