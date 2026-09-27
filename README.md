@@ -86,6 +86,9 @@ rules for `/health` and `/ready`. Treat the committed defaults and
 `FORGE_OWNER`, and your own family mapping in addition to the required
 `FORGE_TOKEN` and `DEST_S3_*` credentials.
 
+The [deployment and release workflow](docs/notes/deployment.md) documents the
+Argo build, image versioning, runtime inputs, PVC, probes, and GitOps handoff.
+
 ## Development
 
 ```bash
