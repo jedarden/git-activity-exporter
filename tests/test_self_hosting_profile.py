@@ -25,7 +25,7 @@ def test_self_hosting_profile_is_opt_in_and_non_author_specific():
     compose = yaml.safe_load((PROFILE / "compose.yaml").read_text())
     services = compose["services"]
     assert services["exporter"]["profiles"] == ["self-hosting"]
-    assert services["exporter"]["image"].endswith(":0.1.28}")
+    assert services["exporter"]["image"].endswith(":0.1.29}")
     assert ":latest" not in services["exporter"]["image"]
     assert services["exporter"]["environment"] == {
         "FORGE_BASE_URL": "http://forgejo-fixture:8081",

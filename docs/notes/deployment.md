@@ -62,7 +62,7 @@ The profile makes every reuser-specific input visible:
   in the fixture only;
 - a single-writer mirror volume (`self-hosting-mirrors` in Compose and a
   `ReadWriteOnce` 20Gi PVC in Kubernetes); and
-- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.28`).
+- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.29`).
 
 Run the smoke profile from the repository root:
 
