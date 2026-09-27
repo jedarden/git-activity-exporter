@@ -111,13 +111,49 @@ whole cycle — whichever cycle it saw — even while a publication is in
 flight. Do not cache pointer-resolved URLs across polls: pruning will
 eventually delete the cycle they name.
 
-The fixed keys remain for consumers that have not moved to the pointer
-(the static panel reads `hourly.parquet` + `meta.json` directly). They
-carry the pre-protocol ordering and are reconciled from the pointer after a
-restart; a reader landing between the mirror's PUTs can still interleave,
-exactly as it always could. `meta.json`'s `cycle_id` vs `current.json`'s
-tells such a reader it crossed a publication boundary. The pointer is the
-migration target.
+### Legacy fixed-key read consistency
+
+The fixed keys remain for consumers that have not moved to the pointer (the
+static panel reads `hourly.parquet` + `meta.json` directly), but they are not
+an atomic read surface. A legacy consumer must treat a fixed-key read as a
+candidate snapshot and validate it against the pointer before returning any
+of its bytes. The required read attempt is:
+
+1. GET and validate `current.json`; retain its `cycle_id`, `generated_at`, and
+   `objects` mapping as the attempt's expected identity. A missing, malformed,
+   unsupported, or incomplete pointer rejects the attempt; fixed keys cannot
+   recover an absent authority.
+2. GET all four root fixed keys without mixing values from another attempt.
+   Missing keys or a read error rejects the attempt.
+3. Parse root `meta.json` and require both `cycle_id` and `generated_at` to
+   equal the pointer. A difference is a publication-boundary mismatch, not a
+   signal to choose the older or newer fixed keys.
+4. GET the four immutable objects named by the pointer and require each root
+   fixed-key body to be byte-for-byte equal to its named immutable body. This
+   catches the data-before-`meta.json` window where the root marker can still
+   name the old cycle even though one or more data keys already contain the
+   new cycle.
+5. GET `current.json` again and require the validated pointer identity to be
+   unchanged. If the pointer changed while the fixed keys were read, discard
+   the entire candidate and start again.
+
+On any mismatch, missing object, transient read error, or pointer change, the
+consumer discards every value from that attempt and retries the complete
+sequence at most three times, with a short increasing delay (100 ms, then
+250 ms). It must never merge keys from attempts or fall back to an unvalidated
+fixed-key snapshot. If the third attempt fails, the read is rejected with no
+data returned (for example, `legacy_snapshot_inconsistent`), and the consumer
+emits a diagnostic containing the prefix, attempt count, pointer cycle before
+and after the read, root `meta.json` cycle, and the missing/mismatched key
+names. The next poll may retry; persistent rejection is an operational
+incident, not a reason to guess a cycle.
+
+This validation makes a mixed fixed-key snapshot unservable as one cycle even
+though a reader can land between the mirror PUTs. The publisher, not the
+consumer, repairs the root keys: on the next publication or restart it
+reconciles every fixed key from the immutable cycle named by `current.json`,
+writing `meta.json` last. The pointer-resolved path remains the migration
+target and the simpler read path.
 
 ## Output schema-version compatibility
 
@@ -603,12 +639,17 @@ coverage changes.
 
 ### Consumer caveats
 
-- **Read pointer-first.** On the fixed legacy keys, compare `cycle_id` with
-  `current.json`'s: a mismatch means the read crossed a publication
-  boundary, and the four fixed keys may interleave two cycles.
+- **Read pointer-first.** A fixed-key reader must run the complete
+  [legacy fixed-key read consistency](#legacy-fixed-key-read-consistency)
+  sequence: compare both metadata identity fields, compare every fixed body
+  with the pointer-named immutable object, and re-read the pointer. Any
+  mismatch is discarded and retried; exhausted retries reject the snapshot
+  rather than returning a mix of cycles.
 - **`meta.json` is the fixed keys' completion marker.** The mirror writes
   it last (publish.py `_meta_last`), so a fixed-key reader that sees a new
   `generated_at` knows the other three fixed keys were already replaced.
+  This marker comparison is necessary but not sufficient: the immutable-body
+  comparison also catches a new data key paired with the old root marker.
 - **`repo_errors` is prose, not an interface.** Reasons are truncated and
   formatted for humans; match repos on `repos_failed`, never on the shape
   of an error string.

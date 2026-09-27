@@ -90,6 +90,97 @@ def fixed_keys(s3):
     }
 
 
+class LegacySnapshotRejected(RuntimeError):
+    """The legacy fixed-key reader could not prove a whole-cycle snapshot."""
+
+
+def read_legacy_fixed_snapshot(s3, max_attempts=3):
+    """Model the documented legacy consumer read contract.
+
+    The root objects are only returned after they match both the pointer's
+    metadata and every immutable object named by that pointer. This catches
+    the data-before-meta window that a cycle-id-only check cannot see.
+    """
+    names = ("hourly.parquet", "commits.parquet", "bead_events.parquet", "meta.json")
+    diagnostics = []
+    pointer_key = f"{PREFIX}/current.json"
+
+    for attempt in range(1, max_attempts + 1):
+        pointer_cycle = None
+        pointer_after_cycle = None
+        meta_cycle = None
+        try:
+            pointer_raw = s3io.download_bytes(s3, BUCKET, pointer_key)
+            if pointer_raw is None:
+                raise LegacySnapshotRejected("current.json is missing")
+            pointer = json.loads(pointer_raw)
+            publish.validate_pointer_document(pointer)
+            pointer_cycle = pointer["cycle_id"]
+
+            fixed = {
+                name: s3io.download_bytes(s3, BUCKET, f"{PREFIX}/{name}")
+                for name in names
+            }
+            missing = [name for name, body in fixed.items() if body is None]
+            if missing:
+                raise LegacySnapshotRejected(f"missing fixed keys: {missing}")
+
+            meta = json.loads(fixed["meta.json"])
+            meta_cycle = meta.get("cycle_id")
+            reasons = []
+            if (
+                meta.get("cycle_id") != pointer["cycle_id"]
+                or meta.get("generated_at") != pointer["generated_at"]
+            ):
+                reasons.append(
+                    "meta cycle "
+                    f"{meta.get('cycle_id')} != pointer cycle {pointer['cycle_id']}"
+                )
+
+            mismatched = []
+            for name in names:
+                immutable = s3io.download_bytes(
+                    s3, BUCKET, f"{PREFIX}/{pointer['objects'][name]}"
+                )
+                if immutable is None or fixed[name] != immutable:
+                    mismatched.append(name)
+            if mismatched:
+                reasons.append(
+                    f"fixed-key mismatch for pointer cycle {pointer['cycle_id']}: {mismatched}"
+                )
+
+            pointer_after = s3io.download_bytes(s3, BUCKET, pointer_key)
+            if pointer_after != pointer_raw:
+                try:
+                    pointer_after_cycle = json.loads(pointer_after).get("cycle_id")
+                except (AttributeError, TypeError, ValueError):
+                    pointer_after_cycle = None
+                reasons.append(
+                    "current.json changed during the read: "
+                    f"before {pointer_cycle}, after {pointer_after_cycle}"
+                )
+
+            if reasons:
+                raise LegacySnapshotRejected("; ".join(reasons))
+            return fixed
+        except (
+            LegacySnapshotRejected,
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            publish.PublicationError,
+            s3io.S3OperationError,
+        ) as error:
+            diagnostics.append(
+                f"prefix={PREFIX} attempt={attempt} "
+                f"pointer_before={pointer_cycle} pointer_after={pointer_after_cycle} "
+                f"meta_cycle={meta_cycle}: {error}"
+            )
+
+    raise LegacySnapshotRejected("; ".join(diagnostics))
+
+
 @pytest.fixture(autouse=True)
 def reset_prune_health():
     publish.reset_prune_health()
@@ -348,6 +439,44 @@ def test_pointer_meta_mismatch_is_not_used_as_rollback_source():
 
     assert_pointer_view_is("B", s3)
     assert s3.objects[meta_key][0] == replacement_meta
+
+
+def test_legacy_fixed_reader_accepts_only_a_complete_pointer_cycle():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+
+    assert read_legacy_fixed_snapshot(s3) == fixed_keys(s3)
+
+
+@pytest.mark.parametrize("mixed_state", ("new-data-old-meta", "old-data-new-meta"))
+def test_legacy_fixed_reader_never_accepts_a_mixed_snapshot(mixed_state):
+    """A marker comparison alone must not make a mixed root look complete."""
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    fixed_a = fixed_keys(s3)
+    pointer_a = s3.objects[f"{PREFIX}/current.json"]
+
+    do_publish(s3, "B")
+    fixed_b = fixed_keys(s3)
+    # The immutable A cycle remains available and current.json is restored to
+    # the authority a legacy reader observed before B's mirror began.
+    s3.objects[f"{PREFIX}/current.json"] = pointer_a
+
+    if mixed_state == "new-data-old-meta":
+        mixed = dict(fixed_b)
+        mixed["meta.json"] = fixed_a["meta.json"]
+    else:
+        mixed = dict(fixed_a)
+        mixed["meta.json"] = fixed_b["meta.json"]
+    for name, body in mixed.items():
+        key = f"{PREFIX}/{name}"
+        s3.objects[key] = (body, s3.objects[key][1])
+
+    with pytest.raises(LegacySnapshotRejected, match="fixed-key mismatch|meta cycle") as error:
+        read_legacy_fixed_snapshot(s3)
+
+    assert "attempt=3" in str(error.value)
+    assert cycle_id("A") in str(error.value)
 
 
 def test_cycle_id_format_names_generated_at(monkeypatch):

@@ -26,9 +26,9 @@ On restart, fixed keys are reconciled from the cycle named by `current.json`
 before the next cycle is staged, so an interrupted mirror is recoverable. The
 exporter implementation and its publication failure-path tests cover this
 protocol. Consumers should resolve `current.json` first;
-legacy fixed-key reads can cross a write boundary and must compare their
-`meta.json` `cycle_id` with the pointer. The protocol and its failure
-semantics are specified in
+legacy fixed-key reads must validate the complete root mirror against the
+pointer-named cycle, retry mismatches, and reject an exhausted or mixed read.
+The protocol and its failure semantics are specified in
 [`docs/notes/output-schema.md`](docs/notes/output-schema.md#publication-protocol).
 
 Column types, nullability, and the join keys the attempt ledger uses against

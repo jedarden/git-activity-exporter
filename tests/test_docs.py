@@ -57,6 +57,20 @@ def test_commit_bulk_contract_is_documented_at_both_surfaces():
         assert phrase in schema, f"commit bulk contract missing from output-schema.md: {phrase}"
 
 
+def test_legacy_fixed_key_consistency_contract_is_documented():
+    schema = " ".join(OUTPUT_SCHEMA_MD.read_text().split())
+
+    for phrase in (
+        "validate it against the pointer before returning any of its bytes",
+        "byte-for-byte equal to its named immutable body",
+        "retries the complete sequence at most three times",
+        "discards every value from that attempt",
+        "the read is rejected with no data returned",
+        "data-before-`meta.json` window",
+    ):
+        assert phrase in schema, f"legacy fixed-key consistency contract missing: {phrase}"
+
+
 def test_dest_s3_variables_are_documented():
     # The README tells reusers to bring DEST_S3_* credentials, but the exact
     # variable names exist only as _require/_optional calls in config.py.
