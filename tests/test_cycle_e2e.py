@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 from types import SimpleNamespace
 
@@ -371,6 +372,89 @@ def _lifecycle_repo(name, source, empty=False):
     }
 
 
+def _make_recovery_fixture(tmp_path, monkeypatch):
+    source_root = tmp_path / "recovery-sources"
+    source_root.mkdir()
+    sources = {
+        name: _make_source(
+            source_root / name,
+            "2026-09-23T09:00:00+00:00",
+            f"feat: add {name}",
+            {"README.md": f"{name} fixture\n"},
+        )
+        for name in ["stable-repo", "recover-repo"]
+    }
+    records = [_lifecycle_repo(name, source) for name, source in sources.items()]
+    forge_calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, params=None, timeout=None):
+            params = dict(params or {})
+            forge_calls.append({
+                "url": url,
+                "params": params,
+                "timeout": timeout,
+                "authorization": self.headers.get("Authorization"),
+            })
+            return Response({"data": records})
+
+    monkeypatch.setattr(forge.requests, "Session", Session)
+    # These fixtures clone local file:// repositories. Production Forgejo
+    # enumeration and the clone boundary reject local URLs by policy; the
+    # policy has dedicated tests, while this fixture focuses on recovery I/O.
+    monkeypatch.setattr(forge, "validate_clone_url", lambda *args: None)
+    monkeypatch.setattr(main.gitscan, "validate_clone_url", lambda *args: None)
+    monkeypatch.setattr(main, "_now", lambda: GENERATED_AT)
+
+    clone_root = tmp_path / "recovery-mirrors"
+    _mark_clone_root(clone_root)
+    cfg = SimpleNamespace(
+        forge_base_url="https://forge.fixture",
+        forge_token="fixture-token",
+        forge_owner="fixture-owner",
+        repo_denylist=[],
+        clone_root=str(clone_root),
+        window_days=30,
+        shallow_since_days=30,
+        trim_max_lines=5000,
+        trim_max_files=200,
+        excluded_path_patterns=list(DEFAULT_EXCLUDED_PATHS),
+        bead_bulk_close_threshold=150,
+        bead_bulk_hour_share=0.5,
+        families_file="families.yaml",
+        # One failed cold clone out of this two-repo fixture must withhold.
+        max_failure_rate=0.2,
+        dest=SimpleNamespace(bucket=BUCKET),
+        dest_prefix=PREFIX,
+        version="fixture",
+        git_timeout_seconds=60,
+        http_timeout_seconds=30,
+    )
+    return SimpleNamespace(
+        cfg=cfg,
+        clone_root=clone_root,
+        sources=sources,
+        forge_calls=forge_calls,
+        family_map={
+            "stable-repo": "family-a",
+            "recover-repo": "family-b",
+        },
+    )
+
+
 def _full_page_with(*records):
     filler_source = records[0]["clone_url"]
     filler = [
@@ -603,3 +687,71 @@ def test_mirror_lifecycle_prunes_orphans_and_reclones_an_emptied_repo(tmp_path, 
         "renamed-as-repo",
         "emptied-repo",
     }
+
+
+def test_mirror_volume_recovery_rebuilds_or_withholds_without_replacing_s3(
+    tmp_path, monkeypatch
+):
+    """An empty/damaged cache is rebuildable, but a failed rebuild is fail-closed."""
+    recovery = _make_recovery_fixture(tmp_path, monkeypatch)
+    s3 = FakeS3()
+
+    main._run_cycle(recovery.cfg, s3, recovery.family_map)
+    first_pointer, first_staged, first_fixed = _read_cycle(s3)
+    assert first_staged == first_fixed
+
+    # Losing the PVC contents leaves only its ownership marker. The next
+    # cycle must cold-clone both repositories and publish a complete dataset.
+    for path in recovery.clone_root.iterdir():
+        if path.name != gitscan.CLONE_ROOT_MARKER:
+            shutil.rmtree(path)
+    assert list(recovery.clone_root.iterdir()) == [
+        recovery.clone_root / gitscan.CLONE_ROOT_MARKER
+    ]
+
+    main._run_cycle(recovery.cfg, s3, recovery.family_map)
+    empty_recovery_pointer, empty_recovery_staged, empty_recovery_fixed = _read_cycle(s3)
+    empty_recovery_meta = json.loads(empty_recovery_staged["meta.json"])
+    assert empty_recovery_pointer["cycle_id"] != first_pointer["cycle_id"]
+    assert empty_recovery_staged == empty_recovery_fixed
+    assert empty_recovery_meta["repos_total"] == 2
+    assert empty_recovery_meta["repos_scanned"] == 2
+    assert empty_recovery_meta["repos_failed"] == []
+    assert {row["repo"] for row in _rows(empty_recovery_staged["commits.parquet"])} == {
+        "stable-repo", "recover-repo"
+    }
+    for name, key in first_pointer["objects"].items():
+        assert s3.objects[f"{PREFIX}/{key}"][0] == first_staged[name]
+
+    # A damaged mirror is also rebuilt from Forgejo. Removing HEAD forces the
+    # cold-clone path while leaving the rest of the PVC usable.
+    damaged_mirror = recovery.clone_root / "recover-repo.git"
+    (damaged_mirror / "HEAD").unlink()
+    main._run_cycle(recovery.cfg, s3, recovery.family_map)
+    damaged_recovery_pointer, damaged_recovery_staged, damaged_recovery_fixed = _read_cycle(s3)
+    damaged_recovery_meta = json.loads(damaged_recovery_staged["meta.json"])
+    assert damaged_recovery_pointer["cycle_id"] != empty_recovery_pointer["cycle_id"]
+    assert damaged_recovery_staged == damaged_recovery_fixed
+    assert damaged_recovery_meta["repos_scanned"] == 2
+    assert damaged_recovery_meta["repos_failed"] == []
+    assert (damaged_mirror / "HEAD").is_file()
+    assert not (recovery.clone_root / "recover-repo.git.tmp").exists()
+
+    # If Forgejo cannot recreate a damaged mirror, the failure-rate guard
+    # withholds before publication. The last complete S3 cycle remains the
+    # authoritative pointer and fixed-key snapshot byte-for-byte.
+    before_withhold_objects = dict(s3.objects)
+    before_withhold_puts = list(s3.puts)
+    shutil.rmtree(damaged_mirror)
+    shutil.rmtree(recovery.sources["recover-repo"])
+    with pytest.raises(main.CycleWithheld, match=r"1/2 repo\(s\) failed"):
+        main._run_cycle(recovery.cfg, s3, recovery.family_map)
+
+    assert s3.objects == before_withhold_objects
+    assert s3.puts == before_withhold_puts
+    current_pointer, current_staged, current_fixed = _read_cycle(s3)
+    assert current_pointer == damaged_recovery_pointer
+    assert current_staged == damaged_recovery_staged
+    assert current_fixed == damaged_recovery_fixed
+    assert (recovery.clone_root / "stable-repo.git").is_dir()
+    assert not damaged_mirror.exists()

@@ -532,6 +532,58 @@ reference Deployment's desired `replicas: 1`, `Recreate` strategy, and one-pod
 quota are the GitOps enforcement; a second replica is unsupported until the
 publication protocol has a cross-process lease and fencing.
 
+### Mirror-volume recovery runbook
+
+Treat the mirror PVC as a rebuildable cache and S3 as the recovery authority.
+Do not delete `current.json`, immutable `cycles/<cycle_id>/` objects, or the
+fixed-key snapshot while repairing the volume. The pointer names the last
+complete dataset; fixed keys are repaired from that pointer on process start,
+so they are not safe recovery input.
+
+1. **Classify the incident without changing state.** Check the PVC, pod logs,
+   and the read-only health surfaces:
+
+   ```bash
+   kubectl -n git-activity-exporter get pvc git-activity-exporter-mirrors
+   kubectl -n git-activity-exporter get pods -l app=git-activity-exporter
+   kubectl -n git-activity-exporter logs deployment/git-activity-exporter --since=2h
+   kubectl -n git-activity-exporter port-forward deployment/git-activity-exporter 18080:8080
+   curl --fail http://127.0.0.1:18080/health
+   curl --fail http://127.0.0.1:18080/metrics
+   ```
+
+   Stop the port-forward after the check. An empty directory with the exact
+   clone-root marker is a cold-cache recovery. A missing marker, unwritable
+   mount, or missing PVC is a provisioning problem: restore the volume mount,
+   marker-init step, ownership, or claim through the declarative GitOps
+   manifests, then let ArgoCD reconcile. Never point `CLONE_ROOT` at a broad
+   directory and never repair an ArgoCD-managed object with an imperative
+   `kubectl` mutation.
+
+2. **Allow the exporter to rebuild the cache.** A missing mirror is cloned
+   from Forgejo. A damaged existing mirror is discarded and re-cloned after
+   the refresh fails. The first cold cycle can take substantially longer than
+   the normal poll interval; `/health` remains live while `/ready` stays 503
+   until a restarted process commits its first complete publication. Keep one
+   writer and do not manually delete arbitrary mirrors as a capacity fix.
+
+3. **Verify the cycle outcome.** For a complete recovery, wait for
+   `last_cycle_outcome=published`, then resolve `current.json` and confirm its
+   four named objects exist, `meta.json.cycle_id` matches the pointer,
+   `repos_scanned == repos_total`, and `repos_failed` is empty. A failed cold
+   clone or volume error must not be mistaken for a quiet fleet. If the
+   failure-rate guard reports `withheld`, the prior pointer and its fixed keys
+   remain authoritative and no replacement dataset was committed; repair the
+   Forgejo, network, or PVC cause and wait for the next poll. A cycle reported
+   as `failed` has the same S3 safety guarantee and needs the underlying
+   collection or publication error repaired first.
+
+4. **Close the incident.** Confirm the next cycle is warm (the existing
+   mirrors are fetched rather than cold-cloned), the health timestamp advances,
+   and the PVC has enough free space for the largest incoming Git pack. Record
+   whether the cache was empty, a mirror was damaged, or the volume itself was
+   replaced, along with the committed cycle ID and any withheld/failed outcome.
+
 ### Mirror volume capacity
 
 The `20Gi` PVC is the supported minimum, not a universal capacity guarantee.
