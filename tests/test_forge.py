@@ -514,28 +514,85 @@ def test_enumeration_error_fails_the_cycle_before_any_prune_or_publish(monkeypat
         [],
         {"data": [{"name": "repo-1"}]},
         {"data": [repo(1), repo(1)]},
+        {"data": [repo(1) | {"clone_url": "file:///tmp/unsafe.git"}]},
+        {"data": [repo(1) | {"empty": "false"}]},
+        {"data": [repo(1)], "ok": False},
     ],
 )
-def test_invalid_enumeration_response_fails_before_prune_or_publish(
+def test_invalid_enumeration_response_cannot_mutate_cycle_state(
     monkeypatch, tmp_path, response
 ):
+    """Validation must finish before any destructive or publishing work.
+
+    Keep an actual orphan mirror in place instead of mocking the prune: if an
+    invalid response ever reached orphan hygiene, this test would delete it.
+    The subprocess spy covers clone, fetch, and scan Git invocations, while
+    FakeS3 records all publication writes.
+    """
     FakeForge([response]).install(monkeypatch)
+    cfg = _cfg(tmp_path)
     _mirror(tmp_path, "survivor")
+    _mirror(tmp_path, "orphan")
     s3 = FakeS3()
-    prune_calls = []
+
+    mirror_calls = []
+
+    def unexpected_mirror(*args, **kwargs):
+        mirror_calls.append(args[0])
+        raise AssertionError("invalid enumeration reached mirror refresh")
+
+    monkeypatch.setattr(main.gitscan, "ensure_mirror", unexpected_mirror)
+
+    git_calls = []
+
+    def unexpected_git(*args, **kwargs):
+        git_calls.append(args[0])
+        raise AssertionError("invalid enumeration reached a Git operation")
+
     monkeypatch.setattr(
         main.gitscan,
-        "prune_orphans",
-        lambda *args: prune_calls.append(args) or ["unexpected"],
+        "_run",
+        unexpected_git,
     )
 
-    with pytest.raises(forge.EnumerationError):
-        main._run_cycle(_cfg(tmp_path), s3, {})
+    scan_calls = []
 
+    def unexpected_scan(*args, **kwargs):
+        scan_calls.append(args[0])
+        raise AssertionError("invalid enumeration reached mirror scanning")
+
+    monkeypatch.setattr(main.gitscan, "scan_commits", unexpected_scan)
+
+    prune_calls = []
+    real_prune = main.gitscan.prune_orphans
+
+    def record_prune(*args, **kwargs):
+        prune_calls.append(args)
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(main.gitscan, "prune_orphans", record_prune)
+
+    deleted = []
+    real_rmtree = main.gitscan.shutil.rmtree
+
+    def record_deletion(path, *args, **kwargs):
+        deleted.append(path)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(main.gitscan.shutil, "rmtree", record_deletion)
+
+    with pytest.raises(forge.EnumerationError):
+        main._run_cycle(cfg, s3, {})
+
+    assert mirror_calls == []
+    assert git_calls == []
+    assert scan_calls == []
     assert prune_calls == []
+    assert deleted == []
     assert s3.puts == []
     assert s3.objects == {}
     assert (tmp_path / "survivor.git").exists()
+    assert (tmp_path / "orphan.git").exists()
 
 
 def test_empty_enumeration_publishes_without_pruning_and_recovers_after_fix(monkeypatch, tmp_path):
