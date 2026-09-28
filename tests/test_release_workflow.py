@@ -18,6 +18,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
+FAKE_RELEASE_SECRETS = {
+    "FORGEJO_TOKEN": "forgejo-token-redaction-test-only",
+    "GIT_PASSWORD": "git-password-redaction-test-only",
+    "DOCKER_CONFIG": "docker-config-redaction-test-only",
+}
+SECRET_ENV_NAMES = frozenset(FAKE_RELEASE_SECRETS)
 WORKFLOW_RELATIVE = Path(
     "k8s/iad-ci/argo-workflows/git-activity-exporter-build-workflowtemplate.yml"
 )
@@ -134,6 +140,94 @@ def _assert_origin_only(source: str) -> None:
             ]
             if remotes:
                 assert remotes[0] == "origin", match.group(0)
+
+
+def _render_workflow_parameters(value: str) -> str:
+    """Render non-secret Argo values before exercising shell command lines."""
+    replacements = {
+        "{{workflow.parameters.git-repo}}": "jedarden/git-activity-exporter",
+        "{{workflow.parameters.branch}}": "main",
+        "{{workflow.parameters.commit-sha}}": "a" * 40,
+        "{{inputs.parameters.version}}": "1.2.4",
+        "{{inputs.parameters.source-sha}}": "b" * 40,
+        "{{inputs.parameters.verified-image}}": (
+            "ronaldraygun/git-activity-exporter:1.2.4"
+        ),
+        "{{inputs.parameters.gitops-revision}}": "c" * 40,
+        "{{steps.resolve-version.outputs.parameters.version}}": "1.2.4",
+        "{{steps.resolve-version.outputs.parameters.source-sha}}": "b" * 40,
+        "{{steps.smoke.outputs.parameters.verified-image}}": (
+            "ronaldraygun/git-activity-exporter:1.2.4"
+        ),
+        "{{steps.promote.outputs.parameters.gitops-revision}}": "c" * 40,
+    }
+    for placeholder, replacement in replacements.items():
+        value = value.replace(placeholder, replacement)
+    return value
+
+
+def _joined_shell_lines(source: str) -> list[str]:
+    """Join shell continuation lines so command arguments can be captured."""
+    joined = []
+    pending = ""
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if pending:
+            line = f"{pending}{line}"
+        if line.endswith("\\"):
+            pending = f"{line[:-1]} "
+        else:
+            joined.append(line)
+            pending = ""
+    if pending:
+        joined.append(pending)
+    return joined
+
+
+def _release_git_commands(source: str) -> list[tuple[str, str]]:
+    """Extract clone/fetch/push commands for execution by a fake Git binary."""
+    commands = []
+    for line in _joined_shell_lines(_render_workflow_parameters(source)):
+        match = re.search(r"\bgit\s+(clone|fetch|pull|push)\b.*", line)
+        if not match:
+            continue
+        command = re.split(r"\s*(?:;|&&|\|\|)\s*", match.group(0), maxsplit=1)[
+            0
+        ].strip()
+        commands.append((match.group(1), command))
+    return commands
+
+
+def _assert_no_fake_secret(artifact: str, label: str) -> None:
+    """Keep fake credentials out of an artifact without echoing their values."""
+    for name, value in FAKE_RELEASE_SECRETS.items():
+        assert value not in artifact, f"{label} leaked {name}"
+
+
+def _source_without_credential_helper(template: dict) -> str:
+    source = template.get("script", {}).get("source", "")
+    for entry in _env_by_name(template).values():
+        if entry.get("name") == "GIT_CONFIG_VALUE_0":
+            source = source.replace(entry.get("value", ""), "")
+    return source
+
+
+def _assert_secret_outputs_are_not_printed(template: dict) -> None:
+    """Reject shell logging/tracing that could expose an injected secret."""
+    source = _source_without_credential_helper(template)
+    secret_names = "|".join(re.escape(name) for name in SECRET_ENV_NAMES)
+    assert not re.search(r"(?m)^\s*set\s+-[^\n]*x", source)
+    assert not re.search(r"(?im)^\s*(?:printenv|env)\b", source)
+    assert not re.search(
+        rf"(?im)^\s*(?:echo|printf|printenv|env|cat|tee|logger)\b[^\n]*"
+        rf"(?:\$(?:\{{)?(?:{secret_names})\}}?|\b(?:{secret_names})\b)",
+        source,
+    )
+    for name in SECRET_ENV_NAMES:
+        assert f"${name}" not in source
+        assert f"${{{name}}}" not in source
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -634,6 +728,113 @@ def test_missing_or_invalid_registry_credentials_cannot_reach_gitops_promotion()
     promote_source = templates["promote"].get("script", {}).get("source", "")
     assert "docker-hub-registry" not in promote_source
     assert "/kaniko/.docker" not in promote_source
+
+
+def test_release_fixture_redacts_fake_secrets_from_clone_push_kaniko_surfaces(
+    tmp_path: Path,
+):
+    """Exercise command argv and output surfaces with deliberately fake secrets."""
+    workflow = _fixture_workflow()
+    templates = _templates(workflow)
+    fixture_text = (FIXTURES / "git-activity-exporter-workflow.yml").read_text()
+    _assert_no_fake_secret(fixture_text, "workflow fixture")
+
+    # Secret values must be injected only by Kubernetes. They cannot be Argo
+    # parameters or output paths, which are persisted and surfaced by Argo.
+    parameters = list(workflow["spec"].get("arguments", {}).get("parameters", []))
+    for template in templates.values():
+        parameters.extend(template.get("inputs", {}).get("parameters", []))
+        for output in template.get("outputs", {}).get("parameters", []):
+            assert output["name"] not in SECRET_ENV_NAMES
+            value_from = output.get("valueFrom", {})
+            output_path = value_from.get("path", "")
+            assert not SECRET_ENV_NAMES.intersection(output_path.split("/"))
+            _assert_no_fake_secret(str(output), f"{template['name']} output")
+    assert all(parameter["name"] not in SECRET_ENV_NAMES for parameter in parameters)
+
+    # A credential helper is allowed to mention the Forgejo token because Git
+    # expands it inside the helper. Every other script must keep injected
+    # values out of logging/tracing and command interpolation.
+    for template in templates.values():
+        _assert_secret_outputs_are_not_printed(template)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" >> \"$TRACE_FILE\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    trace_file = tmp_path / "git-argv.txt"
+    command_env = os.environ.copy()
+    command_env.update(FAKE_RELEASE_SECRETS)
+    command_env["PATH"] = f"{fake_bin}{os.pathsep}{command_env['PATH']}"
+    command_env["TRACE_FILE"] = str(trace_file)
+
+    # Run the actual clone/fetch/push command lines through a fake Git binary.
+    # If a token is interpolated into a URL or argument, the fake binary records
+    # that exact value and this assertion fails without contacting a provider.
+    git_command_count = 0
+    for template_name in ("test", "resolve-version", "self-hosting-smoke", "promote"):
+        source = templates[template_name].get("script", {}).get("source", "")
+        source += templates[template_name].get("container", {}).get("args", [""])[0]
+        for operation, command in _release_git_commands(source):
+            result = subprocess.run(
+                ["sh", "-c", f"set -eu\n{command}"],
+                cwd=tmp_path,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=command_env,
+            )
+            assert result.returncode == 0, result.stderr
+            git_command_count += 1
+            _assert_no_fake_secret(result.stdout, f"{template_name} {operation} stdout")
+            _assert_no_fake_secret(result.stderr, f"{template_name} {operation} stderr")
+            if operation == "clone":
+                arguments = shlex.split(command)
+                urls = [argument for argument in arguments if "://" in argument]
+                assert urls, command
+                for url in urls:
+                    assert "@" not in url
+                    assert not any(name in url for name in SECRET_ENV_NAMES)
+    assert git_command_count
+    _assert_no_fake_secret(trace_file.read_text(), "captured Git argv")
+
+    # Kaniko receives the Forgejo password through its environment and the
+    # Docker Hub credential through a mounted file. Its argv must contain only
+    # public repository names, a version, and the pinned source reference.
+    docker = templates["docker-build"]["container"]
+    kaniko_args = [_render_workflow_parameters(argument) for argument in docker["args"]]
+    assert all(
+        not any(name in argument for name in SECRET_ENV_NAMES)
+        and not re.search(r"\$(?:\{)?(?:FORGEJO_TOKEN|GIT_PASSWORD)\}?", argument)
+        for argument in kaniko_args
+    )
+    fake_kaniko = fake_bin / "kaniko"
+    fake_kaniko.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_kaniko.chmod(0o755)
+    kaniko_result = subprocess.run(
+        [str(fake_kaniko), *kaniko_args],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=command_env,
+    )
+    assert kaniko_result.returncode == 0
+    _assert_no_fake_secret(kaniko_result.stdout, "captured Kaniko argv")
+    _assert_no_fake_secret(kaniko_result.stderr, "captured Kaniko stderr")
+
+    image_metadata = "\n".join(
+        [str(ROOT / "Dockerfile"), (ROOT / "Dockerfile").read_text(), *kaniko_args]
+    )
+    _assert_no_fake_secret(image_metadata, "image metadata")
 
 
 def test_partial_release_retries_keep_the_resolved_version_and_verification_gate():
