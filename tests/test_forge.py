@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from src import forge, main, s3io
+from src import forge, gitscan, main, s3io
 from tests.fake_s3 import FakeS3
 
 BASE = "https://forge"
@@ -353,6 +353,9 @@ def test_transport_error_fails_the_walk(monkeypatch):
 
 def _cfg(tmp_path):
     # Superset covering both _collect and _run_cycle.
+    (tmp_path / gitscan.CLONE_ROOT_MARKER).write_text(
+        gitscan.CLONE_ROOT_MARKER_CONTENT
+    )
     return SimpleNamespace(
         forge_base_url=BASE,
         forge_token=TOKEN,

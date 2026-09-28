@@ -199,6 +199,9 @@ def test_naive_event_timestamps_fail_rather_than_being_ambiguous():
 def test_cycle_window_is_shared_by_git_and_bead_reads(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
+    (tmp_path / gitscan.CLONE_ROOT_MARKER).write_text(
+        gitscan.CLONE_ROOT_MARKER_CONTENT
+    )
     cfg = SimpleNamespace(
         forge_base_url="https://forge",
         forge_token="token",

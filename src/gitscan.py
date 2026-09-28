@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -34,6 +35,16 @@ _FIELD_SEP = "\x1f"
 _PRETTY = f"C{_FIELD_SEP}%H{_FIELD_SEP}%at{_FIELD_SEP}%aE{_FIELD_SEP}%(trailers:key=Bead-Id,valueonly,separator=){_FIELD_SEP}%s"
 _DEEPEN_MIN_COMMITS = 100
 _DEEPEN_MAX_ATTEMPTS = 8
+
+# This file is provisioned by the deployment's volume-init step. It is a
+# deliberate ownership boundary: without it, a typo in CLONE_ROOT could make
+# the orphan-prune walk an arbitrary writable directory.
+CLONE_ROOT_MARKER = ".git-activity-exporter-clone-root"
+CLONE_ROOT_MARKER_CONTENT = "git-activity-exporter clone root v1\n"
+_BROAD_CLONE_ROOTS = frozenset({
+    "/tmp", "/data", "/home", "/root", "/var", "/usr", "/etc", "/opt",
+    "/mnt", "/media", "/run", "/app", "/workspace", "/workspaces",
+})
 
 
 class GitError(Exception):
@@ -62,6 +73,82 @@ class StorageExhausted(GitError):
     mirror cannot make a full volume healthy and would turn a recoverable
     capacity incident into a larger cold-clone incident.
     """
+
+
+class CloneRootError(ValueError):
+    """CLONE_ROOT is not an explicitly provisioned mirror directory."""
+
+
+def _clone_root_error(clone_root: str, reason: str):
+    raise CloneRootError(f"unsafe CLONE_ROOT {clone_root!r}: {reason}")
+
+
+def validate_clone_root(clone_root: str) -> str:
+    """Validate and return the normalized, dedicated mirror directory.
+
+    Pruning is destructive, so a marker is required in addition to ordinary
+    filesystem checks. The root and every existing path component must be a
+    real directory rather than a symlink, and immediate symlink entries are
+    rejected so a mirror cannot redirect deletion outside the volume.
+    """
+    if not isinstance(clone_root, str) or not clone_root:
+        _clone_root_error(clone_root, "must be a non-empty absolute path")
+    if not os.path.isabs(clone_root):
+        _clone_root_error(clone_root, "must be an absolute path")
+
+    root = os.path.normpath(clone_root)
+    if root == os.path.sep:
+        _clone_root_error(clone_root, "the filesystem root is not a mirror directory")
+    if root in _BROAD_CLONE_ROOTS or len(root.split(os.path.sep)) <= 2:
+        _clone_root_error(clone_root, "path is too broad; use a dedicated child directory")
+
+    current = os.path.sep
+    for component in root.split(os.path.sep)[1:]:
+        current = os.path.join(current, component)
+        try:
+            component_stat = os.lstat(current)
+        except FileNotFoundError:
+            _clone_root_error(clone_root, "directory and ownership marker must already exist")
+        except OSError as error:
+            _clone_root_error(clone_root, f"cannot inspect path: {error}")
+        if stat.S_ISLNK(component_stat.st_mode):
+            _clone_root_error(clone_root, "path components must not be symlinks")
+
+    try:
+        root_stat = os.lstat(root)
+    except OSError as error:
+        _clone_root_error(clone_root, f"cannot inspect directory: {error}")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        _clone_root_error(clone_root, "must be a directory")
+    if not os.access(root, os.W_OK | os.X_OK):
+        _clone_root_error(clone_root, "directory is not writable")
+
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    _clone_root_error(clone_root, f"unexpected symlink entry {entry.name!r}")
+    except OSError as error:
+        _clone_root_error(clone_root, f"cannot scan directory: {error}")
+
+    marker = os.path.join(root, CLONE_ROOT_MARKER)
+    try:
+        marker_stat = os.lstat(marker)
+    except FileNotFoundError:
+        _clone_root_error(clone_root, f"missing ownership marker {CLONE_ROOT_MARKER}")
+    except OSError as error:
+        _clone_root_error(clone_root, f"cannot inspect ownership marker: {error}")
+    if stat.S_ISLNK(marker_stat.st_mode) or not stat.S_ISREG(marker_stat.st_mode):
+        _clone_root_error(clone_root, f"ownership marker {CLONE_ROOT_MARKER} must be a regular file")
+    try:
+        with open(marker, "rb") as marker_file:
+            marker_content = marker_file.read(len(CLONE_ROOT_MARKER_CONTENT.encode()) + 1)
+    except OSError as error:
+        _clone_root_error(clone_root, f"cannot read ownership marker: {error}")
+    if marker_content != CLONE_ROOT_MARKER_CONTENT.encode():
+        _clone_root_error(clone_root, f"invalid ownership marker {CLONE_ROOT_MARKER}")
+
+    return root
 
 
 _TRANSIENT_GIT_MARKERS = (
@@ -223,6 +310,7 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
     extend it until the cutoff is reached or the attempt budget is exhausted;
     widening the reporting window does not require --unshallow or a re-clone.
     """
+    clone_root = validate_clone_root(clone_root)
     if forge_base_url is None:
         raise ValueError("forge_base_url is required to validate clone_url")
     validate_clone_url(repo["clone_url"], forge_base_url)
@@ -380,6 +468,7 @@ def prune_orphans(clone_root: str, live_names) -> list:
     <name>.git.tmp litter from a killed clone is swept too, but is not a repo
     and is only logged.
     """
+    clone_root = validate_clone_root(clone_root)
     live = {f"{name}.git" for name in live_names}
     if not live:
         log.warning("clone_root %s not pruned: enumeration returned no repos", clone_root)
@@ -395,16 +484,25 @@ def prune_orphans(clone_root: str, live_names) -> list:
         if entry in live:
             continue
         path = os.path.join(clone_root, entry)
-        if not os.path.isdir(path):
+        try:
+            entry_stat = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(entry_stat.st_mode):
             continue
         if entry.endswith(".git.tmp"):
             shutil.rmtree(path, ignore_errors=True)
             log.info("removed clone litter %s", entry)
-        elif entry.endswith(".git") and os.path.exists(os.path.join(path, "HEAD")):
+        elif entry.endswith(".git"):
             # The HEAD check: only something that looks like one of our bare
             # mirrors is assumed to be ours to delete.
-            shutil.rmtree(path, ignore_errors=True)
-            pruned.append(entry[: -len(".git")])
+            try:
+                head_stat = os.lstat(os.path.join(path, "HEAD"))
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(head_stat.st_mode):
+                shutil.rmtree(path, ignore_errors=True)
+                pruned.append(entry[: -len(".git")])
     return pruned
 
 

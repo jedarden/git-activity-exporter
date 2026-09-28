@@ -69,9 +69,25 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         fsGroup: 1000
+      initContainers:
+        - name: initialize-mirror-root
+          image: ronaldraygun/git-activity-exporter:0.1.56
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - >-
+              mkdir -p /data/mirrors &&
+              printf '%s\n' 'git-activity-exporter clone root v1' >
+              /data/mirrors/.git-activity-exporter-clone-root &&
+              chown 1000:1000 /data/mirrors
+              /data/mirrors/.git-activity-exporter-clone-root
+          volumeMounts:
+            - name: mirrors
+              mountPath: /data/mirrors
       containers:
         - name: exporter
-          image: ronaldraygun/git-activity-exporter:0.1.55
+          image: ronaldraygun/git-activity-exporter:0.1.56
           imagePullPolicy: IfNotPresent
           ports:
             - name: health

@@ -11,7 +11,7 @@ everything else has a default.
 | `FORGE_OWNER` | `jedarden` | whose repos to enumerate |
 | `FORGE_TOKEN` | *(required)* | runtime read scope is sufficient; release CI uses a separate write-back credential |
 | `REPO_DENYLIST` | *(empty)* | comma-separated repo names to skip |
-| `CLONE_ROOT` | `/data/mirrors` | must be a persistent volume; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
+| `CLONE_ROOT` | `/data/mirrors` | must be an existing, writable, dedicated directory on a persistent volume with the `.git-activity-exporter-clone-root` ownership marker; mirrors orphaned by a deleted/renamed/denylisted/empty repo are pruned from it each cycle |
 | `WINDOW_DAYS` | `90` | positive reporting-window length in elapsed 24-hour UTC days; [boundary contract](data-sources.md#reporting-window-boundary-contract) |
 | `SHALLOW_SINCE_DAYS` | `WINDOW_DAYS + 10` | date-based history bound; existing mirrors deepen on fetch when a wider window is requested — [shallow-mirror behavior](data-sources.md#git--bounded-window-explicit-coverage) |
 | `TRIM_MAX_LINES` | `5000` | strict upper bound on a commit's filtered `lines_added + lines_deleted`; above it the commit is flagged bulk — [commit bulk contract](output-schema.md#commit-bulk-and-filtered-loc-contract) |

@@ -216,6 +216,11 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
             datetime.now(timezone.utc), cfg.window_days
         )
 
+    # CLONE_ROOT is destructive state: fail before enumeration, mirror scan,
+    # or orphan pruning if the configured directory is not the provisioned
+    # writable mirror volume.
+    gitscan.validate_clone_root(cfg.clone_root)
+
     repos = forge.list_repos(
         cfg.forge_base_url, cfg.forge_token, cfg.forge_owner,
         cfg.http_timeout_seconds, cfg.repo_denylist,

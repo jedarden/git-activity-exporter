@@ -177,7 +177,7 @@ The profile makes every reuser-specific input visible:
   in the fixture only;
 - a single-writer mirror volume (`self-hosting-mirrors` in Compose and a
   `ReadWriteOnce` 20Gi PVC in Kubernetes); and
-- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.55`).
+- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.56`).
 
 The repository's release-drift check compares these committed image
 references with `VERSION`, rejects mutable `:latest` or untagged references,
@@ -412,6 +412,14 @@ The exporter stores bare shallow repository mirrors under `/data/mirrors`.
 `CLONE_ROOT` must point there (the reference ConfigMap does), and
 `git-activity-exporter-mirrors` mounts that path from a `20Gi` `longhorn`
 PersistentVolumeClaim with `ReadWriteOnce` access.
+
+The directory must already exist, be writable by UID/GID 1000, and contain the
+exact regular-file marker `.git-activity-exporter-clone-root` whose contents
+are `git-activity-exporter clone root v1`. The reference self-hosting profiles
+create this marker in their volume-init step. The exporter refuses to scan or
+prune an unmarked directory, a symlink, the filesystem root, or a broad parent
+such as `/data` or `/tmp`; this fail-closed check prevents a bad `CLONE_ROOT`
+value from deleting unrelated files.
 
 The mirrors are a rebuildable cache, not the published dataset. Losing the
 PVC costs a slow cold collection cycle but does not delete S3 data. The volume

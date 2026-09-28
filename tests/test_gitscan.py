@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -193,6 +194,7 @@ def test_authentication_failure_is_redacted_and_not_retried(monkeypatch, caplog)
 
 def _fake_mirror(tmp_path, name="x"):
     path = tmp_path / f"{name}.git"
+    _mark_clone_root(tmp_path)
     path.mkdir()
     (path / "HEAD").write_text("ref: refs/heads/main\n")
     return path
@@ -202,7 +204,16 @@ def _repo(name="x"):
     return {"name": name, "clone_url": f"https://git.ardenone.com/jedarden/{name}.git"}
 
 
+def _mark_clone_root(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / gitscan.CLONE_ROOT_MARKER).write_text(
+        gitscan.CLONE_ROOT_MARKER_CONTENT
+    )
+
+
 def _ensure(repo, clone_root, token, shallow_since_days, timeout, window_start=None):
+    _mark_clone_root(clone_root)
     return gitscan.ensure_mirror(
         repo,
         clone_root,
@@ -217,6 +228,7 @@ def _ensure(repo, clone_root, token, shallow_since_days, timeout, window_start=N
 def test_untrusted_clone_endpoint_is_rejected_before_git_receives_credentials(
     tmp_path, monkeypatch
 ):
+    _mark_clone_root(tmp_path)
     remote_calls = []
     credential_calls = []
 
@@ -246,7 +258,7 @@ def test_untrusted_clone_endpoint_is_rejected_before_git_receives_credentials(
 
     assert remote_calls == []
     assert credential_calls == []
-    assert list(tmp_path.iterdir()) == []
+    assert list(tmp_path.iterdir()) == [tmp_path / gitscan.CLONE_ROOT_MARKER]
 
 
 def _fake_clone(target):
@@ -295,6 +307,7 @@ def test_existing_shallow_mirror_is_deepened_for_wider_window(tmp_path, monkeypa
     middle_sha = _git(source, "rev-parse", "HEAD~1")
 
     mirror = tmp_path / "history.git"
+    _mark_clone_root(tmp_path)
     subprocess.run(
         [
             "git", "clone", "-q", "--mirror", "--shallow-since=2026-09-01",
@@ -497,8 +510,57 @@ def test_prune_refuses_empty_enumeration(tmp_path):
     assert dead.exists(), "a listing fault must not be able to clear the whole farm"
 
 
-def test_prune_missing_root_is_a_noop(tmp_path):
-    assert gitscan.prune_orphans(str(tmp_path / "nope"), ["x"]) == []
+def test_prune_rejects_unmarked_root_without_deleting_unrelated_data(tmp_path):
+    root = tmp_path / "unmarked"
+    root.mkdir()
+    unrelated = _fake_mirror(root, "unrelated")
+    (root / gitscan.CLONE_ROOT_MARKER).unlink()
+
+    with pytest.raises(gitscan.CloneRootError, match="ownership marker"):
+        gitscan.prune_orphans(str(root), ["live"])
+
+    assert unrelated.exists()
+
+
+def test_prune_rejects_root_and_broad_paths_before_listing(monkeypatch):
+    monkeypatch.setattr(
+        gitscan.os,
+        "listdir",
+        lambda _path: pytest.fail("invalid CLONE_ROOT must not be scanned"),
+    )
+
+    for path in ("/", "/tmp"):
+        with pytest.raises(gitscan.CloneRootError):
+            gitscan.prune_orphans(path, ["live"])
+
+
+def test_prune_rejects_symlinked_root(tmp_path):
+    real_root = tmp_path / "real-mirrors"
+    _mark_clone_root(real_root)
+    mirror = _fake_mirror(real_root, "unrelated")
+    symlink_root = tmp_path / "mirrors"
+    symlink_root.symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(gitscan.CloneRootError, match="symlink"):
+        gitscan.prune_orphans(str(symlink_root), ["live"])
+
+    assert mirror.exists()
+
+
+def test_prune_requires_a_writable_marked_directory(tmp_path):
+    root = tmp_path / "mirrors"
+    _mark_clone_root(root)
+    root.chmod(0o555)
+    try:
+        with pytest.raises(gitscan.CloneRootError, match="writable"):
+            gitscan.prune_orphans(str(root), ["live"])
+    finally:
+        root.chmod(0o755)
+
+
+def test_prune_missing_root_is_rejected(tmp_path):
+    with pytest.raises(gitscan.CloneRootError, match="must already exist"):
+        gitscan.prune_orphans(str(tmp_path / "nope"), ["x"])
 
 
 def test_show_timeout_uses_git_timeout_semantics(monkeypatch):

@@ -7,7 +7,15 @@ from src import gitscan, main, parquet_io, s3io
 from tests.fake_s3 import FakeS3
 
 
+def _mark_clone_root(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / gitscan.CLONE_ROOT_MARKER).write_text(
+        gitscan.CLONE_ROOT_MARKER_CONTENT
+    )
+
+
 def test_collect_keeps_going_and_records_failed_and_stale_repos(monkeypatch, tmp_path):
+    _mark_clone_root(tmp_path)
     repos = [
         {"name": "timeout", "clone_url": "https://forge/timeout.git"},
         {"name": "slow", "clone_url": "https://forge/slow.git"},
@@ -59,7 +67,29 @@ def test_collect_keeps_going_and_records_failed_and_stale_repos(monkeypatch, tmp
     }
 
 
+def test_collect_rejects_invalid_clone_root_before_enumerating_or_pruning(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "unmarked"
+    root.mkdir()
+    unrelated = root / "unrelated.git"
+    unrelated.mkdir()
+    (unrelated / "HEAD").write_text("ref: refs/heads/main\n")
+
+    monkeypatch.setattr(
+        main.forge,
+        "list_repos",
+        lambda *args: pytest.fail("invalid CLONE_ROOT must fail before enumeration"),
+    )
+
+    with pytest.raises(gitscan.CloneRootError, match="ownership marker"):
+        main._collect(SimpleNamespace(clone_root=str(root), window_days=1), {})
+
+    assert unrelated.exists()
+
+
 def test_forensic_integrity_failure_excludes_the_whole_repository(monkeypatch, tmp_path):
+    _mark_clone_root(tmp_path)
     repos = [
         {"name": "corrupt", "clone_url": "https://forge/corrupt.git"},
         {"name": "healthy", "clone_url": "https://forge/healthy.git"},

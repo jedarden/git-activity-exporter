@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pyarrow.parquet as pq
 import pytest
 
-from src import forge, main, s3io
+from src import forge, gitscan, main, s3io
 from src.config import DEFAULT_EXCLUDED_PATHS
 from tests.fake_s3 import FakeS3
 
@@ -58,6 +58,13 @@ def _write(path, relative, content):
 def _commit(path, date, subject):
     _git(path, "add", "-A")
     _git(path, "commit", "-q", "--no-verify", "-m", subject, date=date)
+
+
+def _mark_clone_root(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / gitscan.CLONE_ROOT_MARKER).write_text(
+        gitscan.CLONE_ROOT_MARKER_CONTENT
+    )
 
 
 def _event(sequence, issue_id, kind, timestamp, actor, detail):
@@ -171,6 +178,7 @@ def _make_cycle_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "_now", lambda: GENERATED_AT)
 
     clone_root = tmp_path / "mirrors"
+    _mark_clone_root(clone_root)
     cfg = SimpleNamespace(
         forge_base_url="https://forge.fixture",
         forge_token="fixture-token",
@@ -482,6 +490,7 @@ def test_mirror_lifecycle_prunes_orphans_and_reclones_an_emptied_repo(tmp_path, 
     monkeypatch.setattr(main, "_now", lambda: GENERATED_AT)
 
     clone_root = tmp_path / "mirrors"
+    _mark_clone_root(clone_root)
     cfg = SimpleNamespace(
         forge_base_url="https://forge.fixture",
         forge_token="fixture-token",
@@ -532,6 +541,7 @@ def test_mirror_lifecycle_prunes_orphans_and_reclones_an_emptied_repo(tmp_path, 
         "late-page-repo",
     }
     assert {path.name for path in clone_root.iterdir()} == {
+        gitscan.CLONE_ROOT_MARKER,
         "stable-repo.git",
         "deleted-repo.git",
         "renamed-repo.git",
@@ -555,6 +565,7 @@ def test_mirror_lifecycle_prunes_orphans_and_reclones_an_emptied_repo(tmp_path, 
         "renamed-repo",
     ]
     assert {path.name for path in clone_root.iterdir()} == {
+        gitscan.CLONE_ROOT_MARKER,
         "stable-repo.git",
         "late-page-repo.git",
         "renamed-as-repo.git",
