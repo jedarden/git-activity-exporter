@@ -538,6 +538,13 @@ Two details a reuser will otherwise hit:
 
 ## Rotation
 
+The complete provision → propagate → validate → revoke procedure, including
+release-workflow and registry credentials and fail-closed recovery, is in the
+[credential rotation runbook](deployment.md#credential-rotation-runbook).
+The application configuration does not change during rotation: providers
+update the managed source, Secret references refresh, and the process is
+restarted to read the replacement.
+
 **S3 access key.** Rotate at the source, never by hand-editing the reflected
 Secret: update or re-mint the `dashboard-write-key` GarageKey, and the
 operator rewrites `dashboard-s3-credentials`, Reflector re-mirrors it, and
@@ -546,7 +553,9 @@ the pod — no manifest change needed. Because the key is shared by every
 `dashboard-site` writer, this rotation restarts all of them at once; if that
 blast radius is unwanted, mint a dedicated GarageKey scoped to `dashboard-site`
 and reflect it into this namespace alone. Verify by property, not by value:
-the pod restarts and the next cycle publishes, or it doesn't.
+the pod restarts and the next cycle publishes, or it doesn't. Keep the old key
+active until that validation succeeds; if it fails, restore the previous key at
+the Garage source and let the operator/Reflector/Reloader chain converge.
 
 **`FORGE_TOKEN`.** Write a new KV v2 version at
 `ardenone-cluster/git-activity-exporter/forge` (field `forgejo-token`) — an
@@ -555,4 +564,7 @@ picks the new version up within its 1h `refreshInterval` and rewrites the
 K8s Secret, Reloader restarts the pod, and the next cycle proves it. To
 verify without reading the value:
 `kubectl get externalsecret git-activity-exporter-forge -n git-activity-exporter`
-shows `SecretSynced`, and `meta.json`'s freshness advances.
+shows `SecretSynced`, and `meta.json`'s freshness advances. Keep the previous
+version until both the replacement pod and a published cycle have passed; an
+auth failure leaves the previous pointer in place and is safe to retry after
+restoring the previous KV version.

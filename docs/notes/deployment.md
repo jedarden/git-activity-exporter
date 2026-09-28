@@ -131,6 +131,100 @@ may already have pushed the automatic `VERSION` commit; that is the retry
 anchor and is not GitOps promotion. After rotation, retry the release using
 that same resolved version rather than manually promoting an unverified tag.
 
+## Credential rotation runbook
+
+This runbook covers the four credential boundaries used by the exporter and
+its release path. Rotation is a secret-management operation: it does not
+require changing source code, a ConfigMap, a workflow parameter, an image, or
+the application repository. Never publish a credential value in Git, an
+application configuration file, a command argument, a workflow input, or a
+log. When a provider CLI needs a value, pass it through the approved secret
+manager's stdin or a mode-`600` temporary file; do not put the value in the
+shell command line.
+
+| Credential | Managed source and consumer | Functional validation before revocation |
+| --- | --- | --- |
+| Runtime Forgejo (`FORGE_TOKEN`) | Read-only token in the source secret for `git-activity-exporter-forge`, injected into the exporter Deployment | The ExternalSecret reports `SecretSynced=True`, Reloader has started the replacement pod, `/ready` returns `200`, and a new `meta.json` shows a published cycle |
+| Runtime S3 (`DEST_S3_*`) | The `dashboard-write-key` GarageKey and its generated/reflected `dashboard-s3-credentials` Secret | The operator and reflector report the replacement without exposing data, the exporter restarts, and the next cycle publishes to the intended bucket/prefix |
+| Release Forgejo (`FORGEJO_TOKEN`/`GIT_PASSWORD`) | Write-scoped token in `forgejo-webhook-token` in `argo-workflows`, consumed by the release WorkflowTemplate | A controlled release reaches the authenticated clone/write step and remains gated through the normal smoke and promotion checks |
+| Registry (Docker Hub) | Read/write PAT rendered as `.dockerconfigjson` in `docker-hub-registry` in `argo-workflows` | `SecretSynced=True`, Kaniko pushes the exact resolved image/cache, and the image smoke completes before promotion |
+
+### Provision, propagate, validate, revoke
+
+1. **Inventory and provision.** Record the credential's secret resource,
+   managed source, scope, consumers, and the current release/cycle health
+   timestamp. Mint a replacement with the same or narrower permissions while
+   the old credential is still valid. Runtime Forgejo needs repository read
+   scope only. Runtime S3 needs read/write access to the destination because
+   publication recovery reads and prunes objects. Release Forgejo needs only
+   the repository read/write actions used by the workflow. The Docker Hub PAT
+   needs read/write access to the image and cache repositories, not account
+   administration or deletion.
+
+2. **Write the managed source.** Write the replacement to the owning secret
+   manager, not to a generated or reflected Kubernetes Secret. Runtime Forgejo
+   is a new KV version at
+   `ardenone-cluster/git-activity-exporter/forge` / `forgejo-token`;
+   release Forgejo is the `token` property at
+   `rs-manager/iad-ci/forgejo/ci-token`; the registry is the `PAT` property at
+   `rs-manager/iad-ci/docker/build`; runtime S3 is a replacement or update of
+   the destination GarageKey. Keep the previous version/key available until
+   every consumer has passed validation. An OpenBao update is a versioned
+   write, never a delete, so rollback remains possible without recovering a
+   value from logs or a pod.
+
+3. **Propagate without reading values.** For External Secrets, use the
+   normal GitOps change to bump the resource's `force-sync` annotation when an
+   immediate refresh is needed; otherwise wait for the documented refresh
+   interval. Check only status, for example `SecretSynced=True`, resource
+   generation, pod restart time, and rollout/readiness state. Do not decode a
+   Secret, print its YAML, or use `printenv`. For runtime Secrets, wait for
+   Reloader (or the equivalent rollout controller) to restart the process,
+   because the application reads credentials at startup. For the GarageKey,
+   wait for the operator and reflector to produce the destination Secret and
+   then for the exporter and other shared writers to restart. Do not mutate an
+   ArgoCD-managed object directly with `kubectl`.
+
+4. **Validate the consumer.** Check `/health` and `/ready` on the replacement
+   runtime pod, then confirm a fresh published cycle and its pointer before
+   revoking anything. A release Forgejo rotation is valid only when the
+   release's authenticated clone/write boundary succeeds; a registry rotation
+   is valid only when Kaniko pushes the exact resolved tag and cache and the
+   smoke gate succeeds. Keep the normal ordering intact: test, resolve,
+   build, smoke, promote, then rollout verification. A registry or release
+   credential check must never be treated as a reason to skip a later gate.
+
+5. **Revoke only after validation.** Revoke the superseded provider token or
+   key and verify revocation using provider metadata or an authorization
+   result, never by printing the credential. The release Forgejo token and
+   Docker Hub PAT may be projected to other workflows/namespaces from the same
+   managed source; inventory those consumers before revoking. The reference
+   runtime S3 key is shared by other `dashboard-site` writers, so either
+   validate all of them or use a destination-specific key to reduce the blast
+   radius.
+
+### Failure and rollback behavior
+
+If provisioning, synchronization, restart, or validation fails, leave the old
+credential active and do not revoke it. Repair the managed source and repeat
+propagation; do not hand-edit the materialized Secret. If the replacement has
+already been published and is unusable, restore the previous OpenBao version
+or provider key at the source, force a refresh, and wait for the same
+status/restart checks. Temporary files containing a value must be removed
+after the managed write and must never be committed or attached to a bead.
+
+Runtime authentication or S3 failures are fail-closed: the cycle fails before
+publication, the previous S3 pointer remains authoritative, and readiness
+does not claim a newly published cycle. A release Forgejo failure stops the
+workflow at its authenticated step. A missing, invalid, or read-only registry
+credential makes `docker-build` fail and cannot reach `promote`; it must not
+be hidden with `continueOn` or a manual image-pin commit. If `resolve-version`
+already pushed an automatic `VERSION` commit, retain it as the retry anchor
+and retry the same resolved version after the credential is repaired. All
+errors and health output must remain sanitized; the credential value itself
+must not appear in provider errors, workflow output, application logs, or
+`meta.json`.
+
 ### Updating reproducibility pins
 
 Every entry in `requirements.txt` and `requirements-dev.txt` must use an exact
