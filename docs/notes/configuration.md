@@ -522,6 +522,9 @@ value ever passes through a manifest. The key is scoped read+write to the
 does come from OpenBao: ExternalSecret `git-activity-exporter-forge`
 (ClusterSecretStore `openbao-v2`, `refreshInterval: 1h`) mirrors KV v2 path
 `ardenone-cluster/git-activity-exporter/forge`, field `forgejo-token`.
+The source/target namespaces, Reflector ownership, update behavior, and
+fail-closed rotation contract are specified in
+[`deployment.md#runtime-s3-secret-reflector-contract`](deployment.md#runtime-s3-secret-reflector-contract).
 
 Two details a reuser will otherwise hit:
 
