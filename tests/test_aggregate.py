@@ -151,3 +151,71 @@ def test_worker_epoch_is_computed_per_repo():
         r["worker"] for r in rows if r["worker"] not in (None, "inferential")
     } == {"worker", "other"}
     assert any(r["worker"] == "inferential" for r in rows)
+
+
+def test_documented_worker_attribution_partitions_activity_once():
+    events = [
+        # Before the epoch, even an explicitly named actor remains
+        # inferential: the claim cannot be used to backfill the close.
+        {"repo": "NEEDLE", "ts": 3600 * 9, "issue_id": "old-close",
+         "kind": "closed", "actor": "system"},
+        {"repo": "NEEDLE", "ts": 3600 * 9 + 1, "issue_id": "old-claim",
+         "kind": "claimed", "actor": "old-worker"},
+        {"repo": "NEEDLE", "ts": 3600 * 9 + 2, "issue_id": "old-release",
+         "kind": "released", "actor": "old-worker"},
+        # The first non-system close establishes an inclusive epoch.
+        {"repo": "NEEDLE", "ts": 3600 * 10 + 10, "issue_id": "epoch-close",
+         "kind": "closed", "actor": "alice"},
+        {"repo": "NEEDLE", "ts": 3600 * 10 + 20, "issue_id": "new-claim",
+         "kind": "claimed", "actor": "alice"},
+        {"repo": "NEEDLE", "ts": 3600 * 10 + 30, "issue_id": "new-release",
+         "kind": "released", "actor": "alice"},
+        # A system event never establishes or extends attribution.
+        {"repo": "NEEDLE", "ts": 3600 * 11 + 1, "issue_id": "system-close",
+         "kind": "closed", "actor": "system"},
+        {"repo": "NEEDLE", "ts": 3600 * 11 + 2, "issue_id": "other-worker",
+         "kind": "reopened", "actor": "bob"},
+        # A repository with only system actors has no attribution epoch.
+        {"repo": "FABRIC", "ts": 3600 * 9, "issue_id": "system-only",
+         "kind": "closed", "actor": "system"},
+    ]
+    commits = [
+        _commit("NEEDLE", 3600 * 10),
+        _commit("FABRIC", 3600 * 11),
+    ]
+
+    assert beads.attribution_epochs(events) == {"NEEDLE": 3600 * 10 + 10}
+    rows = aggregate.build_hourly(commits, events, FAMILY_MAP)
+    repo_rows = [row for row in rows if row["worker"] is None]
+    worker_rows = [row for row in rows if row["worker"] is not None]
+
+    assert {row["worker"] for row in worker_rows} == {
+        "alice", "bob", "inferential"
+    }
+    assert not any(row["worker"] in {"old-worker", "system"} for row in rows)
+
+    inferential = [row for row in worker_rows if row["worker"] == "inferential"]
+    assert {(row["repo"], row["hour_epoch"]) for row in inferential} == {
+        ("NEEDLE", 9), ("NEEDLE", 11), ("FABRIC", 9)
+    }
+    alice = [row for row in worker_rows if row["worker"] == "alice"]
+    assert sum(row["beads_closed"] for row in alice) == 1
+    assert sum(row["beads_claimed"] for row in alice) == 1
+    assert sum(row["beads_released"] for row in alice) == 1
+    assert not any(row["worker"] == "system" for row in worker_rows)
+
+    event_measures = (
+        "beads_closed", "beads_closed_bulk", "beads_claimed",
+        "beads_released", "beads_reopened",
+    )
+    # The null-worker rows are the repository/fleet rollup; the named and
+    # inferential rows are its disjoint worker partitions. Selecting the
+    # appropriate side of the grain must preserve each event exactly once.
+    for measure in event_measures:
+        assert sum(row[measure] for row in repo_rows) == sum(
+            row[measure] for row in worker_rows
+        )
+    assert sum(row["commits"] for row in repo_rows) == 2
+    assert sum(row["commits"] for row in worker_rows) == 0
+    assert sum(row["beads_closed"] for row in repo_rows
+               if row["family"] == "agent-fleet") == 4
