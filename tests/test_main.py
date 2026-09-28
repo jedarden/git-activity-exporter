@@ -195,6 +195,30 @@ def test_generation_failure_uploads_nothing(monkeypatch):
     assert s3.objects == {}
 
 
+def test_storage_exhaustion_aborts_cycle_before_publication(monkeypatch):
+    cfg = _cycle_cfg()
+    s3 = RecordingS3()
+    _stub_collect(monkeypatch)
+    main._run_cycle(cfg, s3, {})
+    previous_pointer = s3io.download_bytes(
+        s3, cfg.dest.bucket, f"{cfg.dest_prefix}/current.json"
+    )
+    previous_puts = list(s3.puts)
+
+    def full_volume(*_args):
+        raise gitscan.StorageExhausted("mirror volume is full")
+
+    monkeypatch.setattr(main, "_collect", full_volume)
+
+    with pytest.raises(gitscan.StorageExhausted):
+        main._run_cycle(cfg, s3, {})
+
+    assert s3io.download_bytes(
+        s3, cfg.dest.bucket, f"{cfg.dest_prefix}/current.json"
+    ) == previous_pointer
+    assert s3.puts == previous_puts
+
+
 def test_run_cycle_publishes_one_cycle_through_the_pointer(monkeypatch):
     cfg = _cycle_cfg()
     s3 = RecordingS3()

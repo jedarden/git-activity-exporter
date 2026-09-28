@@ -45,6 +45,9 @@ def test_monitoring_manifest_scrapes_metrics_and_declares_cycle_alerts():
         "GitActivityExporterPruneFailures",
         "GitActivityExporterPublicationFailures",
         "GitActivityExporterMetricsMissing",
+        "GitActivityExporterMirrorVolumeLowSpace",
+        "GitActivityExporterMirrorVolumeCritical",
+        "GitActivityExporterMirrorVolumeMetricsMissing",
     }
     assert "last_successful_publication_timestamp_seconds" in alerts[
         "GitActivityExporterPublicationStale"
@@ -56,4 +59,14 @@ def test_monitoring_manifest_scrapes_metrics_and_declares_cycle_alerts():
     ]["expr"]
     assert "absent(git_activity_exporter_up" in alerts[
         "GitActivityExporterMetricsMissing"
+    ]["expr"]
+    assert "kubelet_volume_stats_available_bytes" in alerts[
+        "GitActivityExporterMirrorVolumeLowSpace"
+    ]["expr"]
+    assert "0.20" in alerts["GitActivityExporterMirrorVolumeLowSpace"]["expr"]
+    assert "2147483648" in alerts[
+        "GitActivityExporterMirrorVolumeCritical"
+    ]["expr"]
+    assert "absent(kubelet_volume_stats_capacity_bytes" in alerts[
+        "GitActivityExporterMirrorVolumeMetricsMissing"
     ]["expr"]

@@ -28,7 +28,7 @@ Decide these values before editing the workload:
 | Forgejo owner | `analytics` | `FORGE_OWNER` |
 | S3 bucket | `analytics-git-activity` | `DEST_S3_BUCKET` |
 | S3 prefix | `exports/git-activity` | `DEST_S3_PREFIX` |
-| Image | `registry.example/analytics/git-activity-exporter:0.1.54` | Deployment `image` |
+| Image | `registry.example/analytics/git-activity-exporter:0.1.55` | Deployment `image` |
 | Mirror volume | a writable 20 GiB or larger RWO PVC | `CLONE_ROOT` and the volume mount |
 
 Use a bucket/prefix dedicated to this exporter. Only one exporter replica may
@@ -256,6 +256,37 @@ If your cluster does not provide a default storage class, add its explicit
 `storageClassName` to the PVC before reconciling it. Do not add a second
 Deployment or a second writer for the same S3 prefix.
 
+### Mirror volume sizing and capacity
+
+The example requests the supported minimum of 20 GiB, but that is a floor,
+not a guarantee for every Forgejo owner. A mirror is a bare shallow Git
+repository, and a cold clone or history deepening temporarily needs space
+beside the existing mirror. Size the PVC for the current mirror usage plus
+the largest expected incoming mirror or pack operation, while keeping at
+least 20% free. For the measured reference fleet, the full mirror set used
+14.04 GiB (the largest individual mirror was 3.4 GiB), so 30 GiB or more is
+a sensible starting point when your fleet is similar; measure your own
+volume before choosing a smaller claim. Increase the claim as repository
+count, history depth, or the observed high-water mark grows.
+
+Copy the optional Prometheus Operator resources in
+[`examples/self-hosting/monitoring.yaml`](../examples/self-hosting/monitoring.yaml)
+with the workload. They alert when the PVC has less than 20% free space
+(`warning`, held for 15 minutes), less than 10% or 2 GiB free (`critical`,
+held for 10 minutes), and when kubelet volume statistics disappear. The
+volume-stat alerts require the cluster's Prometheus to scrape
+`kubelet_volume_stats_*`; keep the missing-metrics alert enabled so a broken
+scrape does not look like a healthy volume.
+
+When Git reports `ENOSPC` or a quota exhaustion while refreshing a mirror, the
+exporter keeps the existing mirror, removes any failed `.git.tmp` clone, and
+fails the cycle before publication. The previous S3 `current.json` remains
+authoritative, `/health` remains live, and the next poll retries after the
+PVC has been expanded or space reclaimed. Do not delete arbitrary live
+mirrors as an emergency fix; change the PVC size or reclaim known orphaned
+repositories through the normal GitOps configuration, then verify a new
+`published` cycle.
+
 ## 7. Validate the first successful cycle
 
 The first cycle can be slow because every repository is cloned into the empty
@@ -315,6 +346,8 @@ UID 1000.
 
 - Keep the mirror PVC. It is a rebuildable cache, but losing it turns the next
   cycle into a full cold clone.
+- Keep at least 20% of the mirror PVC free. Treat the low-space warning as a
+  capacity-planning alert, not as a signal to wait for Git failures.
 - Keep one replica. Scale vertically or reduce the reporting workload rather
   than adding writers.
 - Keep `SHALLOW_SINCE_DAYS >= WINDOW_DAYS`; the default adds ten days of

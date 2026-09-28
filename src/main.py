@@ -250,6 +250,10 @@ def _collect(cfg, family_map, reporting_window: Optional[ReportingWindow] = None
                 path, name, cfg.window_days, cfg.git_timeout_seconds,
                 reporting_window
             )
+        except gitscan.StorageExhausted:
+            # A full volume is a cycle-fatal infrastructure error, not a
+            # repository-sized gap that the publish guard may accept.
+            raise
         except Exception as e:
             # One unreachable or corrupt repo must not cost the whole cycle;
             # the failure is counted into meta.json so a repo silently
@@ -484,6 +488,12 @@ def main():
             # log the provider exception or endpoint, which may contain
             # credentials in a self-hosted configuration.
             log.error("%s", e)
+        except gitscan.StorageExhausted as error:
+            _record_cycle_outcome("failed")
+            # Do not publish the repositories that happened to fit. The
+            # previous complete publication remains authoritative while the
+            # PVC is expanded or space is reclaimed and the next poll retries.
+            log.error("mirror volume exhausted; cycle failed without publication: %s", error)
         except CycleWithheld as e:
             _record_cycle_outcome("withheld")
             log.warning("cycle withheld: %s", e)

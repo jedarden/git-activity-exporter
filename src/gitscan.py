@@ -6,6 +6,7 @@ clone cold, but only 1.21s to fetch incrementally. The cold pass is the
 expensive one, which is why mirrors live on a PVC and a cycle publishes
 whatever it has rather than blocking on a complete set.
 """
+import errno
 import logging
 import os
 import re
@@ -54,6 +55,15 @@ class GitTimeout(GitError):
     """
 
 
+class StorageExhausted(GitError):
+    """The mirror volume could not accept another Git write.
+
+    This is distinct from mirror corruption: deleting a last-known-good
+    mirror cannot make a full volume healthy and would turn a recoverable
+    capacity incident into a larger cold-clone incident.
+    """
+
+
 _TRANSIENT_GIT_MARKERS = (
     "connection reset",
     "connection refused",
@@ -81,6 +91,20 @@ _AUTHENTICATION_MARKERS = (
     "returned error: 401",
     "returned error: 403",
 )
+
+_STORAGE_MARKERS = (
+    "no space left on device",
+    "disk quota exceeded",
+    "quota exceeded",
+    "not enough space",
+)
+
+
+def _is_storage_exhaustion(error: Exception) -> bool:
+    if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EDQUOT):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _STORAGE_MARKERS)
 
 
 def _is_transient_remote_error(error: Exception) -> bool:
@@ -120,6 +144,8 @@ def _run(args, timeout, cwd=None, env=None):
     if proc.returncode != 0:
         stderr = _scrub(proc.stderr.strip()[:300], secrets)
         message = f"{_safe(args, secrets)} failed rc={proc.returncode}: {stderr}"
+        if _is_storage_exhaustion(stderr):
+            raise StorageExhausted(message)
         if any(marker in stderr.lower() for marker in _AUTHENTICATION_MARKERS):
             raise GitAuthenticationError(message)
         raise GitError(message)
@@ -235,14 +261,29 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
             # cost the repo its mirror AND its data.
             log.warning("fetch timed out for %s, keeping the stale mirror: %s", repo["name"], e)
             return path, False
+        except StorageExhausted:
+            # A full volume is not evidence that the existing mirror is
+            # corrupt. Keep it in place so the next cycle can scan it after
+            # the PVC is expanded or space is reclaimed.
+            log.error("mirror volume is full for %s; keeping its mirror", repo["name"])
+            raise
         except GitError as e:
             # A mirror can be left unusable by a killed clone (partial pack,
             # missing HEAD's target). Re-cloning is cheap relative to serving
             # wrong numbers from a corrupt one.
+            if _is_storage_exhaustion(e):
+                raise StorageExhausted(
+                    f"mirror volume is full while refreshing {repo['name']}"
+                ) from e
             log.warning("fetch failed for %s, re-cloning: %s", repo["name"], e)
             shutil.rmtree(path, ignore_errors=True)
 
-    os.makedirs(clone_root, exist_ok=True)
+    try:
+        os.makedirs(clone_root, exist_ok=True)
+    except OSError as error:
+        if _is_storage_exhaustion(error):
+            raise StorageExhausted("mirror volume is full") from error
+        raise
     tmp = path + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
@@ -251,11 +292,17 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
                 ["git", "clone", "--quiet", "--mirror", f"--shallow-since={since}", url, tmp],
                 timeout, env=env, before_attempt=lambda: shutil.rmtree(tmp, ignore_errors=True),
             )
+        except StorageExhausted:
+            raise
         except GitError as e:
             # "error processing shallow info" means the cutoff excludes every
             # commit on the remote -- a repo dormant longer than the window. It
             # is a legitimate repo with nothing in range, not a broken one, so
             # fall back to a minimal clone rather than dropping it from the fleet.
+            if _is_storage_exhaustion(e):
+                raise StorageExhausted(
+                    f"mirror volume is full while cloning {repo['name']}"
+                ) from e
             if "shallow info" not in str(e):
                 raise
             log.info("%s has no commits since %s; cloning at depth 1 instead", repo["name"], since)
@@ -265,7 +312,12 @@ def ensure_mirror(repo, clone_root: str, token: str, shallow_since_days: int, ti
                 timeout, env=env, before_attempt=lambda: shutil.rmtree(tmp, ignore_errors=True),
             )
         shutil.rmtree(path, ignore_errors=True)
-        os.rename(tmp, path)
+        try:
+            os.rename(tmp, path)
+        except OSError as error:
+            if _is_storage_exhaustion(error):
+                raise StorageExhausted("mirror volume is full") from error
+            raise
         return path, True
     finally:
         # A failed or timed-out clone must not leave its partial pack on the
@@ -298,7 +350,14 @@ def mirror_history_complete(path: str, window_start: datetime,
             datetime.fromisoformat(value.replace("Z", "+00:00")) for value in boundary_dates
         ]
         return all(as_utc(value).date() <= cutoff for value in parsed)
-    except (OSError, GitError, TypeError, ValueError) as error:
+    except OSError as error:
+        if _is_storage_exhaustion(error):
+            raise StorageExhausted("mirror volume is full") from error
+        log.warning("could not establish mirror history coverage for %s: %s", path, error)
+        return False
+    except (GitError, TypeError, ValueError) as error:
+        if _is_storage_exhaustion(error):
+            raise StorageExhausted("mirror volume is full") from error
         log.warning("could not establish mirror history coverage for %s: %s", path, error)
         return False
 

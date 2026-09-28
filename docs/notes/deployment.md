@@ -177,7 +177,7 @@ The profile makes every reuser-specific input visible:
   in the fixture only;
 - a single-writer mirror volume (`self-hosting-mirrors` in Compose and a
   `ReadWriteOnce` 20Gi PVC in Kubernetes); and
-- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.54`).
+- a semver-pinned exporter image (`ronaldraygun/git-activity-exporter:0.1.55`).
 
 The repository's release-drift check compares these committed image
 references with `VERSION`, rejects mutable `:latest` or untagged references,
@@ -420,6 +420,36 @@ root-owned Longhorn volume. Keep one replica and the `Recreate` strategy:
 two pods cannot safely share the RWO volume and would race while publishing
 the same S3 keys.
 
+### Mirror volume capacity
+
+The `20Gi` PVC is the supported minimum, not a universal capacity guarantee.
+Bare shallow mirrors grow with repository count and history depth, and a cold
+clone or bounded deepen needs temporary pack space beside the existing mirror.
+Size the claim for the current high-water usage plus the largest expected
+incoming mirror or pack operation, with at least 20% free remaining. The
+measured reference fleet used 14.04 GiB for its full mirror set and its
+largest mirror was 3.4 GiB; a similar fleet should start at 30 GiB or more
+and then resize from observed usage. Recheck the high-water mark after adding
+repositories, widening `SHALLOW_SINCE_DAYS`, or changing the Forgejo owner.
+
+The optional self-hosting `PrometheusRule` watches the PVC's kubelet volume
+statistics. It warns below 20% free for 15 minutes, pages critically below
+10% or 2 GiB free for 10 minutes, and warns when the capacity metric is
+missing for 15 minutes. The Prometheus instance must scrape
+`kubelet_volume_stats_available_bytes` and
+`kubelet_volume_stats_capacity_bytes`; otherwise the missing-metrics alert is
+the only safe signal. Keep the low-space threshold well above zero because a
+Git fetch can need a temporary pack before it replaces refs.
+
+When the volume fills, Git `ENOSPC`/quota errors are handled as a
+cycle-fatal storage incident. The exporter preserves an existing mirror,
+cleans a failed cold-clone `.git.tmp`, publishes nothing, and leaves the
+previous S3 pointer authoritative. `/health` remains live so the volume and
+staleness alerts can fire; after a declarative PVC expansion or known orphan
+reclamation, the next poll retries automatically. The exporter does not
+delete arbitrary live mirrors or publish the repositories that happened to
+fit.
+
 ## Resource envelope and cold start
 
 The reference Deployment requests `512Mi` of memory and limits the container
@@ -527,6 +557,9 @@ labels must match the target Prometheus instance. The reference thresholds are:
 | `prune.consecutive_failures` | At least one for 15m | warning | New data can publish while old cycle cleanup is stuck. |
 | Publication failures | At least two consecutive attempts; hold 10m | critical | The previous complete pointer remains live while new writes fail. |
 | Monitoring scrape | `/metrics` absent for 5m | critical | The alert surface itself is blind. |
+| Mirror PVC low space | Less than 20% free for 15m | warning | A cold clone or fetch may soon fail even though current cycles still publish. |
+| Mirror PVC critical space | Less than 10% or 2GiB free for 10m | critical | Git writes may fail; the exporter protects the previous publication. |
+| Mirror PVC metrics missing | Kubelet capacity metric absent for 15m | warning | Capacity alerting is blind and must be repaired before trusting the volume state. |
 
 For the default `POLL_INTERVAL_SECONDS=3600`, the two-hour windows represent
 two attempts. A single transient withheld cycle or prune error is intentionally
@@ -590,8 +623,30 @@ Secret, restart the Deployment manually, or use `kubectl apply`, `patch`,
    any prune alert must have cleared. Confirm the Prometheus target is still
    scraping and record the relevant sanitized log line and GitOps/secret
    change in the incident. If the pod itself is unhealthy, correct the image,
-   configuration, Secret source, PVC, or resource request in Git and let ArgoCD
-   reconcile; use the safe rollback procedure below for a bad release.
+configuration, Secret source, PVC, or resource request in Git and let ArgoCD
+reconcile; use the safe rollback procedure below for a bad release.
+
+### Mirror volume capacity runbook
+
+For a low-space, critical-space, or missing-volume-metrics alert:
+
+1. Confirm the alert's `namespace` and `persistentvolumeclaim` labels, then
+   inspect `kubelet_volume_stats_available_bytes` and
+   `kubelet_volume_stats_capacity_bytes` for the mirror PVC. If the metrics
+   are missing, repair the kubelet/Prometheus scrape before making a sizing
+   decision.
+2. Check `/health`, `/metrics`, and the pod logs. A full volume is reported as
+   `mirror volume exhausted; cycle failed without publication`; a prior
+   `current.json` remains the recovery anchor. Do not treat a partial cycle as
+   safe merely because some repositories scanned.
+3. Increase the PVC request through the declarative-config GitOps path when
+   the storage class supports expansion, or reclaim only known orphaned
+   mirrors by changing the owner/denylist configuration through GitOps. Do
+   not manually delete live mirrors or mutate the ArgoCD-managed PVC.
+4. Wait for the next poll and verify a new `published` outcome, a newer
+   `last_successful_cycle_at`, and a recovered free-space ratio. A PVC loss
+   is recoverable but causes a full cold clone, so allow the normal readiness
+   grace before treating the replacement pod as unhealthy.
 
 ## Argo and GitOps reconciliation
 

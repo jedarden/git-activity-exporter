@@ -126,3 +126,53 @@ spec:
             summary: "Git activity exporter metrics are missing"
             description: "Prometheus has not received the exporter metrics surface for five minutes; check the pod, ServiceMonitor, and target status."
             runbook: "docs/notes/deployment.md#cycle-alert-runbook"
+
+    - name: git-activity-exporter.storage
+      interval: 30s
+      rules:
+        - alert: GitActivityExporterMirrorVolumeLowSpace
+          expr: |
+            (
+              kubelet_volume_stats_available_bytes{namespace="git-activity-exporter",persistentvolumeclaim="git-activity-exporter-mirrors"}
+              /
+              kubelet_volume_stats_capacity_bytes{namespace="git-activity-exporter",persistentvolumeclaim="git-activity-exporter-mirrors"}
+            ) < 0.20
+          for: 15m
+          labels:
+            severity: warning
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity exporter mirror volume is low on space"
+            description: "The mirror PVC has less than 20% free space. Expand it through GitOps or reclaim capacity before the next cold clone needs room."
+            runbook: "docs/notes/deployment.md#mirror-volume-capacity-runbook"
+
+        - alert: GitActivityExporterMirrorVolumeCritical
+          expr: |
+            (
+              (
+                kubelet_volume_stats_available_bytes{namespace="git-activity-exporter",persistentvolumeclaim="git-activity-exporter-mirrors"}
+                /
+                kubelet_volume_stats_capacity_bytes{namespace="git-activity-exporter",persistentvolumeclaim="git-activity-exporter-mirrors"}
+              ) < 0.10
+            )
+            or
+            kubelet_volume_stats_available_bytes{namespace="git-activity-exporter",persistentvolumeclaim="git-activity-exporter-mirrors"} < 2147483648
+          for: 10m
+          labels:
+            severity: critical
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity exporter mirror volume is critically full"
+            description: "The mirror PVC has less than 10% or 2GiB free. Git writes may fail; the exporter will preserve the previous publication until capacity is restored."
+            runbook: "docs/notes/deployment.md#mirror-volume-capacity-runbook"
+
+        - alert: GitActivityExporterMirrorVolumeMetricsMissing
+          expr: absent(kubelet_volume_stats_capacity_bytes{namespace="git-activity-exporter",persistentvolumeclaim="git-activity-exporter-mirrors"})
+          for: 15m
+          labels:
+            severity: warning
+            component: git-activity-exporter
+          annotations:
+            summary: "Git activity exporter mirror volume capacity metrics are missing"
+            description: "Kubelet volume statistics for the mirror PVC are absent; capacity alerts cannot determine whether the volume is filling."
+            runbook: "docs/notes/deployment.md#mirror-volume-capacity-runbook"

@@ -39,6 +39,9 @@ spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
+      # 20Gi is the minimum supported size. Size for the measured mirror set
+      # plus clone/fetch headroom; see the capacity guidance and alerts in the
+      # self-hosting guide before increasing the repository fleet or history.
       storage: 20Gi
 ---
 apiVersion: apps/v1
@@ -68,7 +71,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: exporter
-          image: ronaldraygun/git-activity-exporter:0.1.54
+          image: ronaldraygun/git-activity-exporter:0.1.55
           imagePullPolicy: IfNotPresent
           ports:
             - name: health

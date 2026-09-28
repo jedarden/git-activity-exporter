@@ -247,6 +247,19 @@ listed in `repos_failed` with the reason in `repo_errors`, and the partial
 accumulate. Clone, fetch, `log`, `ls-tree` and `show` share the one bound;
 there is no separate cold-clone timeout.
 
+**Mirror-volume exhaustion is cycle-fatal and preserves usable cache state.**
+Git `ENOSPC` and quota-exhaustion errors are distinguished from corrupt-mirror
+errors. A failed refresh never deletes the existing mirror, and a failed cold
+clone removes its partial `<name>.git.tmp` directory in the normal cleanup
+path. The collector aborts the cycle instead of treating a full volume as a
+single-repository gap, so no partial result reaches S3 and the previous
+`current.json` remains authoritative. `/health` stays live, the cycle is
+reported as `failed`, and the next poll retries after the PVC is expanded or
+known orphaned mirrors are reclaimed. Capacity is monitored separately from
+the application endpoint with kubelet's `kubelet_volume_stats_*` metrics; see
+the self-hosting and deployment runbooks for the warning and critical
+thresholds.
+
 **A timed-out or failed `log` also excludes the repo.** A timeout while
 extracting commits cannot establish complete coverage, so the repo is not
 partially published. Its existing mirror is kept, and the repo is listed in

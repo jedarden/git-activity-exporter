@@ -363,6 +363,40 @@ def test_fetch_timeout_keeps_mirror_and_serves_it_stale(tmp_path, monkeypatch):
     assert "fetch" in calls[0]
 
 
+def test_fetch_storage_exhaustion_keeps_mirror_and_never_reclones(tmp_path, monkeypatch):
+    path = _fake_mirror(tmp_path)
+    calls = []
+
+    def fake_run(args, timeout, cwd=None, env=None):
+        calls.append(args)
+        raise gitscan.GitError("fatal: unable to write new objects: No space left on device")
+
+    monkeypatch.setattr(gitscan, "_run", fake_run)
+
+    with pytest.raises(gitscan.StorageExhausted, match="mirror volume is full"):
+        _ensure(_repo(), str(tmp_path), "tok", 100, 600)
+
+    assert len(calls) == 1, "capacity exhaustion must not use remote retries"
+    assert "fetch" in calls[0]
+    assert path.is_dir(), "the last known-good mirror must survive a full volume"
+    assert not (tmp_path / "x.git.tmp").exists()
+
+
+def test_clone_storage_exhaustion_cleans_partial_mirror(tmp_path, monkeypatch):
+    def fake_run(args, timeout, cwd=None, env=None):
+        assert "fetch" not in args
+        os.makedirs(args[-1])
+        raise gitscan.GitError("fatal: unable to write pack: No space left on device")
+
+    monkeypatch.setattr(gitscan, "_run", fake_run)
+
+    with pytest.raises(gitscan.StorageExhausted, match="mirror volume is full"):
+        _ensure(_repo(), str(tmp_path), "tok", 100, 600)
+
+    assert not (tmp_path / "x.git.tmp").exists()
+    assert not (tmp_path / "x.git").exists()
+
+
 def test_fetch_corruption_reclones(tmp_path, monkeypatch):
     path = _fake_mirror(tmp_path)
 

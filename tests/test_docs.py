@@ -141,6 +141,49 @@ def test_runtime_and_release_forgejo_credential_roles_are_documented():
         assert phrase in section, f"Forgejo credential-role contract missing: {phrase}"
 
 
+def test_mirror_capacity_and_exhaustion_contract_is_documented():
+    deployment = " ".join(DEPLOYMENT_MD.read_text().split())
+    self_hosting = " ".join(
+        (DEPLOYMENT_MD.parent.parent / "self-hosting.md").read_text().split()
+    )
+    monitoring = (
+        DEPLOYMENT_MD.parent.parent.parent
+        / "examples"
+        / "self-hosting"
+        / "monitoring.yaml"
+    ).read_text()
+
+    for phrase in (
+        "20Gi",
+        "14.04 GiB",
+        "largest mirror was 3.4 GiB",
+        "at least 20% free",
+        "temporary pack space",
+        "ENOSPC",
+        "preserves an existing mirror",
+        "publishes nothing",
+        "Mirror volume capacity runbook",
+    ):
+        assert phrase in deployment, f"mirror capacity contract missing from deployment.md: {phrase}"
+    for phrase in (
+        "30 GiB or more",
+        "kubelet_volume_stats_*",
+        "less than 20% free space",
+        "less than 10% or 2 GiB free",
+        "removes any failed",
+        "fails the cycle before publication",
+    ):
+        assert phrase in self_hosting, f"mirror capacity contract missing from self-hosting.md: {phrase}"
+    for phrase in (
+        "GitActivityExporterMirrorVolumeLowSpace",
+        "GitActivityExporterMirrorVolumeCritical",
+        "GitActivityExporterMirrorVolumeMetricsMissing",
+        "kubelet_volume_stats_available_bytes",
+        "kubelet_volume_stats_capacity_bytes",
+    ):
+        assert phrase in monitoring, f"mirror capacity alert missing: {phrase}"
+
+
 def test_docker_hub_registry_credential_contract_is_documented():
     text = " ".join(DEPLOYMENT_MD.read_text().split())
     _, _, section = text.partition("### Docker Hub registry credential contract")
