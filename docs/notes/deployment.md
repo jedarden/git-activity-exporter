@@ -19,19 +19,23 @@ The reference manifests are in `declarative-config`:
 
 The `git-activity-exporter-build` WorkflowTemplate runs these steps in order:
 
-1. Clone `jedarden/git-activity-exporter` from Forgejo and run
+1. The sensor copies the Forgejo push payload's `body.after` SHA into the
+   workflow's `commit-sha` parameter. The test and version steps clone the
+   application repository and check out that exact commit before running
    `pip install -r requirements-dev.txt` followed by `python -m pytest tests/ -q`.
    The test suite's release-drift gate runs `python scripts/check-release-drift.py`
    and rejects unpinned Python dependencies, mutable Dockerfile base-image
    tags, untagged images, and `:latest` references. These checks run before
    version resolution so a failed change cannot leave an auto-bump commit
    behind.
-2. Read `VERSION` from `main`. If the triggering commit changed `VERSION`,
-   that value is used. Otherwise, increment the patch component, commit the
-   new `VERSION` as `ci: auto-bump version to ...`, and push that commit back
-   to Forgejo. The sensor excludes commits authored by `Argo Workflows CI`, so
-   this CI write-back does not recursively start another build.
-3. Kaniko builds `Dockerfile` from the Forgejo `main` context and pushes
+2. Resolve `VERSION` from the captured commit. If that commit changed
+   `VERSION`, its value is used. Otherwise, increment the patch component,
+   commit the new `VERSION` as `ci: auto-bump version to ...`, and push that
+   direct child back to Forgejo. The resolver emits that child SHA as the
+   build source SHA, so the generated image contains the exact versioned
+   source it resolved. The sensor excludes commits authored by `Argo Workflows
+   CI`, so this CI write-back does not recursively start another build.
+3. Kaniko builds `Dockerfile` from the resolver's exact source SHA and pushes
    `ronaldraygun/git-activity-exporter:<version>` to Docker Hub. The workflow
    uses a pinned Kaniko image and the registry credential described below; it
    never publishes or references `:latest`.
@@ -52,8 +56,16 @@ image's embedded version comes from the `VERSION` file copied from the build
 context. Because an automatic bump is pushed before the Kaniko step, the
 source version and image tag agree. The workflow serializes releases with the
 `git-activity-exporter-release` mutex so version write-back and promotion do
-not race one another. The resolved version is a workflow output passed to every
-later stage; retries do not recalculate it.
+not race one another. The resolved version and source SHA are workflow outputs
+passed to every later stage; retries do not recalculate them.
+
+If a queued or retried run finds that `main` has advanced beyond its captured
+event SHA, it fails closed rather than pulling or rebasing the newer commit.
+That run must be released or retried only after the newer push starts its own
+workflow. The sole accepted descendant is the resolver's own direct
+`Argo Workflows CI` auto-bump commit, which a retry reuses without creating a
+second bump. This keeps tests, `VERSION`, image construction, and promotion
+attached to one source revision even while `main` changes.
 
 ### Forgejo credential roles
 
@@ -359,6 +371,14 @@ If `VERSION` was pushed but the image build or registry push failed:
    second auto-bump commit. An explicit `VERSION` commit is likewise reused.
 3. The retry builds and pushes the same `:<version>` tag. Promotion remains
    unreachable until the image smoke check succeeds.
+
+If a run was queued while another application commit advanced `main`, or a
+retry resumes after an unrelated commit has landed, the resolver rejects the
+captured SHA as stale. Do not pull or rebase that run: the newer push owns a
+separate release attempt. A retry is safe only when `main` is still the
+triggering SHA or is the direct `Argo Workflows CI` auto-bump child created by
+that same run; in the latter case the existing bump commit and its source SHA
+are reused.
 
 If the image was pushed and smoke-verified but GitOps promotion failed:
 

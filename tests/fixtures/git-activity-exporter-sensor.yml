@@ -34,3 +34,10 @@ spec:
                       value: jedarden/git-activity-exporter
                     - name: branch
                       value: main
+                    - name: commit-sha
+                      value: ""
+        parameters:
+          - src:
+              dependencyName: git-activity-exporter-push
+              dataKey: body.after
+            dest: spec.arguments.parameters.2.value

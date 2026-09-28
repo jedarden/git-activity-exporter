@@ -10,6 +10,8 @@ spec:
         value: jedarden/git-activity-exporter
       - name: branch
         value: main
+      - name: commit-sha
+        value: ""
   entrypoint: build
   synchronization:
     mutexes:
@@ -34,12 +36,16 @@ spec:
               parameters:
                 - name: version
                   value: "{{steps.resolve-version.outputs.parameters.version}}"
+                - name: source-sha
+                  value: "{{steps.resolve-version.outputs.parameters.source-sha}}"
         - - name: self-hosting-smoke
             template: self-hosting-smoke
             arguments:
               parameters:
                 - name: version
                   value: "{{steps.resolve-version.outputs.parameters.version}}"
+                - name: source-sha
+                  value: "{{steps.resolve-version.outputs.parameters.source-sha}}"
         - - name: smoke
             template: smoke
             arguments:
@@ -68,9 +74,13 @@ spec:
         command: [sh]
         source: |
           set -e
-          git clone --depth 1 --branch {{workflow.parameters.branch}} \
+          COMMIT_SHA="{{workflow.parameters.commit-sha}}"
+          printf '%s\n' "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          git clone --branch {{workflow.parameters.branch}} \
             "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" /tmp/repo
           cd /tmp/repo
+          git checkout --detach "$COMMIT_SHA"
+          test "$(git rev-parse HEAD)" = "$COMMIT_SHA"
           python -m pytest tests/ -q
         env:
           - name: GIT_CONFIG_COUNT
@@ -92,19 +102,44 @@ spec:
         command: [sh]
         source: |
           set -e
+          TRIGGER_SHA="{{workflow.parameters.commit-sha}}"
+          printf '%s\n' "$TRIGGER_SHA" | grep -Eq '^[0-9a-f]{40}$'
           git clone --branch {{workflow.parameters.branch}} \
             "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" \
             /tmp/repo
           cd /tmp/repo
+          git checkout --detach "$TRIGGER_SHA"
+          test "$(git rev-parse HEAD)" = "$TRIGGER_SHA"
+
+          # A queued or retried run may start after main has moved. Never
+          # rebase the tested source onto an unrelated commit: wait for that
+          # commit's webhook instead. The one allowed descendant is the
+          # resolver's own CI VERSION bump from a prior attempt.
+          git fetch origin main
+          MAIN_SHA=$(git rev-parse origin/main)
+          VERSION=""
+          SOURCE_SHA="$TRIGGER_SHA"
+          if [ "$MAIN_SHA" != "$TRIGGER_SHA" ]; then
+            MAIN_VERSION=$(git show "$MAIN_SHA:VERSION" | tr -d '[:space:]')
+            MAIN_SUBJECT=$(git log -1 --format=%s "$MAIN_SHA")
+            MAIN_AUTHOR=$(git log -1 --format=%an "$MAIN_SHA")
+            if [ "$(git rev-parse "$MAIN_SHA^" 2>/dev/null || true)" = "$TRIGGER_SHA" ] \
+              && [ "$MAIN_AUTHOR" = "Argo Workflows CI" ] \
+              && [ "$MAIN_SUBJECT" = "ci: auto-bump version to $MAIN_VERSION" ]; then
+              VERSION="$MAIN_VERSION"
+              SOURCE_SHA="$MAIN_SHA"
+              echo "Reusing VERSION bump ${SOURCE_SHA} for trigger ${TRIGGER_SHA}"
+            else
+              echo "main advanced beyond trigger ${TRIGGER_SHA}; refusing stale release" >&2
+              exit 1
+            fi
+          fi
 
           VERSION_CHANGED=$(git diff --name-only HEAD~1 HEAD -- VERSION 2>/dev/null | grep -c '^VERSION$' || true)
           CURRENT=$(cat VERSION | tr -d '[:space:]')
-          LAST_AUTO_BUMP=$(git log -1 --format=%s | sed -n \
-            's/^ci: auto-bump version to //p')
 
-          if [ "$LAST_AUTO_BUMP" = "$CURRENT" ]; then
-            VERSION="$CURRENT"
-            echo "Reusing existing auto-bump commit for ${VERSION}"
+          if [ -n "$VERSION" ]; then
+            :
           elif [ "$VERSION_CHANGED" -gt 0 ] 2>/dev/null; then
             VERSION="$CURRENT"
             echo "VERSION changed in commit — using ${VERSION}"
@@ -120,19 +155,16 @@ spec:
             git config user.name "Argo Workflows CI"
             git add VERSION
             git commit -m "ci: auto-bump version to ${VERSION}"
-            PUSHED=false
-            for i in 1 2 3; do
-              if git pull --rebase && git push; then
-                PUSHED=true
-                break
-              fi
-              echo "Push attempt $i failed, retrying..."
-              sleep 3
-            done
-            test "$PUSHED" = true
+            # This is intentionally a fast-forward-only write. If main moves
+            # after the check, the push fails and a newer webhook owns the
+            # next release; pulling/rebasing would build untested source.
+            git push origin HEAD:main
+            SOURCE_SHA=$(git rev-parse HEAD)
           fi
 
           echo "$VERSION" > /tmp/version
+          echo "$SOURCE_SHA" > /tmp/source-sha
+          printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
         env:
           - name: GIT_CONFIG_COUNT
             value: "1"
@@ -145,6 +177,14 @@ spec:
               secretKeyRef:
                 name: forgejo-webhook-token
                 key: token
+      outputs:
+        parameters:
+          - name: version
+            valueFrom:
+              path: /tmp/version
+          - name: source-sha
+            valueFrom:
+              path: /tmp/source-sha
     - name: smoke
       inputs:
         parameters:
@@ -167,6 +207,7 @@ spec:
       inputs:
         parameters:
           - name: version
+          - name: source-sha
       container:
         image: docker:29.7.2-dind
         command: [sh, -c]
@@ -183,9 +224,13 @@ spec:
             docker info >/dev/null
             docker compose version >/dev/null
 
-            git clone --depth 1 --branch {{workflow.parameters.branch}} \
+            git clone --branch {{workflow.parameters.branch}} \
               "https://git.ardenone.com/{{workflow.parameters.git-repo}}.git" /tmp/repo
             cd /tmp/repo
+            SOURCE_SHA="{{inputs.parameters.source-sha}}"
+            printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+            git checkout --detach "$SOURCE_SHA"
+            test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
             IMAGE="ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}"
             docker pull "$IMAGE"
             SKIP_BUILD=1 IMAGE="$IMAGE" SMOKE_PYTHON_IMAGE="$IMAGE" \
@@ -290,6 +335,7 @@ spec:
       inputs:
         parameters:
           - name: version
+          - name: source-sha
       retryStrategy:
         limit: "2"
         retryPolicy: Always
@@ -299,7 +345,7 @@ spec:
       container:
         image: gcr.io/kaniko-project/executor:v1.23.2
         args:
-          - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}
+          - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#{{inputs.parameters.source-sha}}
           - --dockerfile=Dockerfile
           - --destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
           - --build-arg=VERSION={{inputs.parameters.version}}

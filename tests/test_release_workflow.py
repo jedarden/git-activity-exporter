@@ -176,11 +176,20 @@ def _application_origin(root: Path, *, explicit_version_change: bool) -> Path:
 
 
 def _run_resolve_version(
-    workflow: dict, root: Path, origin: Path, expected_version_path: Path
-) -> str:
+    workflow: dict,
+    root: Path,
+    origin: Path,
+    expected_version_path: Path,
+    *,
+    commit_sha: str | None = None,
+    expect_failure: bool = False,
+) -> str | subprocess.CompletedProcess[str]:
     """Run the WorkflowTemplate's resolver against a local bare Git repo."""
     script = _templates(workflow)["resolve-version"]["script"]["source"]
     checkout = root / f"resolve-checkout-{expected_version_path.name}"
+    commit_sha = commit_sha or _git(
+        root, "--git-dir", str(origin), "rev-parse", "main"
+    )
     clone_pattern = re.compile(
         r'git clone --branch \{\{workflow\.parameters\.branch\}\} \\\n'
         r'\s+"https://git\.ardenone\.com/\{\{workflow\.parameters\.git-repo\}\}\.git" \\\n'
@@ -195,6 +204,8 @@ def _run_resolve_version(
     assert replacements == 1, script
     script = script.replace("/tmp/repo", str(checkout))
     script = script.replace("/tmp/version", str(expected_version_path))
+    script = script.replace("/tmp/source-sha", str(expected_version_path) + ".sha")
+    script = script.replace("{{workflow.parameters.commit-sha}}", commit_sha)
     result = subprocess.run(
         ["sh", "-c", script],
         cwd=root,
@@ -203,6 +214,9 @@ def _run_resolve_version(
         text=True,
         env=os.environ.copy(),
     )
+    if expect_failure:
+        assert result.returncode != 0
+        return result
     assert result.returncode == 0, result.stderr
     return expected_version_path.read_text(encoding="utf-8").strip()
 
@@ -373,7 +387,11 @@ def test_self_hosting_smoke_runs_as_a_pinned_image_release_gate():
         {
             "name": "version",
             "value": "{{steps.resolve-version.outputs.parameters.version}}",
-        }
+        },
+        {
+            "name": "source-sha",
+            "value": "{{steps.resolve-version.outputs.parameters.source-sha}}",
+        },
     ]
     assert smoke["container"]["image"] == "docker:29.7.2-dind"
     assert smoke["securityContext"]["privileged"] is True
@@ -393,6 +411,7 @@ def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
     assert _parameter_values(workflow) == {
         "git-repo": "jedarden/git-activity-exporter",
         "branch": "main",
+        "commit-sha": "",
     }
 
     sensor = _sensor()
@@ -402,6 +421,7 @@ def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
     assert _parameter_values(trigger_resource) == {
         "git-repo": "jedarden/git-activity-exporter",
         "branch": "main",
+        "commit-sha": "",
     }
 
     test_source = templates["test"]["script"]["source"]
@@ -428,9 +448,82 @@ def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
     assert re.search(r"\bgit\s+push\b", resolve_source)
     assert any(
         argument
-        == "--context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}"
+        == "--context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#{{inputs.parameters.source-sha}}"
         for argument in docker_args
     )
+
+
+def test_release_fixture_captures_event_sha_and_rejects_stale_main():
+    workflow = _fixture_workflow()
+    sensor = yaml.safe_load(
+        (FIXTURES / "git-activity-exporter-sensor.yml").read_text()
+    )
+    workflow_parameters = _parameter_values(workflow)
+    assert workflow_parameters["commit-sha"] == ""
+
+    trigger = sensor["spec"]["triggers"][0]["template"]
+    trigger_resource = trigger["argoWorkflow"]["source"]["resource"]
+    assert _parameter_values(trigger_resource)["commit-sha"] == ""
+    assert trigger["parameters"] == [
+        {
+            "src": {
+                "dependencyName": "git-activity-exporter-push",
+                "dataKey": "body.after",
+            },
+            "dest": "spec.arguments.parameters.2.value",
+        }
+    ]
+
+    templates = _templates(workflow)
+    test_source = templates["test"]["script"]["source"]
+    resolve_source = templates["resolve-version"]["script"]["source"]
+    smoke_source = templates["self-hosting-smoke"]["container"]["args"][0]
+    docker_args = templates["docker-build"]["container"]["args"]
+    for source in (test_source, resolve_source, smoke_source):
+        assert "git checkout --detach" in source
+        assert 'test "$(git rev-parse HEAD)" =' in source
+    assert any(
+        arg.endswith("#{{inputs.parameters.source-sha}}") for arg in docker_args
+    )
+    assert "git pull --rebase" not in resolve_source
+    assert "refusing stale release" in resolve_source
+
+
+def test_queued_release_fails_when_main_advanced_past_trigger(tmp_path):
+    workflow = _fixture_workflow()
+    application_origin = _application_origin(tmp_path, explicit_version_change=False)
+    trigger_sha = _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    )
+
+    seed = tmp_path / "application-seed"
+    (seed / "release-input.txt").write_text("newer queued change\n", encoding="utf-8")
+    _git(seed, "add", "release-input.txt")
+    _git(seed, "commit", "-m", "advance main while release is queued")
+    _git(seed, "push", "origin", "main")
+    advanced_sha = _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    )
+    assert advanced_sha != trigger_sha
+
+    result = _run_resolve_version(
+        workflow,
+        tmp_path,
+        application_origin,
+        tmp_path / "stale-version",
+        commit_sha=trigger_sha,
+        expect_failure=True,
+    )
+
+    assert "refusing stale release" in result.stderr
+    assert _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "log",
+        "--format=%s",
+        "main",
+    ).splitlines()[0] == "advance main while release is queued"
 
 
 def test_promotion_is_serialized_and_verifies_the_pushed_gitops_revision():
@@ -470,7 +563,7 @@ def test_resolved_version_drives_both_embedded_version_and_image_tag():
     assert "--build-arg=VERSION={{inputs.parameters.version}}" in args
     assert any(
         arg.startswith("--context=git://git.ardenone.com/")
-        and "refs/heads/{{workflow.parameters.branch}}" in arg
+        and arg.endswith("#{{inputs.parameters.source-sha}}")
         for arg in args
     )
     assert "echo \"$VERSION\" > /tmp/version" in templates["resolve-version"]["script"]["source"]
@@ -588,15 +681,31 @@ def test_partial_release_retries_keep_the_resolved_version_and_verification_gate
 def test_resolver_reuses_an_auto_bump_on_retry_without_a_duplicate_commit(tmp_path):
     workflow = _fixture_workflow()
     application_origin = _application_origin(tmp_path, explicit_version_change=False)
+    trigger_sha = _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    )
 
     first = _run_resolve_version(
-        workflow, tmp_path, application_origin, tmp_path / "first-version"
+        workflow,
+        tmp_path,
+        application_origin,
+        tmp_path / "first-version",
+        commit_sha=trigger_sha,
     )
     second = _run_resolve_version(
-        workflow, tmp_path, application_origin, tmp_path / "second-version"
+        workflow,
+        tmp_path,
+        application_origin,
+        tmp_path / "second-version",
+        commit_sha=trigger_sha,
     )
 
     assert first == second == "1.2.4"
+    bump_sha = _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    )
+    assert Path(f"{tmp_path / 'first-version'}.sha").read_text().strip() == bump_sha
+    assert Path(f"{tmp_path / 'second-version'}.sha").read_text().strip() == bump_sha
     commits = _git(
         tmp_path,
         "--git-dir",
