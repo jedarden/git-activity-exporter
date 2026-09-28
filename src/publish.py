@@ -51,7 +51,11 @@ That is the pre-protocol behavior preserved, not a regression; the pointer
 is the migration target and the only read path with an absolute guarantee
 (docs/notes/output-schema.md, "Publication protocol").
 
-Single-writer by deployment: one exporter replica publishes this prefix.
+Calls to this module's publication entry points are serialized by a
+process-local reentrant lock. This prevents concurrent threads in one
+exporter process from interleaving recovery, fixed-key mirroring, pointer
+commit, or pruning. It is not a cross-process or cross-pod lease; deployment
+must still keep exactly one exporter replica on a destination prefix.
 """
 import json
 import logging
@@ -149,6 +153,13 @@ _prune_state = {
     "consecutive_failures": 0,
     "last_failure_cycle_id": None,
 }
+
+# S3 has no multi-object transaction, so all mutations in one publication
+# must stay together. The lock is intentionally process-local: it closes the
+# concurrent-thread hole without pretending to be a cross-pod ownership or
+# fencing protocol. The reentrant form is required because failure recovery
+# can call recover_publication() while publish_cycle() already holds it.
+_publication_lock = threading.RLock()
 
 
 def reset_prune_health():
@@ -463,7 +474,8 @@ def recover_publication(s3, bucket: str, prefix: str, expected_names=None):
     incomplete, or mismatched pointer returns ``None`` after logging and does
     not delete or rewrite anything.
     """
-    return _reconcile_publication(s3, bucket, prefix, expected_names).cycle_id
+    with _publication_lock:
+        return _reconcile_publication(s3, bucket, prefix, expected_names).cycle_id
 
 
 def _snapshot_fixed_keys(s3, bucket: str, prefix: str, names):
@@ -488,8 +500,8 @@ def _restore_fixed_snapshot(s3, bucket: str, prefix: str, snapshot):
             s3io.delete_key(s3, bucket, f"{prefix}/{name}")
 
 
-def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
-                  generated_at: str, retention: int = RETAINED_CYCLES) -> str:
+def _publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
+                   generated_at: str, retention: int = RETAINED_CYCLES) -> str:
     """Publish one cycle. Returns the pointer key.
 
     ``payloads`` is [(name, bytes, content_type), ...]; the names become
@@ -608,6 +620,21 @@ def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
         report = _prune(s3, bucket, prefix, keep=cycle_id, retention=retention)
         _record_prune_health(cycle_id, report)
     return pointer_key
+
+
+def publish_cycle(s3, bucket: str, prefix: str, payloads, cycle_id: str,
+                  generated_at: str, retention: int = RETAINED_CYCLES) -> str:
+    """Serialize one complete S3 publication within this process.
+
+    The lock covers recovery through post-commit pruning, not just the final
+    pointer PUT. Otherwise a second caller could mirror fixed keys or prune a
+    staged prefix while the first caller was still publishing. Cross-process
+    callers still require the single-replica deployment contract.
+    """
+    with _publication_lock:
+        return _publish_cycle(
+            s3, bucket, prefix, payloads, cycle_id, generated_at, retention
+        )
 
 
 def _recover_after_failure(s3, bucket, prefix: str, phase: str, bootstrap_snapshot=None):

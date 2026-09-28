@@ -71,6 +71,18 @@ def test_legacy_fixed_key_consistency_contract_is_documented():
         assert phrase in schema, f"legacy fixed-key consistency contract missing: {phrase}"
 
 
+def test_single_writer_guard_contract_is_documented():
+    schema = " ".join(OUTPUT_SCHEMA_MD.read_text().split())
+
+    for phrase in (
+        "process-local reentrant lock",
+        "fixed-key mirroring",
+        "not an S3 lease",
+        "selected cross-process guard is therefore deployment shape",
+    ):
+        assert phrase in schema, f"single-writer guard contract missing: {phrase}"
+
+
 def test_dest_s3_variables_are_documented():
     # The README tells reusers to bring DEST_S3_* credentials, but the exact
     # variable names exist only as _require/_optional calls in config.py.

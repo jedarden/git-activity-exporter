@@ -247,12 +247,20 @@ PUTs reached S3.
 ## Single-writer deployment rule
 
 Publication is intentionally single-writer by deployment: exactly one
-exporter replica owns `DEST_S3_PREFIX`. The protocol has no S3 lock, lease,
-conditional PUT, or runtime replica assertion. Deployment shape is therefore
-part of the correctness boundary, not merely a capacity choice.
+exporter replica owns `DEST_S3_PREFIX`. Within that exporter process,
+publication entry points also take a process-local reentrant lock covering
+recovery, staging, fixed-key mirroring, the `current.json` commit, and prune.
+That lock prevents concurrent threads from interleaving the protocol, but it
+is not an S3 lease and cannot serialize separate processes or pods. The
+deployment shape therefore remains part of the correctness boundary, not
+merely a capacity choice.
 
-With two publishers, the failure is not just a lost update. None of the
-protocol's operations serializes with another publisher:
+The protocol has no cross-process S3 lock, conditional PUT, or runtime
+replica assertion. The selected cross-process guard is therefore deployment
+shape: keep exactly one exporter replica for a destination prefix.
+
+With two separate processes or pods, the failure is not just a lost update.
+None of the protocol's operations serializes with another publisher:
 
 - The prefix existence check and staged PUTs are separate operations. If two
   publishers mint the same `cycle_id`, both can observe an empty prefix and
@@ -274,7 +282,9 @@ this interleaving, and there is no automatic reconciliation. Treat every
 multi-writer deployment, including two replicas of this same image, as
 unsupported.
 
-**Decision: rely on deployment shape alone.** The reference Deployment in the
+**Decision: rely on deployment shape for cross-process exclusion.** The
+process-local lock is defense in depth, not a replacement for this rule. The
+reference Deployment in the
 `declarative-config` repository
 (`k8s/ardenone-cluster/git-activity-exporter/deployment.yml`) is pinned to
 `replicas: 1` and carries a manifest comment warning that two pods would fight
