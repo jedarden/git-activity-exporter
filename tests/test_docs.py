@@ -96,6 +96,22 @@ def test_dest_s3_variables_are_documented():
         assert f"`{name}`" in text, f"{name} missing from docs/notes/configuration.md"
 
 
+def test_repo_denylist_contract_is_documented():
+    text = " ".join(CONFIGURATION_MD.read_text().split())
+
+    for phrase in (
+        "literal comma-separated list",
+        "trimmed of surrounding whitespace",
+        "empty tokens are ignored",
+        "duplicate tokens are accepted and preserved",
+        "exact and case-sensitive",
+        "not a substring, glob, regular expression",
+        "completes the Forgejo pagination walk before applying this denylist",
+        "mirror pruning still refuses to treat that as an empty Forgejo fleet",
+    ):
+        assert phrase in text, f"REPO_DENYLIST contract missing from configuration.md: {phrase}"
+
+
 def test_forgejo_git_credential_contract_is_documented():
     text = DATA_SOURCES_MD.read_text()
     _, _, section = text.partition("### Forgejo Git credentials")

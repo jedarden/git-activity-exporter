@@ -258,6 +258,50 @@ def test_denylist_filters_the_completed_walk(monkeypatch):
     assert [r["name"] for r in out] == [f"repo-{n}" for n in range(1, forge.PAGE_SIZE + 1)]
 
 
+def test_denylist_matching_is_exact_and_case_sensitive(monkeypatch):
+    records = [
+        repo(1),
+        repo(1) | {
+            "name": "repo-1-extra",
+            "full_name": f"{OWNER}/repo-1-extra",
+            "clone_url": f"{BASE}/{OWNER}/repo-1-extra.git",
+        },
+        repo(1) | {
+            "name": "Repo-1",
+            "full_name": f"{OWNER}/Repo-1",
+            "clone_url": f"{BASE}/{OWNER}/Repo-1.git",
+        },
+    ]
+
+    out, _ = list_repos_with_pages(
+        monkeypatch,
+        [{"ok": True, "data": records}],
+        denylist=["repo-1"],
+    )
+
+    assert [record["name"] for record in out] == ["repo-1-extra", "Repo-1"]
+
+
+def test_denylisting_every_repo_does_not_make_prune_delete_mirrors(monkeypatch, tmp_path):
+    """An all-denylisted result is not permission to treat the fleet as gone."""
+    FakeForge([{"ok": True, "data": [repo(1)]}]).install(monkeypatch)
+    _mirror(tmp_path, "repo-1")
+    _mirror(tmp_path, "survivor")
+
+    cfg = _cfg(tmp_path)
+    cfg.repo_denylist = ["repo-1"]
+
+    repos, commits, events, stats = main._collect(cfg, {})
+
+    assert repos == []
+    assert commits == []
+    assert events == []
+    assert stats["repos_total"] == 0
+    assert stats["mirrors_pruned"] == []
+    assert (tmp_path / "repo-1.git").exists()
+    assert (tmp_path / "survivor.git").exists()
+
+
 # --- visibility and empty-repository behavior ------------------------------
 
 

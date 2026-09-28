@@ -149,10 +149,26 @@ def test_shallow_window_may_not_undercut_reporting_window(
         config.load()
 
 
-def test_denylist_is_trimmed_comma_separated_names(isolated_env, monkeypatch):
-    monkeypatch.setenv("REPO_DENYLIST", " repo-one, repo-two ,, repo-three, ")
+def test_denylist_trims_ignores_empty_and_preserves_duplicate_tokens(
+    isolated_env, monkeypatch
+):
+    monkeypatch.setenv(
+        "REPO_DENYLIST", " repo-one, Repo-Two ,, repo-one, , repo-three, "
+    )
 
-    assert config.load().repo_denylist == ["repo-one", "repo-two", "repo-three"]
+    assert config.load().repo_denylist == [
+        "repo-one",
+        "Repo-Two",
+        "repo-one",
+        "repo-three",
+    ]
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , , "])
+def test_blank_denylist_tokens_exclude_no_repositories(isolated_env, monkeypatch, raw):
+    monkeypatch.setenv("REPO_DENYLIST", raw)
+
+    assert config.load().repo_denylist == []
 
 
 def test_excluded_patterns_are_trimmed_literal_comma_tokens(isolated_env, monkeypatch):

@@ -35,6 +35,27 @@ everything else has a default.
 | `DEST_S3_ADDRESSING_STYLE` | `virtual` | `path` wherever the store has no per-bucket virtual-host DNS — see [Destination credentials](#destination-credentials-dest_s3_) |
 | `DEST_S3_PREFIX` | `git-activity/data` | key prefix under the bucket; trailing slash stripped |
 
+### `REPO_DENYLIST` parsing and matching contract
+
+`REPO_DENYLIST` is a literal comma-separated list of Forgejo repository
+names. Each token is trimmed of surrounding whitespace; empty tokens are
+ignored, so an unset, blank, or comma-only value produces an empty denylist
+and excludes no repositories. Non-empty duplicate tokens are accepted and
+preserved in their input order in the loaded configuration, but have no
+additional effect because filtering is a membership check.
+
+Matching is exact and case-sensitive against the Forgejo `name` field. An
+entry matches one complete repository name only: it is not a substring, glob,
+regular expression, or case-insensitive match. For example, `Repo-One` does
+not match `repo-one`, and `repo` does not match `repo-extra`.
+
+The exporter completes the Forgejo pagination walk before applying this
+denylist. A denylisted repository on a later page cannot make that page look
+like the end of the listing. If every enumerated repository is denylisted,
+the resulting live repository list is empty, but mirror pruning still refuses
+to treat that as an empty Forgejo fleet and leaves existing mirrors in place;
+the same safety applies to a genuinely successful empty API response.
+
 ## Runtime file paths and packaging
 
 `FAMILIES_FILE` and `VERSION_FILE` are ordinary file paths, not resource names.
