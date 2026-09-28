@@ -47,15 +47,21 @@ def _sensor() -> dict:
 
 
 def _deployment_resources() -> list[dict]:
-    sibling = ROOT.parent / "declarative-config" / (
-        "k8s/ardenone-cluster/git-activity-exporter/deployment.yml"
+    sibling_dir = ROOT.parent / "declarative-config" / (
+        "k8s/ardenone-cluster/git-activity-exporter"
     )
-    path = (
-        sibling
-        if sibling.is_file()
-        else ROOT / "examples" / "self-hosting" / "kubernetes.yaml"
-    )
-    return [resource for resource in yaml.safe_load_all(path.read_text()) if resource]
+    sibling = sibling_dir / "deployment.yml"
+    if sibling.is_file():
+        paths = [sibling, sibling_dir / "resourcequota.yml"]
+    else:
+        paths = [ROOT / "examples" / "self-hosting" / "kubernetes.yaml"]
+    resources = []
+    for path in paths:
+        if path.is_file():
+            resources.extend(
+                resource for resource in yaml.safe_load_all(path.read_text()) if resource
+            )
+    return resources
 
 
 def _image_fields(value):
@@ -784,6 +790,33 @@ def test_release_workflow_and_kubernetes_manifests_use_explicit_image_pins():
     assert deployment_images
     for image in (*workflow_images, *deployment_images):
         _assert_explicit_image_pin(image)
+
+
+def test_exporter_manifest_enforces_single_writer_topology():
+    resources = _deployment_resources()
+    deployments = [
+        resource
+        for resource in resources
+        if resource.get("kind") == "Deployment"
+        and resource.get("metadata", {}).get("name") == "git-activity-exporter"
+    ]
+    assert len(deployments) == 1
+    deployment = deployments[0]
+    assert deployment["spec"]["replicas"] == 1
+    assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+
+    quotas = [
+        resource
+        for resource in resources
+        if resource.get("kind") == "ResourceQuota"
+        and resource.get("metadata", {}).get("name")
+        == "git-activity-exporter-single-writer"
+    ]
+    assert len(quotas) == 1
+    assert quotas[0]["spec"]["hard"] == {"pods": "1"}
+    assert not any(
+        resource.get("kind") == "HorizontalPodAutoscaler" for resource in resources
+    )
 
 
 def test_ci_writeback_author_is_excluded_from_build_trigger():

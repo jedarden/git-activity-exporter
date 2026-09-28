@@ -189,6 +189,15 @@ if container.get("image") != expected_image:
         f"expected {expected_image!r}"
     )
 
+if spec.get("replicas") != 1:
+    raise SystemExit(
+        f"FAIL: Deployment desired replicas are {spec.get('replicas')!r}, expected 1"
+    )
+if spec.get("strategy") != {"type": "Recreate"}:
+    raise SystemExit(
+        f"FAIL: Deployment strategy is {spec.get('strategy')!r}, expected Recreate"
+    )
+
 ports = {item.get("name"): item.get("containerPort") for item in container.get("ports", [])}
 if ports.get("health") != 8080:
     raise SystemExit("FAIL: Deployment health port is not named health on 8080")
@@ -205,6 +214,37 @@ if container.get("readinessProbe", {}).get("httpGet") != {
     raise SystemExit("FAIL: readiness probe is not GET /ready on the health port")
 PY
 
+kubectl --namespace "$NAMESPACE" get horizontalpodautoscalers --output json \
+    >"$TMP_DIR/hpas.json"
+python3 - "$TMP_DIR/hpas.json" "$DEPLOYMENT" <<'PY'
+import json
+import sys
+
+path, expected_deployment = sys.argv[1:]
+items = json.loads(open(path, encoding="utf-8").read()).get("items", [])
+for hpa in items:
+    target = hpa.get("spec", {}).get("scaleTargetRef", {})
+    if target.get("kind") == "Deployment" and target.get("name") == expected_deployment:
+        name = hpa.get("metadata", {}).get("name", "<unnamed>")
+        raise SystemExit(
+            f"FAIL: HPA {name!r} targets the single-writer Deployment"
+        )
+PY
+
+kubectl --namespace "$NAMESPACE" get resourcequota \
+    "${DEPLOYMENT}-single-writer" --output json \
+    >"$TMP_DIR/resourcequota.json"
+python3 - "$TMP_DIR/resourcequota.json" <<'PY'
+import json
+import sys
+
+quota = json.loads(open(sys.argv[1], encoding="utf-8").read())
+if quota.get("spec", {}).get("hard", {}).get("pods") != "1":
+    raise SystemExit(
+        "FAIL: single-writer ResourceQuota does not cap the namespace at one pod"
+    )
+PY
+
 kubectl --namespace "$NAMESPACE" get pods --selector "$SELECTOR" --output json \
     >"$TMP_DIR/pods.json"
 python3 - "$TMP_DIR/pods.json" "$CONTAINER" "$EXPECTED_IMAGE" <<'PY'
@@ -213,8 +253,10 @@ import sys
 
 path, expected_container, expected_image = sys.argv[1:]
 pods = json.loads(open(path, encoding="utf-8").read()).get("items", [])
-if not pods:
-    raise SystemExit("FAIL: the Deployment selector returned no pods")
+if len(pods) != 1:
+    raise SystemExit(
+        f"FAIL: the Deployment selector returned {len(pods)} pods, expected exactly one"
+    )
 
 for pod in pods:
     name = pod.get("metadata", {}).get("name", "<unnamed>")

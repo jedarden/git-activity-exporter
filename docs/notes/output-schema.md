@@ -252,12 +252,14 @@ publication entry points also take a process-local reentrant lock covering
 recovery, staging, fixed-key mirroring, the `current.json` commit, and prune.
 That lock prevents concurrent threads from interleaving the protocol, but it
 is not an S3 lease and cannot serialize separate processes or pods. The
-deployment shape therefore remains part of the correctness boundary, not
+deployment topology therefore remains part of the correctness boundary, not
 merely a capacity choice.
 
 The protocol has no cross-process S3 lock, conditional PUT, or runtime
 replica assertion. The selected cross-process guard is therefore deployment
-shape: keep exactly one exporter replica for a destination prefix.
+shape: keep exactly one exporter replica for a destination prefix, and cap its
+dedicated namespace at one pod so an HPA or second poller cannot create a
+parallel writer.
 
 With two separate processes or pods, the failure is not just a lost update.
 None of the protocol's operations serializes with another publisher:
@@ -282,18 +284,19 @@ this interleaving, and there is no automatic reconciliation. Treat every
 multi-writer deployment, including two replicas of this same image, as
 unsupported.
 
-**Decision: rely on deployment shape for cross-process exclusion.** The
-process-local lock is defense in depth, not a replacement for this rule. The
-reference Deployment in the
+**Decision: rely on GitOps deployment topology for cross-process exclusion.**
+The process-local lock is defense in depth, not a replacement for this rule.
+The reference Deployment in the
 `declarative-config` repository
 (`k8s/ardenone-cluster/git-activity-exporter/deployment.yml`) is pinned to
-`replicas: 1` and carries a manifest comment warning that two pods would fight
-over the RWO PVC and double-write the same objects. That warning is an
-operational prohibition: do not manually scale the Deployment, attach an HPA,
-or run another workload with the same destination bucket and prefix. Its
-`Recreate` strategy prevents overlap during ordinary rollouts but does not
-prevent scale-out; the RWO PVC and the process-local poll loop likewise are not
-S3 writer exclusion. Reusers must preserve the same deployment boundary.
+`replicas: 1`, uses `Recreate`, and is paired with
+`resourcequota.yml`, whose `pods: "1"` hard limit caps the dedicated namespace.
+The manifest comment and quota are an operational prohibition: do not manually
+scale the Deployment, attach an HPA, or run another workload with the same
+destination bucket and prefix. `Recreate` prevents overlap during ordinary
+rollouts, while the quota prevents a second live pod; the RWO PVC and the
+process-local poll loop alone are not S3 writer exclusion. Reusers must
+preserve the same deployment boundary.
 
 Supporting more than one publisher requires a real ownership protocol, not a
 preflight existence check: unique ownership, conditional acquisition and safe

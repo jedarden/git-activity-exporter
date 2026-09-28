@@ -44,6 +44,17 @@ spec:
       # self-hosting guide before increasing the repository fleet or history.
       storage: 20Gi
 ---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: git-activity-exporter-single-writer
+  namespace: git-activity-exporter
+spec:
+  # This namespace is dedicated to the exporter. A one-pod quota prevents an
+  # HPA or a second poller from creating a concurrent publisher.
+  hard:
+    pods: "1"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -55,6 +66,8 @@ metadata:
     # which lets Kubernetes roll out a fresh process automatically.
     configmap.reloader.stakater.com/reload: git-activity-exporter-families
 spec:
+  # Publication has no cross-process lease or fencing protocol. Keep exactly
+  # one writer, and keep the namespace quota above in place.
   replicas: 1
   strategy:
     type: Recreate

@@ -425,8 +425,18 @@ The mirrors are a rebuildable cache, not the published dataset. Losing the
 PVC costs a slow cold collection cycle but does not delete S3 data. The volume
 must be writable by UID/GID 1000; the pod `fsGroup: 1000` handles a fresh
 root-owned Longhorn volume. Keep one replica and the `Recreate` strategy:
-two pods cannot safely share the RWO volume and would race while publishing
-the same S3 keys.
+the namespace's `ResourceQuota` also caps the total pod count at one. Do not
+attach an HPA or deploy another poller into this namespace. Two pods cannot
+safely share the RWO volume and would race while publishing the same S3 keys.
+
+This is a correctness boundary, not only a capacity preference. If two writers
+ever bypass the quota, their staged objects, fixed-key mirror writes, pointer
+PUTs, and pruning can interleave: the slower writer can move `current.json`
+backward, one writer can prune the other writer's in-flight cycle, and readers
+can observe a pointer whose objects are missing or mixed across cycles. The
+reference Deployment's desired `replicas: 1`, `Recreate` strategy, and one-pod
+quota are the GitOps enforcement; a second replica is unsupported until the
+publication protocol has a cross-process lease and fencing.
 
 ### Mirror volume capacity
 
@@ -708,7 +718,11 @@ The helper:
 - waits for the ArgoCD Application to be `Synced` and `Healthy`, then requires
   its observed revision to equal `--revision`;
 - inspects the Deployment template and every selected pod, requiring the
-  exact semver-pinned `--image`, a `Running`/`Ready` pod, and a ready container;
+  exact semver-pinned `--image`, desired `replicas: 1`, the `Recreate` strategy,
+  exactly one `Running`/`Ready` pod, and a ready container;
+- checks that no HorizontalPodAutoscaler targets the exporter Deployment;
+- checks that the reconciled `git-activity-exporter-single-writer`
+  `ResourceQuota` still caps the namespace at one pod;
 - checks that the Deployment's named `health` port is 8080, liveness is
   `GET /health`, and readiness is `GET /ready`;
 - creates only a loopback `kubectl port-forward` and checks live `/health=200`

@@ -30,7 +30,7 @@ def test_post_reconcile_verifier_is_executable_and_has_help():
 def test_post_reconcile_verifier_is_read_only_and_checks_every_release_boundary():
     text = SCRIPT.read_text()
     snippets = re.findall(r"<<'PY'\n(.*?)\nPY", text, re.DOTALL)
-    assert len(snippets) == 4
+    assert len(snippets) == 6
     for snippet in snippets:
         ast.parse(snippet)
 
@@ -40,7 +40,13 @@ def test_post_reconcile_verifier_is_read_only_and_checks_every_release_boundary(
         "argocd app get",
         'sync.get("revision") != expected_revision',
         'kubectl --namespace "$NAMESPACE" get deployment',
+        'spec.get("replicas") != 1',
+        'spec.get("strategy") != {"type": "Recreate"}',
+        'kubectl --namespace "$NAMESPACE" get horizontalpodautoscalers',
+        'kubectl --namespace "$NAMESPACE" get resourcequota',
+        'hard", {}).get("pods") != "1"',
         'kubectl --namespace "$NAMESPACE" get pods',
+        'len(pods) != 1',
         '"path": "/health"',
         '"path": "/ready"',
         "kubectl --namespace \"$NAMESPACE\" port-forward --address 127.0.0.1",

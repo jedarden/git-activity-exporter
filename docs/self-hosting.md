@@ -33,7 +33,9 @@ Decide these values before editing the workload:
 
 Use a bucket/prefix dedicated to this exporter. Only one exporter replica may
 write a prefix; two writers can race while publishing the fixed compatibility
-keys. Keep `replicas: 1` and `strategy.type: Recreate`.
+keys. Keep `replicas: 1` and `strategy.type: Recreate`, and keep the example's
+`ResourceQuota` with `hard.pods: "1"`; it prevents an HPA or second poller from
+creating a concurrent writer in the dedicated namespace.
 
 ## 2. Create the Forgejo credential
 
@@ -199,7 +201,8 @@ the example-specific values:
 5. Set the PVC storage class and size for your cluster. The volume must be
    writable by UID/GID 1000, mounted at `/data/mirrors`, and support
    `ReadWriteOnce`.
-6. Keep `CLONE_ROOT: /data/mirrors`, one replica, and the `Recreate` strategy.
+6. Keep `CLONE_ROOT: /data/mirrors`, one replica, the `Recreate` strategy, and
+   the one-pod `ResourceQuota`.
 7. Keep the Reloader annotation, or configure an equivalent automatic rollout
    mechanism for `git-activity-exporter-families`.
 8. If the cluster runs Prometheus Operator, copy
@@ -254,7 +257,11 @@ kubectl apply --filename examples/self-hosting/kubernetes.yaml
 
 If your cluster does not provide a default storage class, add its explicit
 `storageClassName` to the PVC before reconciling it. Do not add a second
-Deployment or a second writer for the same S3 prefix.
+Deployment or a second writer for the same S3 prefix. If two writers bypass
+the quota, their pointer and fixed-key writes can interleave and pruning can
+delete a cycle the other writer is still publishing; readers may then see a
+missing or mixed snapshot. The exporter has no cross-process lease or fencing
+to repair that state.
 
 ### Mirror volume sizing and capacity
 

@@ -77,6 +77,11 @@ def test_self_hosting_kubernetes_profile_has_pinned_single_writer_and_pvc():
     deployment = _resource("Deployment", "git-activity-exporter")
     assert deployment["spec"]["replicas"] == 1
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+    quota = _resource("ResourceQuota", "git-activity-exporter-single-writer")
+    assert quota["spec"]["hard"] == {"pods": "1"}
+    assert not any(
+        resource["kind"] == "HorizontalPodAutoscaler" for resource in _resources()
+    )
     assert deployment["metadata"]["annotations"] == {
         "configmap.reloader.stakater.com/reload": "git-activity-exporter-families",
     }
