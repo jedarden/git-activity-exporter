@@ -141,6 +141,30 @@ def test_runtime_and_release_forgejo_credential_roles_are_documented():
         assert phrase in section, f"Forgejo credential-role contract missing: {phrase}"
 
 
+def test_docker_hub_registry_credential_contract_is_documented():
+    text = " ".join(DEPLOYMENT_MD.read_text().split())
+    _, _, section = text.partition("### Docker Hub registry credential contract")
+    assert section, "deployment.md lost the Docker Hub registry credential contract"
+    section = section.split("### ", 1)[0]
+    for phrase in (
+        "docker-hub-registry",
+        "argo-workflows",
+        "kubernetes.io/dockerconfigjson",
+        ".dockerconfigjson",
+        "/kaniko/.docker/config.json",
+        "ronaldraygun/git-activity-exporter",
+        "ronaldraygun/cache",
+        "Read & Write",
+        "rs-manager/iad-ci/docker/build",
+        "force-sync",
+        "SecretSynced=True",
+        "continueOn",
+        "before `promote`",
+        "does not expose the PAT",
+    ):
+        assert phrase in section, f"Docker Hub credential contract missing: {phrase}"
+
+
 def test_plan_and_self_hosting_scope_separate_runtime_reads_from_release_writes():
     plan = " ".join(
         (DEPLOYMENT_MD.parent.parent / "plan" / "plan.md").read_text().split()

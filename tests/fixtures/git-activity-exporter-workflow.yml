@@ -2,6 +2,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
   name: git-activity-exporter-build
+  namespace: argo-workflows
 spec:
   arguments:
     parameters:
@@ -13,6 +14,13 @@ spec:
   synchronization:
     mutexes:
       - name: git-activity-exporter-release
+  volumes:
+    - name: docker-config
+      secret:
+        secretName: docker-hub-registry
+        items:
+          - key: .dockerconfigjson
+            path: config.json
   templates:
     - name: build
       steps:
@@ -292,8 +300,11 @@ spec:
         image: gcr.io/kaniko-project/executor:v1.23.2
         args:
           - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#refs/heads/{{workflow.parameters.branch}}
+          - --dockerfile=Dockerfile
           - --destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
           - --build-arg=VERSION={{inputs.parameters.version}}
+          - --cache=true
+          - --cache-repo=ronaldraygun/cache
         env:
           - name: GIT_USERNAME
             value: x-token
@@ -302,3 +313,6 @@ spec:
               secretKeyRef:
                 name: forgejo-webhook-token
                 key: token
+        volumeMounts:
+          - name: docker-config
+            mountPath: /kaniko/.docker

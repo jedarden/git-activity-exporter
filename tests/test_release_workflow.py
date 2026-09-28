@@ -471,6 +471,72 @@ def test_resolved_version_drives_both_embedded_version_and_image_tag():
     assert "COPY VERSION ." in (ROOT / "Dockerfile").read_text()
 
 
+def test_docker_hub_registry_secret_is_mounted_only_for_kaniko():
+    workflow = _workflow()
+    templates = _templates(workflow)
+
+    assert workflow["metadata"]["namespace"] == "argo-workflows"
+    volumes = {volume["name"]: volume for volume in workflow["spec"]["volumes"]}
+    assert volumes["docker-config"]["secret"] == {
+        "secretName": "docker-hub-registry",
+        "items": [{"key": ".dockerconfigjson", "path": "config.json"}],
+    }
+
+    docker = templates["docker-build"]["container"]
+    assert docker["volumeMounts"] == [
+        {"name": "docker-config", "mountPath": "/kaniko/.docker"}
+    ]
+    env = _env_by_name(docker)
+    assert env["GIT_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": "forgejo-webhook-token",
+        "key": "token",
+    }
+    assert "DOCKERHUB_TOKEN" not in env
+    assert "DOCKER_PASSWORD" not in env
+
+    args = docker["args"]
+    assert "--destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}" in args
+    assert "--cache-repo=ronaldraygun/cache" in args
+    assert all("docker-hub-registry" not in argument for argument in args)
+
+    # A registry credential must not leak into a source-test, version, or
+    # GitOps-promotion pod through a future mount or env entry.
+    for template_name in ("test", "resolve-version", "promote", "verify-rollout"):
+        template = templates[template_name]
+        assert all(
+            mount.get("name") != "docker-config"
+            for mount in template.get("volumeMounts", [])
+        )
+        assert "DOCKERHUB_TOKEN" not in _env_by_name(template)
+        assert "DOCKER_PASSWORD" not in _env_by_name(template)
+
+
+def test_missing_or_invalid_registry_credentials_cannot_reach_gitops_promotion():
+    workflow = _workflow()
+    templates = _templates(workflow)
+    steps = [group[0]["name"] for group in templates["build"]["steps"]]
+
+    # The required Secret/key is not optional, so a missing credential fails
+    # pod admission before Kaniko runs. An invalid/read-only PAT makes Kaniko
+    # fail non-zero. In either case Argo must not continue to promotion.
+    docker = templates["docker-build"]
+    registry_volume = next(
+        volume for volume in workflow["spec"]["volumes"] if volume["name"] == "docker-config"
+    )
+    assert registry_volume["secret"].get("optional") is not True
+    assert "continueOn" not in docker
+    assert "continueOn" not in templates["build"]
+    assert steps.index("docker-build") < steps.index("promote")
+
+    docker_source = "\n".join(docker.get("container", {}).get("args", []))
+    for forbidden in ("set -x", "printenv", "env |", "cat /kaniko/.docker/config.json"):
+        assert forbidden not in docker_source
+
+    promote_source = templates["promote"].get("script", {}).get("source", "")
+    assert "docker-hub-registry" not in promote_source
+    assert "/kaniko/.docker" not in promote_source
+
+
 def test_partial_release_retries_keep_the_resolved_version_and_verification_gate():
     workflow = _fixture_workflow()
     templates = _templates(workflow)
