@@ -690,9 +690,11 @@ The dashboard-site consumer should resolve `current.json` first and read only
 the four objects it names. The declarative-config factory-ledger consumer
 should use the same cycle-scoped objects and replay `ledger/joins.json` to
 prove the `workspace_uuid` + `issue_id` + claim actor/time-window join and the
-`repo` + full-SHA commit bridge. `tests/test_output_contract_fixture.py`
-checks the producer-side bytes, but does not substitute for those consumers'
-native reader tests.
+`repo` + full-SHA commit bridge. The fixture includes positive,
+zero-cardinality negative, and missing-source cases so a consumer cannot turn
+a wrong key or an absent object into verified evidence.
+`tests/test_output_contract_fixture.py` checks the producer-side bytes, but
+does not substitute for those consumers' native reader tests.
 
 ### Bead events ↔ attempt ledger: (`workspace_uuid`, `issue_id`, `actor`, time window)
 

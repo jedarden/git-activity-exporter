@@ -37,5 +37,113 @@
     "commit_identity": ["repo", "sha"],
     "sha_format": "40 lowercase hexadecimal characters",
     "cycle_scope": "resolve current.json before reading any named object"
+  },
+  "probes": {
+    "commits": [
+      {
+        "case_id": "commit-exact-match",
+        "repo": "fixture-repo",
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expected_status": "matched",
+        "expected_cardinality": 1
+      },
+      {
+        "case_id": "commit-wrong-repo",
+        "repo": "other-repo",
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expected_status": "unmatched",
+        "expected_cardinality": 0
+      },
+      {
+        "case_id": "commit-missing-sha",
+        "repo": "fixture-repo",
+        "sha": "dddddddddddddddddddddddddddddddddddddddd",
+        "expected_status": "unmatched",
+        "expected_cardinality": 0
+      }
+    ],
+    "bead_events": [
+      {
+        "case_id": "claim-exact-match",
+        "attempt_id": "attempt-redispatch",
+        "kind": "claimed",
+        "actor": "worker-b",
+        "expected_status": "matched",
+        "expected_cardinality": 1
+      },
+      {
+        "case_id": "close-exact-match",
+        "attempt_id": "attempt-redispatch",
+        "kind": "closed",
+        "actor": "system",
+        "expected_status": "matched",
+        "expected_cardinality": 1
+      },
+      {
+        "case_id": "event-wrong-workspace",
+        "attempt_id": "attempt-redispatch",
+        "workspace_uuid": "66666666-7777-8888-9999-000000000000",
+        "kind": "claimed",
+        "actor": "worker-b",
+        "expected_status": "unmatched",
+        "expected_cardinality": 0
+      },
+      {
+        "case_id": "event-wrong-actor",
+        "attempt_id": "attempt-redispatch",
+        "kind": "claimed",
+        "actor": "worker-c",
+        "expected_status": "unmatched",
+        "expected_cardinality": 0
+      }
+    ],
+    "missing_sources": [
+      {
+        "source": "commits.parquet",
+        "expected_status": "source_missing",
+        "expected_cardinality": 0
+      },
+      {
+        "source": "bead_events.parquet",
+        "expected_status": "source_missing",
+        "expected_cardinality": 0
+      }
+    ],
+    "non_matching_records": {
+      "commits": [
+        {
+          "case_id": "commit-same-repo-different-sha",
+          "attempt_id": "attempt-redispatch",
+          "repo": "fixture-repo",
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "expected_status": "unmatched",
+          "expected_cardinality": 0
+        }
+      ],
+      "bead_events": [
+        {
+          "case_id": "released-is-not-a-claim-or-close",
+          "attempt_id": "attempt-redispatch",
+          "workspace_uuid": "11111111-2222-3333-4444-555555555555",
+          "issue_id": "gitact-redispatch",
+          "kind": "released",
+          "actor": "worker-a",
+          "ts_utc": "2026-09-27T12:02:00Z",
+          "expected_status": "unmatched",
+          "expected_cardinality": 0
+        },
+        {
+          "case_id": "updated-is-not-a-claim-or-close",
+          "attempt_id": "attempt-redispatch",
+          "workspace_uuid": "11111111-2222-3333-4444-555555555555",
+          "issue_id": "gitact-redispatch",
+          "kind": "updated",
+          "actor": "system",
+          "ts_utc": "2026-09-27T12:05:00Z",
+          "expected_status": "unmatched",
+          "expected_cardinality": 0
+        }
+      ]
+    }
   }
 }

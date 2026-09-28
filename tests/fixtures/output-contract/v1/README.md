@@ -10,10 +10,12 @@ published view rather than a collection of isolated rows:
 - `cycles/<cycle_id>/` is the immutable pointer-resolved view.
 - The four files at the fixture root are the legacy fixed-key mirror. They are
   byte-identical to the objects named by the pointer.
-- `ledger/joins.json` contains attempts and expected matches for the
-  documented `(workspace_uuid, issue_id, actor, time window)` bead-event join
-  and `(repo, sha)` commit bridge. The redispatch case deliberately has a
-  `system` close: the worker must come from the in-window claim, not the close.
+- `ledger/joins.json` contains attempts and expected matches, non-matches, and
+  missing-source probes for the documented `(workspace_uuid, issue_id, actor,
+  time window)` bead-event join and `(repo, sha)` commit bridge. The
+  redispatch case deliberately has a `system` close: the worker must come from
+  the in-window claim, not the close. Every positive case is one-to-one; the
+  negative cases must produce zero candidates without losing workspace scope.
 - `manifest.json` records the fixture version and the complete Parquet column
   contract so non-Python consumers can validate the fixture without importing
   exporter code.
