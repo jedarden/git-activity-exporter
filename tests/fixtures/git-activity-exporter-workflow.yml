@@ -332,6 +332,9 @@ spec:
           curl -fsS https://argocd-ro-ardenone-manager-ts.ardenone.com:8444/api/v1/applications/git-activity-exporter-ns-ardenone-cluster
           kubectl --server=http://ardenone-cluster-traefik:8001 get deployment git-activity-exporter
     - name: docker-build
+      metadata:
+        labels:
+          ci.ardenone.com/buildkit-client: "true"
       inputs:
         parameters:
           - name: version
@@ -343,22 +346,37 @@ spec:
           duration: 5s
           factor: "2"
       container:
-        image: gcr.io/kaniko-project/executor:v1.23.2
+        image: moby/buildkit:v0.33.0-rootless@sha256:80b15f0735e87bab7bf59ec4d695dfb4a7cfb25521cf56dc75d6f256285b63ef
+        command: [/bin/sh, -ec]
         args:
-          - --context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#{{inputs.parameters.source-sha}}
-          - --dockerfile=Dockerfile
-          - --destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}
-          - --build-arg=VERSION={{inputs.parameters.version}}
-          - --cache=true
-          - --cache-repo=ronaldraygun/cache
+          - |
+            CONTEXT="https://git.ardenone.com/{{workflow.parameters.git-repo}}.git#{{inputs.parameters.source-sha}}"
+            buildctl --addr tcp://acb-buildkitd:1234 --wait build \
+              --progress=plain \
+              --frontend=dockerfile.v0 \
+              --opt "context=${CONTEXT}" \
+              --opt filename=Dockerfile \
+              --opt "build-arg:VERSION={{inputs.parameters.version}}" \
+              --secret id=GIT_AUTH_TOKEN,env=GIT_AUTH_TOKEN \
+              --output "type=image,name=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}},push=true"
         env:
-          - name: GIT_USERNAME
-            value: x-token
-          - name: GIT_PASSWORD
+          - name: DOCKER_CONFIG
+            value: /home/user/.docker
+          - name: GIT_AUTH_TOKEN
             valueFrom:
               secretKeyRef:
                 name: forgejo-webhook-token
                 key: token
         volumeMounts:
           - name: docker-config
-            mountPath: /kaniko/.docker
+            mountPath: /home/user/.docker
+            readOnly: true
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+            ephemeral-storage: 64Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+            ephemeral-storage: 256Mi

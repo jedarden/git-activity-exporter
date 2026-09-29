@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
 FAKE_RELEASE_SECRETS = {
     "FORGEJO_TOKEN": "forgejo-token-redaction-test-only",
-    "GIT_PASSWORD": "git-password-redaction-test-only",
+    "GIT_AUTH_TOKEN": "git-auth-token-redaction-test-only",
     "DOCKER_CONFIG": "docker-config-redaction-test-only",
 }
 SECRET_ENV_NAMES = frozenset(FAKE_RELEASE_SECRETS)
@@ -521,7 +521,7 @@ def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
     test_source = templates["test"]["script"]["source"]
     resolve_source = templates["resolve-version"]["script"]["source"]
     promote_source = templates["promote"]["script"]["source"]
-    docker_args = templates["docker-build"]["container"]["args"]
+    build_source = templates["docker-build"]["container"]["args"][0]
 
     for source in (test_source, resolve_source, promote_source):
         _assert_origin_only(source)
@@ -540,11 +540,10 @@ def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
     assert "git fetch origin main" in promote_source
     assert "git push origin HEAD:main" in promote_source
     assert re.search(r"\bgit\s+push\b", resolve_source)
-    assert any(
-        argument
-        == "--context=git://git.ardenone.com/{{workflow.parameters.git-repo}}.git#{{inputs.parameters.source-sha}}"
-        for argument in docker_args
-    )
+    assert (
+        'CONTEXT="https://git.ardenone.com/{{workflow.parameters.git-repo}}.git#'
+        '{{inputs.parameters.source-sha}}"'
+    ) in build_source
 
 
 def test_release_fixture_captures_event_sha_and_rejects_stale_main():
@@ -572,13 +571,11 @@ def test_release_fixture_captures_event_sha_and_rejects_stale_main():
     test_source = templates["test"]["script"]["source"]
     resolve_source = templates["resolve-version"]["script"]["source"]
     smoke_source = templates["self-hosting-smoke"]["container"]["args"][0]
-    docker_args = templates["docker-build"]["container"]["args"]
+    build_source = templates["docker-build"]["container"]["args"][0]
     for source in (test_source, resolve_source, smoke_source):
         assert "git checkout --detach" in source
         assert 'test "$(git rev-parse HEAD)" =' in source
-    assert any(
-        arg.endswith("#{{inputs.parameters.source-sha}}") for arg in docker_args
-    )
+    assert "#{{inputs.parameters.source-sha}}" in build_source
     assert "git pull --rebase" not in resolve_source
     assert "refusing stale release" in resolve_source
 
@@ -650,21 +647,20 @@ def test_resolved_version_drives_both_embedded_version_and_image_tag():
     build_steps = templates["build"]["steps"]
     resolve_output = build_steps[2][0]["arguments"]["parameters"][0]["value"]
     docker = templates["docker-build"]
-    args = docker["container"]["args"]
+    build_source = docker["container"]["args"][0]
 
     assert resolve_output == "{{steps.resolve-version.outputs.parameters.version}}"
-    assert "--destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}" in args
-    assert "--build-arg=VERSION={{inputs.parameters.version}}" in args
-    assert any(
-        arg.startswith("--context=git://git.ardenone.com/")
-        and arg.endswith("#{{inputs.parameters.source-sha}}")
-        for arg in args
-    )
+    assert (
+        "type=image,name=ronaldraygun/git-activity-exporter:"
+        "{{inputs.parameters.version}},push=true"
+    ) in build_source
+    assert '--opt "build-arg:VERSION={{inputs.parameters.version}}"' in build_source
+    assert "#{{inputs.parameters.source-sha}}" in build_source
     assert "echo \"$VERSION\" > /tmp/version" in templates["resolve-version"]["script"]["source"]
     assert "COPY VERSION ." in (ROOT / "Dockerfile").read_text()
 
 
-def test_docker_hub_registry_secret_is_mounted_only_for_kaniko():
+def test_docker_hub_registry_secret_is_mounted_only_for_buildkit():
     workflow = _workflow()
     templates = _templates(workflow)
 
@@ -677,20 +673,26 @@ def test_docker_hub_registry_secret_is_mounted_only_for_kaniko():
 
     docker = templates["docker-build"]["container"]
     assert docker["volumeMounts"] == [
-        {"name": "docker-config", "mountPath": "/kaniko/.docker"}
+        {
+            "name": "docker-config",
+            "mountPath": "/home/user/.docker",
+            "readOnly": True,
+        }
     ]
     env = _env_by_name(docker)
-    assert env["GIT_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+    assert env["GIT_AUTH_TOKEN"]["valueFrom"]["secretKeyRef"] == {
         "name": "forgejo-webhook-token",
         "key": "token",
     }
+    assert env["DOCKER_CONFIG"]["value"] == "/home/user/.docker"
     assert "DOCKERHUB_TOKEN" not in env
     assert "DOCKER_PASSWORD" not in env
 
-    args = docker["args"]
-    assert "--destination=ronaldraygun/git-activity-exporter:{{inputs.parameters.version}}" in args
-    assert "--cache-repo=ronaldraygun/cache" in args
-    assert all("docker-hub-registry" not in argument for argument in args)
+    build_source = docker["args"][0]
+    assert "type=image,name=ronaldraygun/git-activity-exporter:" in build_source
+    assert "--secret id=GIT_AUTH_TOKEN,env=GIT_AUTH_TOKEN" in build_source
+    assert "ronaldraygun/cache" not in build_source
+    assert "docker-hub-registry" not in build_source
 
     # A registry credential must not leak into a source-test, version, or
     # GitOps-promotion pod through a future mount or env entry.
@@ -722,15 +724,15 @@ def test_missing_or_invalid_registry_credentials_cannot_reach_gitops_promotion()
     assert steps.index("docker-build") < steps.index("promote")
 
     docker_source = "\n".join(docker.get("container", {}).get("args", []))
-    for forbidden in ("set -x", "printenv", "env |", "cat /kaniko/.docker/config.json"):
+    for forbidden in ("set -x", "printenv", "env |", "cat /home/user/.docker/config.json"):
         assert forbidden not in docker_source
 
     promote_source = templates["promote"].get("script", {}).get("source", "")
     assert "docker-hub-registry" not in promote_source
-    assert "/kaniko/.docker" not in promote_source
+    assert "/home/user/.docker" not in promote_source
 
 
-def test_release_fixture_redacts_fake_secrets_from_clone_push_kaniko_surfaces(
+def test_release_fixture_redacts_fake_secrets_from_clone_push_buildkit_surfaces(
     tmp_path: Path,
 ):
     """Exercise command argv and output surfaces with deliberately fake secrets."""
@@ -803,36 +805,33 @@ def test_release_fixture_redacts_fake_secrets_from_clone_push_kaniko_surfaces(
     assert git_command_count
     _assert_no_fake_secret(trace_file.read_text(), "captured Git argv")
 
-    # Kaniko receives the Forgejo password through its environment and the
-    # Docker Hub credential through a mounted file. Its argv must contain only
-    # public repository names, a version, and the pinned source reference.
+    # BuildKit receives the Forgejo token as a secret session attachment and
+    # Docker Hub credentials through a mounted file. Neither value belongs in
+    # buildctl argv, output, or image metadata.
     docker = templates["docker-build"]["container"]
-    kaniko_args = [_render_workflow_parameters(argument) for argument in docker["args"]]
-    assert all(
-        not any(name in argument for name in SECRET_ENV_NAMES)
-        and not re.search(r"\$(?:\{)?(?:FORGEJO_TOKEN|GIT_PASSWORD)\}?", argument)
-        for argument in kaniko_args
-    )
-    fake_kaniko = fake_bin / "kaniko"
-    fake_kaniko.write_text(
+    build_source = _render_workflow_parameters(docker["args"][0])
+    assert not any(secret in build_source for secret in FAKE_RELEASE_SECRETS.values())
+    assert not re.search(r"\$(?:\{)?(?:FORGEJO_TOKEN|GIT_AUTH_TOKEN)\}?", build_source)
+    fake_buildctl = fake_bin / "buildctl"
+    fake_buildctl.write_text(
         "#!/bin/sh\n"
         "printf '%s\\n' \"$@\"\n",
         encoding="utf-8",
     )
-    fake_kaniko.chmod(0o755)
-    kaniko_result = subprocess.run(
-        [str(fake_kaniko), *kaniko_args],
+    fake_buildctl.chmod(0o755)
+    buildkit_result = subprocess.run(
+        ["sh", "-ec", build_source],
         check=False,
         capture_output=True,
         text=True,
         env=command_env,
     )
-    assert kaniko_result.returncode == 0
-    _assert_no_fake_secret(kaniko_result.stdout, "captured Kaniko argv")
-    _assert_no_fake_secret(kaniko_result.stderr, "captured Kaniko stderr")
+    assert buildkit_result.returncode == 0
+    _assert_no_fake_secret(buildkit_result.stdout, "captured buildctl argv")
+    _assert_no_fake_secret(buildkit_result.stderr, "captured buildctl stderr")
 
     image_metadata = "\n".join(
-        [str(ROOT / "Dockerfile"), (ROOT / "Dockerfile").read_text(), *kaniko_args]
+        [str(ROOT / "Dockerfile"), (ROOT / "Dockerfile").read_text(), build_source]
     )
     _assert_no_fake_secret(image_metadata, "image metadata")
 
@@ -1051,15 +1050,14 @@ def test_release_paths_keep_one_version_before_gitops_promotion(
         )
 
     templates = _templates(workflow)
-    docker_args = templates["docker-build"]["container"]["args"]
-    destination = next(arg for arg in docker_args if arg.startswith("--destination="))
-    build_arg = next(arg for arg in docker_args if arg.startswith("--build-arg="))
-    assert destination.replace(
+    build_source = templates["docker-build"]["container"]["args"][0].replace(
         "{{inputs.parameters.version}}", resolved_version
-    ) == f"--destination=ronaldraygun/git-activity-exporter:{resolved_version}"
-    assert build_arg.replace(
-        "{{inputs.parameters.version}}", resolved_version
-    ) == f"--build-arg=VERSION={resolved_version}"
+    )
+    assert (
+        f"type=image,name=ronaldraygun/git-activity-exporter:{resolved_version},push=true"
+        in build_source
+    )
+    assert f'--opt "build-arg:VERSION={resolved_version}"' in build_source
 
     smoke = templates["smoke"]
     assert smoke["container"]["image"] == (
@@ -1176,9 +1174,9 @@ def test_runtime_and_release_ci_use_distinct_forgejo_credentials():
         }
         assert ci_secret != runtime_secret
 
-    kaniko_env = _env_by_name(templates["docker-build"]["container"])
-    assert "FORGE_TOKEN" not in kaniko_env
-    assert kaniko_env["GIT_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+    buildkit_env = _env_by_name(templates["docker-build"]["container"])
+    assert "FORGE_TOKEN" not in buildkit_env
+    assert buildkit_env["GIT_AUTH_TOKEN"]["valueFrom"]["secretKeyRef"] == {
         "name": ci_secret,
         "key": "token",
     }

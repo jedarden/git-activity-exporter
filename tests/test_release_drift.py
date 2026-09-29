@@ -95,8 +95,8 @@ def test_release_drift_check_rejects_latest_in_compose_image(tmp_path):
         ),
         (
             Path("tests/fixtures/git-activity-exporter-workflow.yml"),
-            "image: gcr.io/kaniko-project/executor:v1.23.2",
-            "image: gcr.io/kaniko-project/executor",
+            "image: moby/buildkit:v0.33.0-rootless@sha256:80b15f0735e87bab7bf59ec4d695dfb4a7cfb25521cf56dc75d6f256285b63ef",
+            "image: moby/buildkit",
             "tests/fixtures/git-activity-exporter-workflow.yml",
         ),
         (
@@ -172,8 +172,8 @@ def test_release_drift_check_rejects_latest_in_workflow_image(tmp_path):
     workflow = tmp_path / "tests" / "fixtures" / "git-activity-exporter-workflow.yml"
     workflow.write_text(
         workflow.read_text().replace(
-            "image: gcr.io/kaniko-project/executor:v1.23.2",
-            "image: gcr.io/kaniko-project/executor:latest",
+            "image: moby/buildkit:v0.33.0-rootless@sha256:80b15f0735e87bab7bf59ec4d695dfb4a7cfb25521cf56dc75d6f256285b63ef",
+            "image: moby/buildkit:latest",
         )
     )
 
