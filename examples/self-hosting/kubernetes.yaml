@@ -37,6 +37,10 @@ metadata:
   namespace: git-activity-exporter
 spec:
   accessModes: [ReadWriteOnce]
+  # Use an explicit approved Rackspace Cinder class; verify size limits and
+  # expansion behavior in the target cluster before adapting this profile.
+  storageClassName: sata
+  volumeMode: Filesystem
   resources:
     requests:
       # 20Gi is the minimum supported size. Size for the measured mirror set

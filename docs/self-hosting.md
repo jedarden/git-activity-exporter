@@ -29,7 +29,7 @@ Decide these values before editing the workload:
 | S3 bucket | `analytics-git-activity` | `DEST_S3_BUCKET` |
 | S3 prefix | `exports/git-activity` | `DEST_S3_PREFIX` |
 | Image | `registry.example/analytics/git-activity-exporter:0.1.56` | Deployment `image` |
-| Mirror volume | a writable 20 GiB or larger RWO PVC | `CLONE_ROOT` and the volume mount |
+| Mirror volume | writable 20 GiB or larger RWO filesystem PVC; Rackspace Spot uses `sata` or `sata-large` | `CLONE_ROOT` and the volume mount |
 
 Use a bucket/prefix dedicated to this exporter. Only one exporter replica may
 write a prefix; two writers can race while publishing the fixed compatibility
@@ -198,9 +198,13 @@ the example-specific values:
 2. Replace the S3 bucket, prefix, addressing style, and optional region.
 3. Replace the inline `families.yaml` content with your mapping.
 4. Replace the Deployment image with the pinned image you built.
-5. Set the PVC storage class and size for your cluster. The volume must be
-   writable by UID/GID 1000, mounted at `/data/mirrors`, and support
-   `ReadWriteOnce`.
+5. Set the PVC storage class and size for your cluster. The reference sets
+   `storageClassName: sata`, `ReadWriteOnce`, `volumeMode: Filesystem`, and
+   20 GiB (`20Gi`). Rackspace Cinder CSI formats this filesystem as ext4 by
+   default.
+   On Rackspace Spot, choose `sata` or `sata-large` explicitly and check its
+   supported size; do not use `ssd`/`ssd-large` or rely on a default. The mount
+   must be writable by UID/GID 1000 and match `CLONE_ROOT: /data/mirrors`.
 6. Keep `CLONE_ROOT: /data/mirrors`, one replica, the `Recreate` strategy, and
    the one-pod `ResourceQuota`.
 7. Keep the Reloader annotation, or configure an equivalent automatic rollout
@@ -255,8 +259,11 @@ Secrets exist:
 kubectl apply --filename examples/self-hosting/kubernetes.yaml
 ```
 
-If your cluster does not provide a default storage class, add its explicit
-`storageClassName` to the PVC before reconciling it. Do not add a second
+Keep `storageClassName` explicit when adapting the PVC. Rackspace Spot Cinder
+volumes cannot be expanded in place or reclassified. To grow the
+volume, provision a replacement PVC with a supported class and size, update
+the Deployment's claim reference through GitOps, and allow a cold cache rebuild
+before retiring the old claim. Do not add a second
 Deployment or a second writer for the same S3 prefix. If two writers bypass
 the quota, their pointer and fixed-key writes can interleave and pruning can
 delete a cycle the other writer is still publishing; readers may then see a
@@ -273,8 +280,11 @@ the largest expected incoming mirror or pack operation, while keeping at
 least 20% free. For the measured reference fleet, the full mirror set used
 14.04 GiB (the largest individual mirror was 3.4 GiB), so 30 GiB or more is
 a sensible starting point when your fleet is similar; measure your own
-volume before choosing a smaller claim. Increase the claim as repository
-count, history depth, or the observed high-water mark grows.
+volume before choosing a smaller claim. Increase capacity as repository
+count, history depth, or the observed high-water mark grows. Rackspace Spot
+Cinder volumes cannot grow in place, so provision a replacement PVC and update
+the Deployment's claim reference through GitOps. Check the target cluster's
+class-specific size range before choosing between `sata` and `sata-large`.
 
 Copy the optional Prometheus Operator resources in
 [`examples/self-hosting/monitoring.yaml`](../examples/self-hosting/monitoring.yaml)
@@ -288,10 +298,11 @@ scrape does not look like a healthy volume.
 When Git reports `ENOSPC` or a quota exhaustion while refreshing a mirror, the
 exporter keeps the existing mirror, removes any failed `.git.tmp` clone, and
 fails the cycle before publication. The previous S3 `current.json` remains
-authoritative, `/health` remains live, and the next poll retries after the
-PVC has been expanded or space reclaimed. Do not delete arbitrary live
-mirrors as an emergency fix; change the PVC size or reclaim known orphaned
-repositories through the normal GitOps configuration, then verify a new
+authoritative, `/health` remains live, and the next poll retries after a
+replacement PVC is attached or space is reclaimed. Do not delete arbitrary
+live mirrors as an emergency fix; provision a replacement PVC and update its
+claim reference through GitOps, or reclaim known orphaned repositories through
+the normal GitOps configuration, then verify a new
 `published` cycle.
 
 ## 7. Validate the first successful cycle

@@ -98,7 +98,11 @@ def test_self_hosting_kubernetes_profile_has_pinned_single_writer_and_pvc():
 
     pvc = _resource("PersistentVolumeClaim", "git-activity-exporter-mirrors")
     assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
-    assert pvc["spec"]["resources"]["requests"]["storage"] == "20Gi"
+    assert pvc["spec"]["storageClassName"] in {"sata", "sata-large"}
+    assert pvc["spec"]["volumeMode"] == "Filesystem"
+    requested_storage = pvc["spec"]["resources"]["requests"]["storage"]
+    assert requested_storage.endswith("Gi")
+    assert int(requested_storage.removesuffix("Gi")) >= 20
     claim_names = {
         volume["persistentVolumeClaim"]["claimName"]
         for volume in deployment["spec"]["template"]["spec"]["volumes"]
@@ -114,6 +118,47 @@ def test_self_hosting_kubernetes_profile_has_pinned_single_writer_and_pvc():
         "DEST_S3_SECRET_ACCESS_KEY",
     } <= env.keys()
     assert all("secretKeyRef" in item["valueFrom"] for item in env.values())
+
+
+def test_self_hosting_rendered_manifest_mounts_clone_root_from_the_claim():
+    config = _resource("ConfigMap", "git-activity-exporter-config")["data"]
+    deployment = _resource("Deployment", "git-activity-exporter")
+    pod_spec = deployment["spec"]["template"]["spec"]
+    container = next(
+        container
+        for container in pod_spec["containers"]
+        if container["name"] == "exporter"
+    )
+    mirror_volumes = [
+        volume for volume in pod_spec["volumes"] if volume["name"] == "mirrors"
+    ]
+    assert mirror_volumes == [{
+        "name": "mirrors",
+        "persistentVolumeClaim": {
+            "claimName": "git-activity-exporter-mirrors",
+        },
+    }]
+
+    clone_root = config["CLONE_ROOT"]
+    mounts = [
+        mount for mount in container["volumeMounts"] if mount["name"] == "mirrors"
+    ]
+    assert len(mounts) == 1
+    assert mounts[0]["mountPath"] == clone_root
+    assert mounts[0].get("readOnly", False) is False
+
+    initializer = next(
+        container
+        for container in pod_spec["initContainers"]
+        if container["name"] == "initialize-mirror-root"
+    )
+    init_mounts = [
+        mount
+        for mount in initializer["volumeMounts"]
+        if mount["name"] == "mirrors"
+    ]
+    assert len(init_mounts) == 1
+    assert init_mounts[0]["mountPath"] == clone_root
 
 
 def test_self_hosting_families_file_is_the_mounted_example():

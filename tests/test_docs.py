@@ -212,6 +212,22 @@ def test_mirror_capacity_and_exhaustion_contract_is_documented():
         assert phrase in monitoring, f"mirror capacity alert missing: {phrase}"
 
 
+def test_mirror_pvc_storage_contract_is_documented():
+    deployment = DEPLOYMENT_MD.read_text()
+    self_hosting = (DEPLOYMENT_MD.parent.parent / "self-hosting.md").read_text()
+    for document in (deployment, self_hosting):
+        for phrase in (
+            "storageClassName: sata",
+            "sata-large",
+            "volumeMode: Filesystem",
+            "20Gi",
+            "ext4",
+            "cannot be expanded",
+            "replacement PVC",
+        ):
+            assert phrase in document, f"mirror PVC contract missing: {phrase}"
+
+
 def test_docker_hub_registry_credential_contract_is_documented():
     text = " ".join(DEPLOYMENT_MD.read_text().split())
     _, _, section = text.partition("### Docker Hub registry credential contract")

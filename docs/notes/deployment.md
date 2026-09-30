@@ -579,9 +579,14 @@ scripts/smoke-self-hosting.sh
 ## PVC and single-writer requirements
 
 The exporter stores bare shallow repository mirrors under `/data/mirrors`.
-`CLONE_ROOT` must point there (the reference ConfigMap does), and
-`git-activity-exporter-mirrors` mounts that path from a `20Gi` `longhorn`
-PersistentVolumeClaim with `ReadWriteOnce` access.
+`CLONE_ROOT` must match the writable mount path there (the reference ConfigMap
+and Deployment do), and `git-activity-exporter-mirrors` mounts that path from a
+`20Gi` PersistentVolumeClaim with `ReadWriteOnce` access and
+`volumeMode: Filesystem`. The reference manifest pins `storageClassName: sata`
+instead of inheriting a cluster default. On Rackspace Spot, use only the
+approved `sata` or `sata-large` Cinder classes and confirm that the selected
+class supports the requested size. The Cinder CSI driver formats filesystem
+volumes as ext4 by default.
 
 The directory must already exist, be writable by UID/GID 1000, and contain the
 exact regular-file marker `.git-activity-exporter-clone-root` whose contents
@@ -594,7 +599,11 @@ value from deleting unrelated files.
 The mirrors are a rebuildable cache, not the published dataset. Losing the
 PVC costs a slow cold collection cycle but does not delete S3 data. The volume
 must be writable by UID/GID 1000; the pod `fsGroup: 1000` handles a fresh
-root-owned Longhorn volume. Keep one replica and the `Recreate` strategy:
+root-owned volume. Rackspace Spot Cinder volumes cannot be expanded in place
+or reclassified. Choose a supported class and enough capacity up front;
+if it fills, provision a new PVC at the required size, point the Deployment at
+it through GitOps, and let the exporter rebuild its cache before retiring the
+old claim. Keep one replica and the `Recreate` strategy:
 the namespace's `ResourceQuota` also caps the total pod count at one. Do not
 attach an HPA or deploy another poller into this namespace. Two pods cannot
 safely share the RWO volume and would race while publishing the same S3 keys.
@@ -685,7 +694,7 @@ When the volume fills, Git `ENOSPC`/quota errors are handled as a
 cycle-fatal storage incident. The exporter preserves an existing mirror,
 cleans a failed cold-clone `.git.tmp`, publishes nothing, and leaves the
 previous S3 pointer authoritative. `/health` remains live so the volume and
-staleness alerts can fire; after a declarative PVC expansion or known orphan
+staleness alerts can fire; after a replacement PVC is attached or known orphan
 reclamation, the next poll retries automatically. The exporter does not
 delete arbitrary live mirrors or publish the repositories that happened to
 fit.
@@ -879,10 +888,13 @@ For a low-space, critical-space, or missing-volume-metrics alert:
    `mirror volume exhausted; cycle failed without publication`; a prior
    `current.json` remains the recovery anchor. Do not treat a partial cycle as
    safe merely because some repositories scanned.
-3. Increase the PVC request through the declarative-config GitOps path when
-   the storage class supports expansion, or reclaim only known orphaned
-   mirrors by changing the owner/denylist configuration through GitOps. Do
-   not manually delete live mirrors or mutate the ArgoCD-managed PVC.
+3. Rackspace Spot Cinder volumes cannot be expanded in place or reclassified.
+   If capacity must grow, provision a new PVC with an approved class and
+   supported size, then update the Deployment claim reference through the
+   declarative-config GitOps path. The mirror cache will rebuild on the new
+   claim. Otherwise reclaim only known orphaned mirrors by changing the
+   owner/denylist configuration through GitOps. Do not manually delete live
+   mirrors or mutate the ArgoCD-managed PVC.
 4. Wait for the next poll and verify a new `published` outcome, a newer
    `last_successful_cycle_at`, and a recovered free-space ratio. A PVC loss
    is recoverable but causes a full cold clone, so allow the normal readiness
