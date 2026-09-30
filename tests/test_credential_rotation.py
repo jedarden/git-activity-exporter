@@ -226,6 +226,8 @@ def _resolve_pod_environment(
 
 
 def _synthetic_runtime_secrets(external_secret: dict, generation: str) -> dict:
+    """Model one provider refresh and the matching reflected S3 Secret."""
+
     provider_key = (
         "ardenone-cluster/git-activity-exporter/forge",
         "forgejo-token",
@@ -248,7 +250,7 @@ def _synthetic_runtime_secrets(external_secret: dict, generation: str) -> dict:
 
 
 def _start_smoke_pod(environment: dict[str, str], generation: str) -> subprocess.Popen:
-    """Start the real config loader with the environment projected into a pod."""
+    """Start the real config loader with SecretKeyRefs projected into a pod."""
 
     source = """
 from src.config import load
@@ -266,7 +268,13 @@ for command in sys.stdin:
             config.dest.secret_access_key,
         )
         expected = os.environ["SMOKE_EXPECTED_GENERATION"]
-        result = "ready" if all(expected in value for value in values) else "stale"
+        expected_values = (
+            f"forge-token:{expected}",
+            f"https://s3:{expected}.example.invalid",
+            f"access-key:{expected}",
+            f"secret-key:{expected}",
+        )
+        result = "ready" if values == expected_values else "stale"
         print(result, flush=True)
     elif command.strip() == "exit":
         break
@@ -287,9 +295,9 @@ for command in sys.stdin:
         text=True,
     )
     if process.stdout.readline().strip() != "started":
-        stderr = process.stderr.read()
+        process.stderr.read()
         process.kill()
-        raise AssertionError(f"runtime config did not start in smoke pod: {stderr}")
+        raise AssertionError("runtime config did not start in smoke pod")
     return process
 
 
@@ -299,14 +307,35 @@ def _probe_smoke_pod(process: subprocess.Popen) -> str:
     return process.stdout.readline().strip()
 
 
-def _stop_smoke_pod(process: subprocess.Popen) -> None:
+def _expect_smoke_pod_ready(process: subprocess.Popen) -> None:
+    if _probe_smoke_pod(process) != "ready":
+        raise AssertionError("runtime smoke probe did not report ready")
+
+
+def _stop_smoke_pod(process: subprocess.Popen) -> str:
     if process.poll() is None:
         process.stdin.write("exit\n")
         process.stdin.flush()
-        process.wait(timeout=5)
     process.stdin.close()
+    process.wait(timeout=5)
+    output = process.stdout.read() + process.stderr.read()
     process.stdout.close()
     process.stderr.close()
+    return output
+
+
+def _assert_smoke_output_redacts_credentials(
+    output: str, generations: tuple[str, ...]
+) -> None:
+    for generation in generations:
+        values = (
+            f"forge-token:{generation}",
+            f"https://s3:{generation}.example.invalid",
+            f"access-key:{generation}",
+            f"secret-key:{generation}",
+        )
+        if any(value in output for value in values):
+            raise AssertionError("synthetic credential appeared in runtime smoke output")
 
 
 def test_rotation_runbook_covers_provision_validation_revocation_and_failure():
@@ -500,24 +529,36 @@ def test_rotated_credentials_reach_the_reloader_restarted_runtime_process():
     )
     first_process = _start_smoke_pod(first_environment, "generation-a")
     replacement_process = None
+    smoke_output = ""
     try:
-        assert _probe_smoke_pod(first_process) == "ready"
+        _expect_smoke_pod_ready(first_process)
 
-        # A running container keeps its startup environment after the managed
-        # sources rotate; a Reloader-driven replacement resolves the new data.
+        # Updating the ExternalSecret's synthetic provider property and the
+        # reflected S3 Secret does not mutate a running process environment.
+        # Reloader stops that process; Kubernetes then resolves the references
+        # again for the replacement pod.
         rotated_environment = _resolve_pod_environment(
             deployment,
             configmap,
             _synthetic_runtime_secrets(external_secret, "generation-b"),
         )
-        assert _probe_smoke_pod(first_process) == "ready"
+        first_pid = first_process.pid
+        smoke_output += _stop_smoke_pod(first_process)
+        if first_process.poll() is None:
+            raise AssertionError("Reloader smoke left the old runtime process running")
+
         replacement_process = _start_smoke_pod(rotated_environment, "generation-b")
-        assert replacement_process.pid != first_process.pid
-        assert _probe_smoke_pod(replacement_process) == "ready"
+        if replacement_process.pid == first_pid:
+            raise AssertionError("runtime process did not restart after Secret rotation")
+        _expect_smoke_pod_ready(replacement_process)
     finally:
         if replacement_process is not None:
-            _stop_smoke_pod(replacement_process)
-        _stop_smoke_pod(first_process)
+            smoke_output += _stop_smoke_pod(replacement_process)
+        elif first_process.poll() is None:
+            smoke_output += _stop_smoke_pod(first_process)
+        _assert_smoke_output_redacts_credentials(
+            smoke_output, ("generation-a", "generation-b")
+        )
 
 
 def test_release_credentials_are_references_and_registry_is_not_a_workflow_input():
