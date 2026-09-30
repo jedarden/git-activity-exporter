@@ -33,6 +33,8 @@ else
 fi
 
 cleanup() {
+    docker rm -f "$PROJECT-missing-forge_token" \
+        "$PROJECT-missing-dest_s3_secret_access_key" >/dev/null 2>&1 || true
     compose --profile self-hosting down --volumes --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$SMOKE_TMP"
 }
@@ -81,6 +83,86 @@ done
 
 [[ ${health_status:-} == 200 ]]
 [[ ${ready_status:-} == 200 ]]
+
+# Exercise the image's real startup path with only synthetic credentials. The
+# healthy exporter above proves that this same harness reaches Ready when all
+# required keys are present. These isolated containers omit one runtime key at
+# a time and must exit before the /ready handler can answer successfully.
+RUNTIME_ENV="$SMOKE_TMP/runtime.env"
+cat > "$RUNTIME_ENV" <<'EOF'
+FORGE_BASE_URL=http://forgejo-fixture:8081
+FORGE_OWNER=reuser
+FORGE_TOKEN=self-hosting-forge-token
+DEST_S3_ENDPOINT=http://s3-fixture:9000
+DEST_S3_BUCKET=reuser-git-activity
+DEST_S3_PREFIX=exports/reuser
+DEST_S3_ACCESS_KEY_ID=self-hosting-access-key
+DEST_S3_SECRET_ACCESS_KEY=self-hosting-secret-key
+DEST_S3_ADDRESSING_STYLE=path
+EOF
+
+assert_missing_runtime_key_fails_closed() {
+    local key=$1
+    local name="$PROJECT-missing-${key,,}"
+    local case_env="$SMOKE_TMP/${key}.env"
+    local log="$SMOKE_TMP/${key}.log"
+    local host_port running ready_status
+
+    awk -F= -v missing_key="$key" '$1 != missing_key' "$RUNTIME_ENV" > "$case_env"
+    docker run --detach --name "$name" --network "${PROJECT}_default" \
+        --publish 127.0.0.1::8080 --env-file "$case_env" \
+        "$IMAGE" sh -c 'python -m src.main; status=$?; sleep 3; exit "$status"' >/dev/null
+
+    host_port=$(docker port "$name" 8080/tcp | sed -n '1s/.*://p')
+    if [[ -z $host_port ]]; then
+        echo "missing-key container did not publish its readiness port: key=$key" >&2
+        return 1
+    fi
+
+    # The wrapper keeps the container around briefly after the real app exits,
+    # so the smoke can probe the same port Kubernetes would use. Config
+    # validation precedes health-server start, so /ready must stay unavailable.
+    sleep 1
+    ready_status=$(curl --silent --output "$SMOKE_TMP/missing-ready" \
+        --write-out '%{http_code}' "http://127.0.0.1:$host_port/ready" || true)
+    if [[ $ready_status == 200 ]]; then
+        echo "container became Ready without required key: $key" >&2
+        return 1
+    fi
+
+    docker logs "$name" > "$log" 2>&1
+    if ! grep -Fq "config error: missing required env var: $key" "$log"; then
+        echo "container failure did not identify missing key: $key" >&2
+        return 1
+    fi
+    for value in self-hosting-forge-token self-hosting-access-key self-hosting-secret-key; do
+        if grep -Fq "$value" "$log"; then
+            echo "container failure exposed a synthetic secret value for key: $key" >&2
+            return 1
+        fi
+    done
+
+    for _ in $(seq 1 20); do
+        running=$(docker inspect --format '{{.State.Running}}' "$name")
+        [[ $running == true ]] || break
+        sleep 0.25
+    done
+    if [[ $running != false ]]; then
+        echo "container did not fail startup for missing key: $key" >&2
+        return 1
+    fi
+    exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$name")
+    if [[ $exit_code == 0 ]]; then
+        echo "container exited successfully without required key: $key" >&2
+        return 1
+    fi
+
+    docker rm "$name" >/dev/null
+    echo "missing-key smoke passed: key=$key readiness=$ready_status state=exited"
+}
+
+assert_missing_runtime_key_fails_closed FORGE_TOKEN
+assert_missing_runtime_key_fails_closed DEST_S3_SECRET_ACCESS_KEY
 
 S3_PORT=$(compose port s3-fixture 9000 | sed -n '1s/.*://p')
 BROWSER_HOST=dashboard.example.test

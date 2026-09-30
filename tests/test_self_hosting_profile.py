@@ -211,3 +211,31 @@ def test_self_hosting_s3_fixture_supports_metadata_preflight():
     # required destination permission.
     assert "def do_HEAD(self):" in fixture
     assert "include_body=False" in fixture
+
+
+def test_self_hosting_smoke_fails_closed_for_missing_runtime_credentials():
+    smoke = (ROOT / "scripts" / "smoke-self-hosting.sh").read_text()
+    assert '[[ ${ready_status:-} == 200 ]]' in smoke
+    assert '"$IMAGE" sh -c' in smoke
+    assert "python -m src.main" in smoke
+    assert 'assert_missing_runtime_key_fails_closed FORGE_TOKEN' in smoke
+    assert (
+        "assert_missing_runtime_key_fails_closed DEST_S3_SECRET_ACCESS_KEY"
+        in smoke
+    )
+    assert 'config error: missing required env var: $key' in smoke
+    assert 'if [[ $ready_status == 200 ]]' in smoke
+    assert 'docker inspect --format \'{{.State.ExitCode}}\' "$name"' in smoke
+    assert "self-hosting-secret-key" in smoke
+
+
+def test_self_hosting_forgejo_fixture_uses_an_allowed_clone_origin():
+    forgejo = (PROFILE / "mock-forgejo.py").read_text()
+    gitconfig = (PROFILE / "gitconfig").read_text()
+    clone_url = "http://forgejo-fixture:8081/{OWNER}/reuser-project.git"
+    assert clone_url in forgejo
+    assert "file://{REPO}" not in forgejo
+    assert (
+        "insteadOf = http://forgejo-fixture:8081/reuser/reuser-project.git"
+        in gitconfig
+    )

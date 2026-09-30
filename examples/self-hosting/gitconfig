@@ -1,2 +1,4 @@
+[url "file:///fixtures/reuser-project.git"]
+    insteadOf = http://forgejo-fixture:8081/reuser/reuser-project.git
 [safe]
     directory = /fixtures/reuser-project.git

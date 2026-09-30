@@ -27,7 +27,13 @@ class Handler(BaseHTTPRequestHandler):
             "data": [{
                 "name": "reuser-project",
                 "full_name": f"{OWNER}/reuser-project",
-                "clone_url": f"file://{REPO}",
+                # Keep the API URL on the configured Forgejo origin so the
+                # workload's clone URL policy exercises its normal HTTP path.
+                # gitconfig rewrites this fixture-only URL to the local bare
+                # repository mounted into the smoke container.
+                "clone_url": (
+                    f"http://forgejo-fixture:8081/{OWNER}/reuser-project.git"
+                ),
                 "empty": False,
             }]
         }
