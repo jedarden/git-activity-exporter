@@ -1,0 +1,25 @@
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageKey
+metadata:
+  name: dashboard-write-key
+  namespace: garage-operator
+spec:
+  clusterRef:
+    name: garage
+  name: Dashboard Site Write Key
+  secretTemplate:
+    name: dashboard-s3-credentials
+    annotations:
+      reflector.v1.k8s.emberstack.com/reflection-allowed: "true"
+      reflector.v1.k8s.emberstack.com/reflection-allowed-namespaces: "b2-usage-exporter,simplefin-sync,options-downloader-status-exporter,cluster-status,argo-workflows-exporter,commitgraph-dashboard,git-activity-exporter,estate-analytics"
+      reflector.v1.k8s.emberstack.com/reflection-auto-enabled: "true"
+      reflector.v1.k8s.emberstack.com/reflection-auto-namespaces: "b2-usage-exporter,simplefin-sync,options-downloader-status-exporter,cluster-status,argo-workflows-exporter,commitgraph-dashboard,git-activity-exporter,estate-analytics"
+    accessKeyIdKey: ACCESS_KEY_ID
+    secretAccessKeyKey: SECRET_ACCESS_KEY
+    endpointKey: S3_ENDPOINT
+    includeEndpoint: true
+  bucketPermissions:
+    - bucketRef:
+        name: dashboard-site
+      read: true
+      write: true
