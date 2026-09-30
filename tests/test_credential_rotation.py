@@ -24,7 +24,9 @@ CONFIGMAP_RELATIVE = Path(
 EXTERNALSECRET_RELATIVE = Path(
     "k8s/ardenone-cluster/git-activity-exporter/externalsecret.yml"
 )
+GARAGE_KEYS_RELATIVE = Path("k8s/ardenone-cluster/garage-operator/keys.yml")
 RUNTIME_MANIFEST_FIXTURE_DIR = ROOT / "tests/fixtures/git-activity-exporter-runtime"
+GARAGE_KEY_FIXTURE = RUNTIME_MANIFEST_FIXTURE_DIR / "garage-key.yml"
 
 RUNTIME_CONFIG_DATA = {
     "FORGE_BASE_URL": "https://git.ardenone.com",
@@ -167,6 +169,10 @@ def _external_secret() -> dict:
     )
 
 
+def _garage_key() -> dict:
+    return yaml.safe_load(GARAGE_KEY_FIXTURE.read_text())
+
+
 def _exporter_container(deployment: dict | None = None) -> dict:
     if deployment is None:
         deployment, _ = _deployment_and_configmap()
@@ -225,31 +231,73 @@ def _resolve_pod_environment(
     return environment
 
 
-def _synthetic_runtime_secrets(external_secret: dict, generation: str) -> dict:
-    """Model one provider refresh and the matching reflected S3 Secret."""
+def _materialize_garage_key_secret(garage_key: dict, generation: str) -> dict:
+    """Model GarageKey rotating its credentials into its configured Secret."""
 
-    provider_key = (
-        "ardenone-cluster/git-activity-exporter/forge",
-        "forgejo-token",
-    )
-    forge_secret = _materialize_external_secret(
-        external_secret, {provider_key: f"forge-token:{generation}"}
-    )
-    s3_secret = {
-        "name": "dashboard-s3-credentials",
-        "data": {
-            "S3_ENDPOINT": f"https://s3:{generation}.example.invalid",
-            "ACCESS_KEY_ID": f"access-key:{generation}",
-            "SECRET_ACCESS_KEY": f"secret-key:{generation}",
-        },
+    template = garage_key["spec"]["secretTemplate"]
+    data = {
+        template["accessKeyIdKey"]: f"access-key:{generation}",
+        template["secretAccessKeyKey"]: f"secret-key:{generation}",
     }
+    if template.get("includeEndpoint"):
+        data[template["endpointKey"]] = f"https://s3:{generation}.example.invalid"
+    return {
+        "name": template["name"],
+        "namespace": garage_key["metadata"]["namespace"],
+        "annotations": template.get("annotations", {}),
+        "data": data,
+    }
+
+
+def _reflect_garage_key_secret(source_secret: dict, target_namespace: str) -> dict:
+    """Model the configured reflector copy into the runtime namespace."""
+
+    annotations = source_secret["annotations"]
+    allowed_namespaces = set(
+        annotations.get(
+            "reflector.v1.k8s.emberstack.com/reflection-allowed-namespaces", ""
+        ).split(",")
+    )
+    automatic_namespaces = set(
+        annotations.get(
+            "reflector.v1.k8s.emberstack.com/reflection-auto-namespaces", ""
+        ).split(",")
+    )
+    allowed_namespaces = {namespace.strip() for namespace in allowed_namespaces}
+    automatic_namespaces = {namespace.strip() for namespace in automatic_namespaces}
+    if (
+        annotations.get("reflector.v1.k8s.emberstack.com/reflection-allowed") != "true"
+        or annotations.get("reflector.v1.k8s.emberstack.com/reflection-auto-enabled")
+        != "true"
+        or target_namespace not in allowed_namespaces
+        or target_namespace not in automatic_namespaces
+    ):
+        raise RuntimeError("GarageKey Secret is not configured for runtime reflection")
+    return {"name": source_secret["name"], "data": source_secret["data"]}
+
+
+def _synthetic_runtime_secrets(
+    external_secret: dict, garage_key: dict, generation: str
+) -> dict:
+    """Run synthetic provider values through the configured Secret paths."""
+
+    provider_values = {
+        (item["remoteRef"]["key"], item["remoteRef"]["property"]):
+        f"forge-token:{generation}"
+        for item in external_secret["spec"]["data"]
+    }
+    forge_secret = _materialize_external_secret(external_secret, provider_values)
+    runtime_namespace = external_secret["metadata"]["namespace"]
+    s3_secret = _reflect_garage_key_secret(
+        _materialize_garage_key_secret(garage_key, generation), runtime_namespace
+    )
     return {
         forge_secret["name"]: forge_secret["data"],
         s3_secret["name"]: s3_secret["data"],
     }
 
 
-def _start_smoke_pod(environment: dict[str, str], generation: str) -> subprocess.Popen:
+def _start_smoke_pod(environment: dict[str, str]) -> subprocess.Popen:
     """Start the real config loader with SecretKeyRefs projected into a pod."""
 
     source = """
@@ -260,14 +308,14 @@ import sys
 config = load()
 print("started", flush=True)
 for command in sys.stdin:
-    if command.strip() == "probe":
+    if command.startswith("probe "):
         values = (
             config.forge_token,
             config.dest.endpoint_url,
             config.dest.access_key_id,
             config.dest.secret_access_key,
         )
-        expected = os.environ["SMOKE_EXPECTED_GENERATION"]
+        expected = command.split(" ", maxsplit=1)[1].strip()
         expected_values = (
             f"forge-token:{expected}",
             f"https://s3:{expected}.example.invalid",
@@ -283,7 +331,6 @@ for command in sys.stdin:
         "PATH": os.environ.get("PATH", ""),
         "PYTHONPATH": str(ROOT),
         **environment,
-        "SMOKE_EXPECTED_GENERATION": generation,
     }
     process = subprocess.Popen(
         [sys.executable, "-u", "-c", source],
@@ -294,22 +341,71 @@ for command in sys.stdin:
         stderr=subprocess.PIPE,
         text=True,
     )
-    if process.stdout.readline().strip() != "started":
+    startup = process.stdout.readline().strip()
+    if startup != "started":
         process.stderr.read()
         process.kill()
         raise AssertionError("runtime config did not start in smoke pod")
+    process._smoke_output = [startup]
     return process
 
 
-def _probe_smoke_pod(process: subprocess.Popen) -> str:
-    process.stdin.write("probe\n")
+def _probe_smoke_pod(process: subprocess.Popen, generation: str) -> str:
+    process.stdin.write(f"probe {generation}\n")
     process.stdin.flush()
-    return process.stdout.readline().strip()
+    result = process.stdout.readline().strip()
+    process._smoke_output.append(result)
+    return result
 
 
-def _expect_smoke_pod_ready(process: subprocess.Popen) -> None:
-    if _probe_smoke_pod(process) != "ready":
+def _expect_smoke_pod_ready(process: subprocess.Popen, generation: str) -> None:
+    if _probe_smoke_pod(process, generation) != "ready":
         raise AssertionError("runtime smoke probe did not report ready")
+
+
+class _ReloaderSmokeHarness:
+    """Model the configured Reloader Secret watch in a disposable process."""
+
+    def __init__(self, deployment: dict, configmap: dict, secrets: dict):
+        self.deployment = deployment
+        self.configmap = configmap
+        self.secrets = secrets
+        self.process = _start_smoke_pod(
+            _resolve_pod_environment(deployment, configmap, secrets)
+        )
+
+    def update_secrets(self, secrets: dict) -> tuple[int, str]:
+        old_process = self.process
+        old_pid = old_process.pid
+        container = _exporter_container(self.deployment)
+        referenced_secrets = {
+            entry["valueFrom"]["secretKeyRef"]["name"]
+            for entry in container["env"]
+            if "secretKeyRef" in entry.get("valueFrom", {})
+        }
+        changed_secrets = {
+            name
+            for name in referenced_secrets
+            if self.secrets.get(name) != secrets.get(name)
+        }
+        if not changed_secrets:
+            return old_pid, "unchanged"
+
+        # Reloader observes changes to referenced Secrets on auto-enabled
+        # workloads and replaces the Pod; the replacement resolves SecretKeyRefs
+        # again from the updated Secret set.
+        if self.deployment["metadata"].get("annotations", {}).get(
+            "reloader.stakater.com/auto"
+        ) != "true":
+            self.secrets = secrets
+            return old_pid, "not-reloaded"
+
+        old_output = _stop_smoke_pod(old_process)
+        self.secrets = secrets
+        self.process = _start_smoke_pod(
+            _resolve_pod_environment(self.deployment, self.configmap, secrets)
+        )
+        return old_pid, old_output
 
 
 def _stop_smoke_pod(process: subprocess.Popen) -> str:
@@ -318,10 +414,12 @@ def _stop_smoke_pod(process: subprocess.Popen) -> str:
         process.stdin.flush()
     process.stdin.close()
     process.wait(timeout=5)
-    output = process.stdout.read() + process.stderr.read()
+    process._smoke_output.extend(process.stdout.read().splitlines())
+    stderr = process.stderr.read()
     process.stdout.close()
     process.stderr.close()
-    return output
+    process._smoke_output.append(stderr)
+    return "\n".join(process._smoke_output)
 
 
 def _assert_smoke_output_redacts_credentials(
@@ -430,7 +528,7 @@ def test_rendered_runtime_manifests_map_config_and_external_secret_to_required_e
     projected = _resolve_pod_environment(
         deployment,
         configmap,
-        _synthetic_runtime_secrets(external_secret, "generation-a"),
+        _synthetic_runtime_secrets(external_secret, _garage_key(), "generation-a"),
     )
     assert REQUIRED_APPLICATION_ENV <= projected.keys()
     assert {name: projected[name] for name in configmap["data"]} == configmap["data"]
@@ -489,6 +587,21 @@ def test_available_gitops_manifests_match_checked_in_rendered_fixtures():
         "reloader.stakater.com/auto": "true"
     }
 
+    garage_keys_path = ROOT.parent / "declarative-config" / GARAGE_KEYS_RELATIVE
+    if garage_keys_path.is_file():
+        live_garage_keys = [
+            resource
+            for resource in yaml.safe_load_all(garage_keys_path.read_text())
+            if resource
+        ]
+        live_garage_key = next(
+            resource
+            for resource in live_garage_keys
+            if resource["kind"] == "GarageKey"
+            and resource["metadata"]["name"] == "dashboard-write-key"
+        )
+        assert live_garage_key == _garage_key()
+
 
 @pytest.mark.parametrize(
     ("secret_name", "secret_key"),
@@ -503,7 +616,9 @@ def test_missing_required_runtime_secret_key_fails_pod_environment_resolution(
     secret_name, secret_key
 ):
     deployment, configmap = _deployment_and_configmap()
-    secrets = _synthetic_runtime_secrets(_external_secret(), "generation-a")
+    secrets = _synthetic_runtime_secrets(
+        _external_secret(), _garage_key(), "generation-a"
+    )
     del secrets[secret_name][secret_key]
 
     with pytest.raises(RuntimeError, match="required SecretKeyRef"):
@@ -513,6 +628,7 @@ def test_missing_required_runtime_secret_key_fails_pod_environment_resolution(
 def test_rotated_credentials_reach_the_reloader_restarted_runtime_process():
     deployment, configmap = _deployment_and_configmap()
     external_secret = _external_secret()
+    garage_key = _garage_key()
     assert (
         deployment["metadata"]["annotations"]["reloader.stakater.com/auto"]
         == "true"
@@ -522,39 +638,38 @@ def test_rotated_credentials_reach_the_reloader_restarted_runtime_process():
         == "true"
     )
 
-    first_environment = _resolve_pod_environment(
+    workload = _ReloaderSmokeHarness(
         deployment,
         configmap,
-        _synthetic_runtime_secrets(external_secret, "generation-a"),
+        _synthetic_runtime_secrets(external_secret, garage_key, "generation-a"),
     )
-    first_process = _start_smoke_pod(first_environment, "generation-a")
-    replacement_process = None
+    first_process = workload.process
     smoke_output = ""
     try:
-        _expect_smoke_pod_ready(first_process)
+        _expect_smoke_pod_ready(first_process, "generation-a")
 
-        # Updating the ExternalSecret's synthetic provider property and the
-        # reflected S3 Secret does not mutate a running process environment.
-        # Reloader stops that process; Kubernetes then resolves the references
-        # again for the replacement pod.
-        rotated_environment = _resolve_pod_environment(
-            deployment,
-            configmap,
-            _synthetic_runtime_secrets(external_secret, "generation-b"),
+        # Refresh the ExternalSecret's provider property and rotate the
+        # GarageKey Secret; the reflector then updates its runtime namespace
+        # copy. The auto-enabled workload replaces its process on those Secret
+        # changes, and the replacement resolves the new SecretKeyRefs.
+        rotated_secrets = _synthetic_runtime_secrets(
+            external_secret, garage_key, "generation-b"
         )
-        first_pid = first_process.pid
-        smoke_output += _stop_smoke_pod(first_process)
+        first_pid, old_output = workload.update_secrets(rotated_secrets)
+        smoke_output += old_output
         if first_process.poll() is None:
             raise AssertionError("Reloader smoke left the old runtime process running")
 
-        replacement_process = _start_smoke_pod(rotated_environment, "generation-b")
+        replacement_process = workload.process
         if replacement_process.pid == first_pid:
             raise AssertionError("runtime process did not restart after Secret rotation")
-        _expect_smoke_pod_ready(replacement_process)
+        if _probe_smoke_pod(replacement_process, "generation-a") != "stale":
+            raise AssertionError("replacement workload still accepted the old credentials")
+        _expect_smoke_pod_ready(replacement_process, "generation-b")
     finally:
-        if replacement_process is not None:
-            smoke_output += _stop_smoke_pod(replacement_process)
-        elif first_process.poll() is None:
+        if workload.process.poll() is None:
+            smoke_output += _stop_smoke_pod(workload.process)
+        if first_process.poll() is None:
             smoke_output += _stop_smoke_pod(first_process)
         _assert_smoke_output_redacts_credentials(
             smoke_output, ("generation-a", "generation-b")
