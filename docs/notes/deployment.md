@@ -75,7 +75,7 @@ exporter and release CI:
 | Principal | Credential | Required Forgejo permission | Allowed repository actions |
 | --- | --- | --- | --- |
 | Runtime exporter Deployment | `FORGE_TOKEN` from Secret `git-activity-exporter-forge` | `read:repository` (or the provider's equivalent read-only repository scope) | Enumerate the configured owner's repositories and clone/fetch their history |
-| Release WorkflowTemplate | `FORGEJO_TOKEN` and Kaniko's equivalent `GIT_PASSWORD` from Secret `forgejo-webhook-token` in `argo-workflows` | `read:repository` plus `write:repository` (or equivalent) | Read the application, commit/push automatic `VERSION` bumps, and commit/push the GitOps image pin |
+| Release WorkflowTemplate | `FORGEJO_TOKEN` and Kaniko's equivalent `GIT_AUTH_TOKEN` from Secret `forgejo-webhook-token` in `argo-workflows` | `read:repository` plus `write:repository` (or equivalent) | Read the application, commit/push automatic `VERSION` bumps, and commit/push the GitOps image pin |
 
 The runtime exporter is therefore read-only against source repositories even
 though it writes the generated dataset to S3. No runtime code has a commit or
@@ -100,7 +100,7 @@ namespace, with type `kubernetes.io/dockerconfigjson` and key
 `.dockerconfigjson`. The WorkflowTemplate mounts that key at
 `/kaniko/.docker/config.json` only in the `docker-build` template. It is a
 Secret volume, not an environment variable, workflow parameter, command-line
-argument, or value printed into logs. `GIT_PASSWORD` remains the Forgejo
+argument, or value printed into logs. `GIT_AUTH_TOKEN` remains the Forgejo
 source-clone/write-back credential; it is not Docker Hub authentication.
 
 The registry and repository contract is:
@@ -158,7 +158,7 @@ shell command line.
 | --- | --- | --- |
 | Runtime Forgejo (`FORGE_TOKEN`) | Read-only token in the source secret for `git-activity-exporter-forge`, injected into the exporter Deployment | The ExternalSecret reports `SecretSynced=True`, Reloader has started the replacement pod, `/ready` returns `200`, and a new `meta.json` shows a published cycle |
 | Runtime S3 (`DEST_S3_*`) | The `dashboard-write-key` GarageKey and its generated/reflected `dashboard-s3-credentials` Secret | The operator and reflector report the replacement without exposing data, the exporter restarts, and the next cycle publishes to the intended bucket/prefix |
-| Release Forgejo (`FORGEJO_TOKEN`/`GIT_PASSWORD`) | Write-scoped token in `forgejo-webhook-token` in `argo-workflows`, consumed by the release WorkflowTemplate | A controlled release reaches the authenticated clone/write step and remains gated through the normal smoke and promotion checks |
+| Release Forgejo (`FORGEJO_TOKEN`/`GIT_AUTH_TOKEN`) | Write-scoped token in `forgejo-webhook-token` in `argo-workflows`, consumed by the release WorkflowTemplate | A controlled release reaches the authenticated clone/write step and remains gated through the normal smoke and promotion checks |
 | Registry (Docker Hub) | Read/write PAT rendered as `.dockerconfigjson` in `docker-hub-registry` in `argo-workflows` | `SecretSynced=True`, Kaniko pushes the exact resolved image/cache, and the image smoke completes before promotion |
 
 ### Provision, propagate, validate, revoke

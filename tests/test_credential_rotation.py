@@ -1,7 +1,11 @@
 """Contract tests for credential rotation and secret injection boundaries."""
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -17,6 +21,67 @@ DEPLOYMENT_RELATIVE = Path(
 CONFIGMAP_RELATIVE = Path(
     "k8s/ardenone-cluster/git-activity-exporter/configmap.yml"
 )
+EXTERNALSECRET_RELATIVE = Path(
+    "k8s/ardenone-cluster/git-activity-exporter/externalsecret.yml"
+)
+
+RUNTIME_CONFIG_DATA = {
+    "FORGE_BASE_URL": "https://git.ardenone.com",
+    "FORGE_OWNER": "jedarden",
+    "WINDOW_DAYS": "90",
+    "SHALLOW_SINCE_DAYS": "100",
+    "CLONE_ROOT": "/data/mirrors",
+    "POLL_INTERVAL_SECONDS": "3600",
+    "GIT_TIMEOUT_SECONDS": "1800",
+    "TRIM_MAX_LINES": "5000",
+    "TRIM_MAX_FILES": "200",
+    "BEAD_BULK_CLOSE_THRESHOLD": "150",
+    "LOG_LEVEL": "INFO",
+}
+FORGE_EXTERNAL_SECRET_SPEC = {
+    "refreshInterval": "1h",
+    "secretStoreRef": {"name": "openbao-v2", "kind": "ClusterSecretStore"},
+    "target": {"name": "git-activity-exporter-forge", "creationPolicy": "Owner"},
+    "data": [
+        {
+            "secretKey": "FORGE_TOKEN",
+            "remoteRef": {
+                "key": "ardenone-cluster/git-activity-exporter/forge",
+                "property": "forgejo-token",
+            },
+        }
+    ],
+}
+EXPECTED_RUNTIME_SECRET_REFS = {
+    "FORGE_TOKEN": {
+        "name": "git-activity-exporter-forge",
+        "key": "FORGE_TOKEN",
+    },
+    "DEST_S3_ENDPOINT": {
+        "name": "dashboard-s3-credentials",
+        "key": "S3_ENDPOINT",
+    },
+    "DEST_S3_ACCESS_KEY_ID": {
+        "name": "dashboard-s3-credentials",
+        "key": "ACCESS_KEY_ID",
+    },
+    "DEST_S3_SECRET_ACCESS_KEY": {
+        "name": "dashboard-s3-credentials",
+        "key": "SECRET_ACCESS_KEY",
+    },
+}
+EXPECTED_RUNTIME_LITERALS = {
+    "DEST_S3_BUCKET": "dashboard-site",
+    "DEST_S3_PREFIX": "git-activity/data",
+    "DEST_S3_ADDRESSING_STYLE": "path",
+}
+REQUIRED_APPLICATION_ENV = {
+    "FORGE_TOKEN",
+    "DEST_S3_ENDPOINT",
+    "DEST_S3_BUCKET",
+    "DEST_S3_ACCESS_KEY_ID",
+    "DEST_S3_SECRET_ACCESS_KEY",
+}
 
 RUNTIME_SECRET_NAMES = {
     "FORGE_TOKEN",
@@ -28,7 +93,11 @@ RUNTIME_SECRET_NAMES = {
 
 def _workflow() -> dict:
     sibling = ROOT.parent / "declarative-config" / WORKFLOW_RELATIVE
-    path = sibling if sibling.is_file() else ROOT / "tests/fixtures/git-activity-exporter-workflow.yml"
+    path = (
+        sibling
+        if sibling.is_file()
+        else ROOT / "tests/fixtures/git-activity-exporter-workflow.yml"
+    )
     return yaml.safe_load(path.read_text())
 
 
@@ -47,19 +116,86 @@ def _env_by_name(template: dict) -> dict[str, dict]:
 
 def _runtime_resources() -> list[dict]:
     sibling_dir = ROOT.parent / "declarative-config" / DEPLOYMENT_RELATIVE.parent
-    if sibling_dir.is_dir():
-        paths = [sibling_dir / DEPLOYMENT_RELATIVE.name, sibling_dir / CONFIGMAP_RELATIVE.name]
-    else:
-        paths = [ROOT / "examples/self-hosting/kubernetes.yaml"]
-
-    resources = []
-    for path in paths:
-        resources.extend(
+    paths = [
+        sibling_dir / DEPLOYMENT_RELATIVE.name,
+        sibling_dir / CONFIGMAP_RELATIVE.name,
+        sibling_dir / EXTERNALSECRET_RELATIVE.name,
+    ]
+    if all(path.is_file() for path in paths):
+        return [
             resource
+            for path in paths
             for resource in yaml.safe_load_all(path.read_text())
             if resource
-        )
-    return resources
+        ]
+    return _reference_runtime_resources()
+
+
+def _reference_runtime_resources() -> list[dict]:
+    """Value-free expected workload resources for isolated source archives."""
+
+    namespace = "git-activity-exporter"
+    return [
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "git-activity-exporter-config",
+                "namespace": namespace,
+            },
+            "data": dict(RUNTIME_CONFIG_DATA),
+        },
+        {
+            "apiVersion": "external-secrets.io/v1",
+            "kind": "ExternalSecret",
+            "metadata": {
+                "name": "git-activity-exporter-forge",
+                "namespace": namespace,
+                "annotations": {"reloader.stakater.com/auto": "true"},
+            },
+            "spec": dict(FORGE_EXTERNAL_SECRET_SPEC),
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "git-activity-exporter",
+                "namespace": namespace,
+                "annotations": {"reloader.stakater.com/auto": "true"},
+            },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "exporter",
+                                "envFrom": [
+                                    {
+                                        "configMapRef": {
+                                            "name": "git-activity-exporter-config"
+                                        }
+                                    }
+                                ],
+                                "env": [
+                                    *[
+                                        {
+                                            "name": name,
+                                            "valueFrom": {"secretKeyRef": dict(ref)},
+                                        }
+                                        for name, ref in EXPECTED_RUNTIME_SECRET_REFS.items()
+                                    ],
+                                    *[
+                                        {"name": name, "value": value}
+                                        for name, value in EXPECTED_RUNTIME_LITERALS.items()
+                                    ],
+                                ],
+                            }
+                        ]
+                    }
+                }
+            },
+        },
+    ]
 
 
 def _deployment_and_configmap() -> tuple[dict, dict]:
@@ -67,6 +203,157 @@ def _deployment_and_configmap() -> tuple[dict, dict]:
     deployment = next(resource for resource in resources if resource["kind"] == "Deployment")
     configmap = next(resource for resource in resources if resource["kind"] == "ConfigMap")
     return deployment, configmap
+
+
+def _external_secret() -> dict:
+    return next(
+        resource
+        for resource in _runtime_resources()
+        if resource["kind"] == "ExternalSecret"
+        and resource["metadata"]["name"] == "git-activity-exporter-forge"
+    )
+
+
+def _exporter_container(deployment: dict | None = None) -> dict:
+    if deployment is None:
+        deployment, _ = _deployment_and_configmap()
+    return next(
+        container
+        for container in deployment["spec"]["template"]["spec"]["containers"]
+        if container["name"] == "exporter"
+    )
+
+
+def _materialize_external_secret(
+    external_secret: dict, provider_values: dict[tuple[str, str], str]
+) -> dict:
+    """Model External Secrets writing its selected provider properties."""
+
+    secret_data = {}
+    for item in external_secret["spec"]["data"]:
+        remote_ref = item["remoteRef"]
+        remote_key = (remote_ref["key"], remote_ref["property"])
+        try:
+            secret_data[item["secretKey"]] = provider_values[remote_key]
+        except KeyError as exc:
+            raise RuntimeError("ExternalSecret provider property is unavailable") from exc
+    return {
+        "name": external_secret["spec"]["target"]["name"],
+        "data": secret_data,
+    }
+
+
+def _resolve_pod_environment(
+    deployment: dict, configmap: dict, secrets: dict[str, dict[str, str]]
+) -> dict[str, str]:
+    """Resolve the exporter's envFrom, literals, and required SecretKeyRefs."""
+
+    container = _exporter_container(deployment)
+    environment = {}
+    for source in container.get("envFrom", []):
+        config_map_ref = source.get("configMapRef")
+        if not config_map_ref:
+            raise AssertionError("unexpected envFrom source in exporter container")
+        if config_map_ref["name"] != configmap["metadata"]["name"]:
+            raise AssertionError("exporter envFrom references an unexpected ConfigMap")
+        environment.update(configmap.get("data", {}))
+
+    for entry in container.get("env", []):
+        if "value" in entry:
+            environment[entry["name"]] = entry["value"]
+            continue
+        secret_ref = entry.get("valueFrom", {}).get("secretKeyRef")
+        if not secret_ref or secret_ref.get("optional") is True:
+            raise AssertionError("runtime credential references must be required")
+        try:
+            environment[entry["name"]] = secrets[secret_ref["name"]][secret_ref["key"]]
+        except KeyError as exc:
+            raise RuntimeError("container cannot resolve a required SecretKeyRef") from exc
+    return environment
+
+
+def _synthetic_runtime_secrets(external_secret: dict, generation: str) -> dict:
+    provider_key = (
+        "ardenone-cluster/git-activity-exporter/forge",
+        "forgejo-token",
+    )
+    forge_secret = _materialize_external_secret(
+        external_secret, {provider_key: f"forge-token:{generation}"}
+    )
+    s3_secret = {
+        "name": "dashboard-s3-credentials",
+        "data": {
+            "S3_ENDPOINT": f"https://s3:{generation}.example.invalid",
+            "ACCESS_KEY_ID": f"access-key:{generation}",
+            "SECRET_ACCESS_KEY": f"secret-key:{generation}",
+        },
+    }
+    return {
+        forge_secret["name"]: forge_secret["data"],
+        s3_secret["name"]: s3_secret["data"],
+    }
+
+
+def _start_smoke_pod(environment: dict[str, str], generation: str) -> subprocess.Popen:
+    """Start the real config loader with the environment projected into a pod."""
+
+    source = """
+from src.config import load
+import os
+import sys
+
+config = load()
+print("started", flush=True)
+for command in sys.stdin:
+    if command.strip() == "probe":
+        values = (
+            config.forge_token,
+            config.dest.endpoint_url,
+            config.dest.access_key_id,
+            config.dest.secret_access_key,
+        )
+        expected = os.environ["SMOKE_EXPECTED_GENERATION"]
+        result = "ready" if all(expected in value for value in values) else "stale"
+        print(result, flush=True)
+    elif command.strip() == "exit":
+        break
+"""
+    process_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(ROOT),
+        **environment,
+        "SMOKE_EXPECTED_GENERATION": generation,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", source],
+        cwd=ROOT,
+        env=process_env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if process.stdout.readline().strip() != "started":
+        stderr = process.stderr.read()
+        process.kill()
+        raise AssertionError(f"runtime config did not start in smoke pod: {stderr}")
+    return process
+
+
+def _probe_smoke_pod(process: subprocess.Popen) -> str:
+    process.stdin.write("probe\n")
+    process.stdin.flush()
+    return process.stdout.readline().strip()
+
+
+def _stop_smoke_pod(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.stdin.write("exit\n")
+        process.stdin.flush()
+        process.wait(timeout=5)
+    process.stdin.close()
+    process.stdout.close()
+    process.stderr.close()
 
 
 def test_rotation_runbook_covers_provision_validation_revocation_and_failure():
@@ -79,7 +366,7 @@ def test_rotation_runbook_covers_provision_validation_revocation_and_failure():
     required = (
         "Runtime Forgejo (`FORGE_TOKEN`)",
         "Runtime S3 (`DEST_S3_*`)",
-        "Release Forgejo (`FORGEJO_TOKEN`/`GIT_PASSWORD`)",
+        "Release Forgejo (`FORGEJO_TOKEN`/`GIT_AUTH_TOKEN`)",
         "Registry (Docker Hub)",
         "Inventory and provision",
         "Write the managed source",
@@ -97,8 +384,12 @@ def test_rotation_runbook_covers_provision_validation_revocation_and_failure():
         assert phrase in compact, f"credential rotation contract missing: {phrase}"
 
     assert compact.index("Inventory and provision") < compact.index("Write the managed source")
-    assert compact.index("Write the managed source") < compact.index("Propagate without reading values")
-    assert compact.index("Propagate without reading values") < compact.index("Validate the consumer")
+    assert compact.index("Write the managed source") < compact.index(
+        "Propagate without reading values"
+    )
+    assert compact.index("Propagate without reading values") < compact.index(
+        "Validate the consumer"
+    )
     assert compact.index("Validate the consumer") < compact.index("Revoke only after validation")
 
     configuration = " ".join(CONFIGURATION_DOC.read_text().split())
@@ -108,11 +399,7 @@ def test_rotation_runbook_covers_provision_validation_revocation_and_failure():
 
 def test_runtime_credentials_are_secret_refs_not_application_configuration():
     deployment, configmap = _deployment_and_configmap()
-    container = next(
-        container
-        for container in deployment["spec"]["template"]["spec"]["containers"]
-        if container["name"] == "exporter"
-    )
+    container = _exporter_container(deployment)
     env = {entry["name"]: entry for entry in container["env"]}
 
     assert RUNTIME_SECRET_NAMES.isdisjoint(configmap.get("data", {}))
@@ -122,6 +409,159 @@ def test_runtime_credentials_are_secret_refs_not_application_configuration():
         assert set(entry) == {"name", "valueFrom"}
         assert set(entry["valueFrom"]) == {"secretKeyRef"}
         assert entry["valueFrom"]["secretKeyRef"].get("optional") is not True
+    assert "FORGEJO_TOKEN" not in env
+    assert "GIT_AUTH_TOKEN" not in env
+    assert all(
+        entry.get("valueFrom", {}).get("secretKeyRef", {}).get("name")
+        != "forgejo-webhook-token"
+        for entry in env.values()
+    )
+
+
+def test_rendered_runtime_manifests_map_config_and_external_secret_to_required_env():
+    deployment, configmap = _deployment_and_configmap()
+    external_secret = _external_secret()
+    container = _exporter_container(deployment)
+    env = {entry["name"]: entry for entry in container["env"]}
+
+    assert configmap["data"] == RUNTIME_CONFIG_DATA
+    assert container["envFrom"] == [
+        {"configMapRef": {"name": "git-activity-exporter-config"}}
+    ]
+    assert external_secret["spec"] == FORGE_EXTERNAL_SECRET_SPEC
+    assert external_secret["metadata"]["annotations"] == {
+        "reloader.stakater.com/auto": "true"
+    }
+    assert env["FORGE_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": external_secret["spec"]["target"]["name"],
+        "key": "FORGE_TOKEN",
+    }
+
+    for name, expected_ref in EXPECTED_RUNTIME_SECRET_REFS.items():
+        assert env[name]["valueFrom"]["secretKeyRef"] == expected_ref
+    for name, value in EXPECTED_RUNTIME_LITERALS.items():
+        assert env[name] == {"name": name, "value": value}
+    assert set(env) == set(EXPECTED_RUNTIME_SECRET_REFS) | set(
+        EXPECTED_RUNTIME_LITERALS
+    )
+
+    projected = _resolve_pod_environment(
+        deployment,
+        configmap,
+        _synthetic_runtime_secrets(external_secret, "generation-a"),
+    )
+    assert REQUIRED_APPLICATION_ENV <= projected.keys()
+    assert {name: projected[name] for name in configmap["data"]} == configmap["data"]
+    assert projected["DEST_S3_BUCKET"] == "dashboard-site"
+
+
+def test_available_gitops_manifests_match_the_checked_in_runtime_contract():
+    sibling_dir = ROOT.parent / "declarative-config" / DEPLOYMENT_RELATIVE.parent
+    paths = [
+        sibling_dir / DEPLOYMENT_RELATIVE.name,
+        sibling_dir / CONFIGMAP_RELATIVE.name,
+        sibling_dir / EXTERNALSECRET_RELATIVE.name,
+    ]
+    if not all(path.is_file() for path in paths):
+        pytest.skip("sibling declarative-config checkout is not available")
+
+    live_resources = [
+        resource
+        for path in paths
+        for resource in yaml.safe_load_all(path.read_text())
+        if resource
+    ]
+    live_deployment = next(
+        resource for resource in live_resources if resource["kind"] == "Deployment"
+    )
+    live_configmap = next(
+        resource for resource in live_resources if resource["kind"] == "ConfigMap"
+    )
+    live_external_secret = next(
+        resource for resource in live_resources if resource["kind"] == "ExternalSecret"
+    )
+    expected_deployment = next(
+        resource
+        for resource in _reference_runtime_resources()
+        if resource["kind"] == "Deployment"
+    )
+    expected_external_secret = next(
+        resource
+        for resource in _reference_runtime_resources()
+        if resource["kind"] == "ExternalSecret"
+    )
+
+    assert live_configmap["data"] == RUNTIME_CONFIG_DATA
+    assert live_external_secret["spec"] == FORGE_EXTERNAL_SECRET_SPEC
+    assert live_external_secret["metadata"]["annotations"] == (
+        expected_external_secret["metadata"]["annotations"]
+    )
+    assert live_deployment["metadata"]["annotations"] == (
+        expected_deployment["metadata"]["annotations"]
+    )
+    live_container = _exporter_container(live_deployment)
+    expected_container = _exporter_container(expected_deployment)
+    assert live_container["envFrom"] == expected_container["envFrom"]
+    assert live_container["env"] == expected_container["env"]
+
+
+@pytest.mark.parametrize(
+    ("secret_name", "secret_key"),
+    [
+        ("git-activity-exporter-forge", "FORGE_TOKEN"),
+        ("dashboard-s3-credentials", "S3_ENDPOINT"),
+        ("dashboard-s3-credentials", "ACCESS_KEY_ID"),
+        ("dashboard-s3-credentials", "SECRET_ACCESS_KEY"),
+    ],
+)
+def test_missing_required_runtime_secret_key_fails_pod_environment_resolution(
+    secret_name, secret_key
+):
+    deployment, configmap = _deployment_and_configmap()
+    secrets = _synthetic_runtime_secrets(_external_secret(), "generation-a")
+    del secrets[secret_name][secret_key]
+
+    with pytest.raises(RuntimeError, match="required SecretKeyRef"):
+        _resolve_pod_environment(deployment, configmap, secrets)
+
+
+def test_rotated_credentials_reach_the_reloader_restarted_runtime_process():
+    deployment, configmap = _deployment_and_configmap()
+    external_secret = _external_secret()
+    assert (
+        deployment["metadata"]["annotations"]["reloader.stakater.com/auto"]
+        == "true"
+    )
+    assert (
+        external_secret["metadata"]["annotations"]["reloader.stakater.com/auto"]
+        == "true"
+    )
+
+    first_environment = _resolve_pod_environment(
+        deployment,
+        configmap,
+        _synthetic_runtime_secrets(external_secret, "generation-a"),
+    )
+    first_process = _start_smoke_pod(first_environment, "generation-a")
+    replacement_process = None
+    try:
+        assert _probe_smoke_pod(first_process) == "ready"
+
+        # A running container keeps its startup environment after the managed
+        # sources rotate; a Reloader-driven replacement resolves the new data.
+        rotated_environment = _resolve_pod_environment(
+            deployment,
+            configmap,
+            _synthetic_runtime_secrets(external_secret, "generation-b"),
+        )
+        assert _probe_smoke_pod(first_process) == "ready"
+        replacement_process = _start_smoke_pod(rotated_environment, "generation-b")
+        assert replacement_process.pid != first_process.pid
+        assert _probe_smoke_pod(replacement_process) == "ready"
+    finally:
+        if replacement_process is not None:
+            _stop_smoke_pod(replacement_process)
+        _stop_smoke_pod(first_process)
 
 
 def test_release_credentials_are_references_and_registry_is_not_a_workflow_input():
@@ -138,9 +578,9 @@ def test_release_credentials_are_references_and_registry_is_not_a_workflow_input
         }
 
     docker = templates["docker-build"]["container"]
-    password = _env_by_name(docker)["GIT_PASSWORD"]
-    assert "value" not in password
-    assert password["valueFrom"]["secretKeyRef"] == {
+    git_auth = _env_by_name(docker)["GIT_AUTH_TOKEN"]
+    assert "value" not in git_auth
+    assert git_auth["valueFrom"]["secretKeyRef"] == {
         "name": "forgejo-webhook-token",
         "key": "token",
     }
@@ -155,11 +595,11 @@ def test_release_credentials_are_references_and_registry_is_not_a_workflow_input
         "items": [{"key": ".dockerconfigjson", "path": "config.json"}],
     }
     assert all(
-        parameter["name"] not in {"FORGEJO_TOKEN", "GIT_PASSWORD", "PAT"}
+        parameter["name"] not in {"FORGEJO_TOKEN", "GIT_AUTH_TOKEN", "PAT"}
         for parameter in workflow["spec"].get("arguments", {}).get("parameters", [])
     )
     assert all(
-        parameter["name"] not in {"FORGEJO_TOKEN", "GIT_PASSWORD", "PAT"}
+        parameter["name"] not in {"FORGEJO_TOKEN", "GIT_AUTH_TOKEN", "PAT"}
         for template in templates.values()
         for parameter in template.get("inputs", {}).get("parameters", [])
     )
