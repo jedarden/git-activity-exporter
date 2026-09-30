@@ -49,6 +49,7 @@ def run_startup(monkeypatch, observed):
         observed["config"] = cfg
         observed["family_map"] = family_map
         stop.set()
+        return "generated", []
 
     monkeypatch.setattr(main.s3io, "client", lambda _dest: object())
     monkeypatch.setattr(main.s3io, "check_permissions", lambda *_args: None)

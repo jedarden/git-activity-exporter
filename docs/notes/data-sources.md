@@ -124,7 +124,9 @@ consumer must treat the lower edge of that repository's history as incomplete;
 the marker is separate from `repos_stale` and may overlap it when a timed-out
 fetch left the old boundary in place. A partial-history repository is not
 silently counted as a fresh, complete mirror and does not become a fetch
-failure merely because the bounded deepen could not reach the cutoff.
+failure merely because the bounded deepen could not reach the cutoff. `/health`
+exposes the same list as `last_successful_repos_partial_history` for the latest
+committed publication; it remains available to probes between cycle attempts.
 
 Merge commits are excluded: git reports no numstat for them, so counting them
 would add commit rows that can never carry lines.

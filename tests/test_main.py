@@ -292,12 +292,13 @@ def test_prune_failure_still_reports_a_published_cycle(monkeypatch):
     s3.fail_when(lambda op, key: RuntimeError("delete boom")
                  if op == "delete" else None)
 
-    generated_at = main._run_cycle(cfg, s3, {})
-    main._record_cycle_outcome("published", generated_at)
+    generated_at, partial_history = main._run_cycle(cfg, s3, {})
+    main._record_cycle_outcome("published", generated_at, partial_history)
 
     health = main._health_snapshot()
     assert health["last_cycle_outcome"] == "published"
     assert health["last_successful_cycle_at"] == generated_at
+    assert health["last_successful_repos_partial_history"] == []
     assert health["prune"] == {
         "last_outcome": "failed",
         "failures_total": 1,

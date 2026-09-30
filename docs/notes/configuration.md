@@ -131,7 +131,7 @@ response. Once the server is bound, these are the complete contracts:
 
 | Request | Status | Payload | Meaning |
 |---|---:|---|---|
-| `GET /health` | `200` | JSON health snapshot | The process is alive. This does not depend on collection or publication success. |
+| `GET /health` | `200` | JSON health snapshot | The process is alive. It also identifies incomplete shallow-history coverage in the latest successful publication. |
 | `GET /metrics` | `200` | Prometheus text exposition | Numeric freshness, cycle-outcome, prune, and publication-failure signals for the monitoring stack. |
 | `GET /ready`, before the first successful cycle | `503` | empty, zero-byte body | The process has not yet completed a publication cycle in this process lifetime. |
 | `GET /ready`, after the first successful cycle | `200` | empty, zero-byte body | A cycle has completed in this process lifetime. |
@@ -140,14 +140,20 @@ response. Once the server is bound, these are the complete contracts:
 `/health` returns `Content-Type: application/json` with exactly these fields:
 
 ```json
-{"last_successful_cycle_at":"2026-09-27T12:00:00Z","last_cycle_outcome":"published","prune":{"last_outcome":"succeeded","failures_total":0,"consecutive_failures":0,"last_failure_cycle_id":null}}
+{"last_successful_cycle_at":"2026-09-27T12:00:00Z","last_cycle_outcome":"published","last_successful_repos_partial_history":["slow-repo"],"prune":{"last_outcome":"succeeded","failures_total":0,"consecutive_failures":0,"last_failure_cycle_id":null}}
 ```
 
-Before the first cycle attempt, both values are `null`. `last_successful_cycle_at`
-is the `generated_at` timestamp from the newest cycle whose complete publication
-committed. It remains unchanged when a later cycle is `withheld` or `failed`.
+Before the first cycle attempt, the timestamp and outcome are `null`; coverage
+is `null` until the first publication. `last_successful_cycle_at` is the
+`generated_at` timestamp from the newest cycle whose publication committed. It
+remains unchanged when a later cycle is `withheld` or `failed`.
 `last_cycle_outcome` is the most recent attempt: `published`, `withheld` (the
 `MAX_FAILURE_RATE` guard rejected it), or `failed` (another cycle exception).
+`last_successful_repos_partial_history` is copied from that successful cycle's
+`meta.json`: an empty list means no scanned repo had incomplete bounded history,
+and listed repos have a shallow boundary newer than the configured date bound.
+It remains unchanged when a later cycle is `withheld` or `failed`, and resets
+to an empty list when a complete-coverage publication succeeds.
 The `prune` object is process-local because pruning runs after the pointer
 commit and therefore cannot be added to the immutable cycle's `meta.json`.
 `last_outcome` is `null` before the first committed cycle and then is either
@@ -241,10 +247,11 @@ Readiness is a process-lifetime latch, not a report on the newest cycle:
 5. **Later failure or withheld publication:** after readiness has been
    achieved, a later failed or withheld cycle does not clear it. `/ready`
    stays `200` and `/health` stays `200`; the previous complete publication
-   remains live. Use `/health`'s `last_successful_cycle_at` and
-   `last_cycle_outcome` for probe-level freshness and outcome; use `meta.json`'s
-   `generated_at`, `repos_failed`, `repos_stale`, and `repos_partial_history`
-   for publication coverage details.
+   remains live. Use `/health`'s `last_successful_cycle_at`,
+   `last_cycle_outcome`, and `last_successful_repos_partial_history` for
+   probe-level freshness, outcome, and shallow-history coverage; use
+   `meta.json`'s `generated_at`, `repos_failed`, `repos_stale`, and
+   `repos_partial_history` for the complete publication coverage details.
 6. **Recovery:** a successful cycle after pre-readiness failures transitions
    `/ready` from `503` to `200`. Recovery after readiness has already been
    achieved has no observable endpoint transition; it remains `200`.

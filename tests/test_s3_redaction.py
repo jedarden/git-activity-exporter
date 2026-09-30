@@ -3,7 +3,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import pytest
 
 from src import config, main, publish, s3io
 from tests.fake_s3 import FakeS3
@@ -160,7 +159,8 @@ def test_health_response_contains_no_s3_error_or_credential_text():
     assert ACCESS_KEY not in snapshot
     assert SECRET_KEY not in snapshot
     assert set(json.loads(snapshot)) == {
-        "last_successful_cycle_at", "last_cycle_outcome", "prune",
+        "last_successful_cycle_at", "last_cycle_outcome",
+        "last_successful_repos_partial_history", "prune",
     }
 
 

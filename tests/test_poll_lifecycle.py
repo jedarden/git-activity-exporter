@@ -75,6 +75,7 @@ def _drive(monkeypatch, outcomes, on_cycle=None, poll_interval_seconds=3600):
             events.append(("cycle-failed", n))
             raise outcome
         events.append(("cycle-ok", n))
+        return "generated", []
 
     cfg = SimpleNamespace(
         log_level=logging.CRITICAL,
@@ -120,7 +121,9 @@ def test_s3_permission_preflight_runs_before_the_first_collection(monkeypatch):
     monkeypatch.setattr(main, "_serve_health", lambda _port: events.append("health"))
     monkeypatch.setattr(main, "threading", SimpleNamespace(Event=ScriptedStop))
     monkeypatch.setattr(main.s3io, "check_permissions", lambda *_args: events.append("preflight"))
-    monkeypatch.setattr(main, "_run_cycle", lambda *_args: events.append("cycle") or "generated")
+    monkeypatch.setattr(
+        main, "_run_cycle", lambda *_args: events.append("cycle") or ("generated", [])
+    )
 
     main.main()
 
@@ -159,7 +162,9 @@ def test_failed_s3_permission_preflight_retries_without_collecting(monkeypatch):
             raise failure
 
     monkeypatch.setattr(main.s3io, "check_permissions", check_permissions)
-    monkeypatch.setattr(main, "_run_cycle", lambda *_args: events.append("cycle") or "generated")
+    monkeypatch.setattr(
+        main, "_run_cycle", lambda *_args: events.append("cycle") or ("generated", [])
+    )
 
     main.main()
 

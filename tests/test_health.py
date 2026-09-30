@@ -181,6 +181,7 @@ def test_endpoint_status_and_payload_contract(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": None,
         "last_cycle_outcome": None,
+        "last_successful_repos_partial_history": None,
         "prune": {
             "last_outcome": None,
             "failures_total": 0,
@@ -197,12 +198,15 @@ def test_endpoint_status_and_payload_contract(health_server):
 
 
 def test_health_reports_last_success_and_current_outcome(health_server):
-    main._record_cycle_outcome("published", "2026-09-27T12:00:00Z")
+    main._record_cycle_outcome(
+        "published", "2026-09-27T12:00:00Z", ["slow-repo"]
+    )
     status, _, body = _get(health_server, "/health")
     assert status == 200
     assert json.loads(body) == {
         "last_successful_cycle_at": "2026-09-27T12:00:00Z",
         "last_cycle_outcome": "published",
+        "last_successful_repos_partial_history": ["slow-repo"],
         "prune": {
             "last_outcome": None,
             "failures_total": 0,
@@ -217,6 +221,7 @@ def test_health_reports_last_success_and_current_outcome(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": "2026-09-27T12:00:00Z",
         "last_cycle_outcome": "withheld",
+        "last_successful_repos_partial_history": ["slow-repo"],
         "prune": {
             "last_outcome": None,
             "failures_total": 0,
@@ -231,6 +236,7 @@ def test_health_reports_last_success_and_current_outcome(health_server):
     assert json.loads(body) == {
         "last_successful_cycle_at": "2026-09-27T12:00:00Z",
         "last_cycle_outcome": "failed",
+        "last_successful_repos_partial_history": ["slow-repo"],
         "prune": {
             "last_outcome": None,
             "failures_total": 0,
@@ -238,6 +244,11 @@ def test_health_reports_last_success_and_current_outcome(health_server):
             "last_failure_cycle_id": None,
         },
     }
+
+    main._record_cycle_outcome("published", "2026-09-27T13:00:00Z", [])
+    status, _, body = _get(health_server, "/health")
+    assert status == 200
+    assert json.loads(body)["last_successful_repos_partial_history"] == []
 
 
 def test_metrics_expose_freshness_outcomes_and_failure_streaks(health_server):
@@ -470,6 +481,7 @@ def test_readiness_transitions_across_failures_withholding_and_recovery(
         outcome = next(outcomes)
         if outcome is not None:
             raise outcome
+        return "generated", []
 
     cfg = SimpleNamespace(
         log_level=logging.WARNING,

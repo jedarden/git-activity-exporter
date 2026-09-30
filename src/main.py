@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 _published = threading.Event()
 _cycle_state_lock = threading.Lock()
 _last_successful_cycle_at = None
+_last_successful_repos_partial_history = None
 _last_cycle_outcome = None
 _cycle_attempts = {"published": 0, "withheld": 0, "failed": 0}
 _publication_failures_total = 0
@@ -32,10 +33,12 @@ class CycleWithheld(RuntimeError):
 
 def _reset_cycle_state():
     global _last_successful_cycle_at, _last_cycle_outcome
+    global _last_successful_repos_partial_history
     global _publication_failures_total, _consecutive_publication_failures
     global _poll_interval_seconds
     with _cycle_state_lock:
         _last_successful_cycle_at = None
+        _last_successful_repos_partial_history = None
         _last_cycle_outcome = None
         _cycle_attempts.update(published=0, withheld=0, failed=0)
         _publication_failures_total = 0
@@ -44,19 +47,27 @@ def _reset_cycle_state():
     publish.reset_prune_health()
 
 
-def _record_cycle_outcome(outcome: str, successful_cycle_at: Optional[str] = None):
+def _record_cycle_outcome(
+    outcome: str,
+    successful_cycle_at: Optional[str] = None,
+    successful_repos_partial_history: Optional[list] = None,
+):
     """Publish the operator-facing state used by the health endpoint.
 
     A failed or withheld cycle must not move the freshness timestamp backward:
     it describes the newest cycle that actually committed a complete dataset.
     """
-    global _last_successful_cycle_at, _last_cycle_outcome
+    global _last_successful_cycle_at, _last_successful_repos_partial_history
+    global _last_cycle_outcome
     global _consecutive_publication_failures
     with _cycle_state_lock:
         _last_cycle_outcome = outcome
         _cycle_attempts[outcome] += 1
         if outcome == "published":
             _last_successful_cycle_at = successful_cycle_at
+            _last_successful_repos_partial_history = list(
+                successful_repos_partial_history or []
+            )
             # A complete publication is the recovery boundary for a run of
             # publication errors. Withheld cycles do not reset this counter:
             # they are not successful publications either.
@@ -82,6 +93,10 @@ def _health_snapshot():
         snapshot = {
             "last_successful_cycle_at": _last_successful_cycle_at,
             "last_cycle_outcome": _last_cycle_outcome,
+            "last_successful_repos_partial_history": (
+                list(_last_successful_repos_partial_history)
+                if _last_successful_repos_partial_history is not None else None
+            ),
         }
     snapshot["prune"] = publish.prune_health()
     return snapshot
@@ -445,7 +460,7 @@ def _run_cycle(cfg, s3, family_map):
 
     publish.publish_cycle(s3, cfg.dest.bucket, cfg.dest_prefix, payloads,
                           cycle_id=cycle_id, generated_at=generated_at)
-    return generated_at
+    return generated_at, stats.get("repos_partial_history", [])
 
 
 def main():
@@ -484,8 +499,8 @@ def main():
                 )
                 s3_permissions_checked = True
                 log.info("S3 destination permission preflight passed")
-            generated_at = _run_cycle(cfg, s3, family_map)
-            _record_cycle_outcome("published", generated_at)
+            generated_at, partial_history = _run_cycle(cfg, s3, family_map)
+            _record_cycle_outcome("published", generated_at, partial_history)
             _published.set()
         except s3io.S3PermissionError as e:
             _record_cycle_outcome("failed")

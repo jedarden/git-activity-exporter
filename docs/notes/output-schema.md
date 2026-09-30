@@ -618,7 +618,9 @@ the scanned set: it names repos whose shallow boundary is still newer than the
 configured date bound, and can overlap `repos_stale`. A healthy cycle
 has `repos_failed`, `repos_stale`, `repos_partial_history`, and
 `mirrors_pruned` all empty; anything else is stated here rather than inferred
-from missing rows.
+from missing rows. `/health` carries the same list as
+`last_successful_repos_partial_history` for the newest committed publication,
+so a published cycle outcome does not imply complete shallow-history coverage.
 
 A cycle whose failure rate exceeds `MAX_FAILURE_RATE` (default 0.2) is
 withheld entirely instead of published partial. **None of these fields

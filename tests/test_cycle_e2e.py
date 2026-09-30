@@ -234,6 +234,13 @@ def local_cycle(tmp_path, monkeypatch):
     return _make_cycle_fixture(tmp_path, monkeypatch)
 
 
+@pytest.fixture
+def clean_cycle_health():
+    main._reset_cycle_state()
+    yield
+    main._reset_cycle_state()
+
+
 def _read_cycle(s3):
     pointer_bytes = s3io.download_bytes(s3, BUCKET, f"{PREFIX}/current.json")
     assert pointer_bytes is not None
@@ -361,6 +368,99 @@ def test_local_fixture_cycle_reuses_mirrors_and_publishes_coverage(local_cycle):
 
     assert s3.objects[f"{PREFIX}/current.json"][0] == previous_pointer
     assert s3.puts == previous_puts
+
+
+def test_unrecoverable_shallow_boundary_is_published_in_metadata_and_health(
+    tmp_path, monkeypatch, clean_cycle_health
+):
+    source = tmp_path / "source"
+    _init_repo(source)
+    _write(source, "history.txt", "before shallow boundary\n")
+    _commit(source, "2026-08-25T09:00:00+00:00", "in-window parent")
+    _write(source, "history.txt", "at shallow boundary\n")
+    _commit(source, "2026-08-26T10:00:00+00:00", "shallow boundary")
+    _write(source, "history.txt", "newest history\n")
+    _commit(source, "2026-09-20T10:00:00+00:00", "newest commit")
+
+    clone_root = tmp_path / "mirrors"
+    _mark_clone_root(clone_root)
+    mirror = clone_root / "shallow-repo.git"
+    subprocess.run(
+        [
+            "git", "clone", "-q", "--mirror", "--shallow-since=2026-08-26",
+            source.as_uri(), str(mirror),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    shallow_boundaries = (mirror / "shallow").read_text().splitlines()
+    assert len(shallow_boundaries) == 1
+    boundary_sha = shallow_boundaries[0]
+    assert _git(mirror, "show", "-s", "--format=%s", boundary_sha) == "shallow boundary"
+
+    repo = {
+        "name": "shallow-repo",
+        "full_name": "fixture/shallow-repo",
+        "clone_url": source.as_uri(),
+        "empty": False,
+    }
+    monkeypatch.setattr(main.forge, "list_repos", lambda *_args: [repo])
+    monkeypatch.setattr(main.gitscan, "validate_clone_url", lambda *_args: None)
+    monkeypatch.setattr(main, "_now", lambda: GENERATED_AT)
+
+    remote_calls = []
+
+    def history_cannot_be_deepened(args, _timeout, cwd=None, env=None, before_attempt=None):
+        remote_calls.append(args)
+
+    monkeypatch.setattr(main.gitscan, "_run_remote", history_cannot_be_deepened)
+    cfg = SimpleNamespace(
+        forge_base_url="https://forge.fixture",
+        forge_token="fixture-token",
+        forge_owner="fixture-owner",
+        http_timeout_seconds=30,
+        repo_denylist=[],
+        clone_root=str(clone_root),
+        window_days=30,
+        shallow_since_days=30,
+        excluded_path_patterns=[],
+        git_timeout_seconds=60,
+        trim_max_lines=5000,
+        trim_max_files=200,
+        bead_bulk_close_threshold=150,
+        bead_bulk_hour_share=0.5,
+        max_failure_rate=0.2,
+        dest=SimpleNamespace(bucket=BUCKET),
+        dest_prefix=PREFIX,
+        version="fixture",
+    )
+    s3 = FakeS3()
+
+    generated_at, partial_history = main._run_cycle(cfg, s3, {"shallow-repo": "fixture"})
+    main._record_cycle_outcome("published", generated_at, partial_history)
+
+    deepens = [call for call in remote_calls if any(arg.startswith("--deepen=") for arg in call)]
+    assert len(deepens) == gitscan._DEEPEN_MAX_ATTEMPTS
+    assert not main.gitscan.mirror_history_complete(
+        str(mirror), main._reporting_window(GENERATED_AT, cfg.window_days).start,
+        cfg.shallow_since_days, cfg.git_timeout_seconds,
+    )
+
+    pointer, staged, _fixed = _read_cycle(s3)
+    assert pointer["generated_at"] == GENERATED_AT
+    meta = json.loads(staged["meta.json"])
+    assert meta["repos_total"] == 1
+    assert meta["repos_scanned"] == 1
+    assert meta["repos_failed"] == []
+    assert meta["repos_partial_history"] == ["shallow-repo"]
+    assert {row["subject"] for row in _rows(staged["commits.parquet"])} == {
+        "shallow boundary", "newest commit",
+    }
+    assert generated_at == GENERATED_AT
+    assert partial_history == ["shallow-repo"]
+    assert main._health_snapshot()["last_successful_repos_partial_history"] == [
+        "shallow-repo"
+    ]
 
 
 def _lifecycle_repo(name, source, empty=False):
