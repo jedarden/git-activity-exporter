@@ -370,9 +370,30 @@ def test_local_fixture_cycle_reuses_mirrors_and_publishes_coverage(local_cycle):
     assert s3.puts == previous_puts
 
 
-def test_unrecoverable_shallow_boundary_is_published_in_metadata_and_health(
-    tmp_path, monkeypatch, clean_cycle_health
+@pytest.mark.parametrize(
+    ("deepening_recovers", "expected_partial_history", "expected_subjects"),
+    [
+        pytest.param(
+            False,
+            ["shallow-repo"],
+            {"shallow boundary", "newest commit"},
+            id="unrecoverable-boundary-is-reported",
+        ),
+        pytest.param(
+            True,
+            [],
+            {"in-window parent", "shallow boundary", "newest commit"},
+            id="recovered-boundary-is-complete",
+        ),
+    ],
+)
+def test_shallow_boundary_coverage_is_published_in_metadata_and_health(
+    tmp_path, monkeypatch, clean_cycle_health, deepening_recovers,
+    expected_partial_history, expected_subjects,
 ):
+    # The reporting window is [2026-08-24T12Z, 2026-09-23T12Z). Its
+    # 30-day bounded-history cutoff is 2026-07-25, so the Aug 26 shallow
+    # root hides an Aug 25 parent that should appear in this report.
     source = tmp_path / "source"
     _init_repo(source)
     _write(source, "history.txt", "before shallow boundary\n")
@@ -413,7 +434,8 @@ def test_unrecoverable_shallow_boundary_is_published_in_metadata_and_health(
     def history_cannot_be_deepened(args, _timeout, cwd=None, env=None, before_attempt=None):
         remote_calls.append(args)
 
-    monkeypatch.setattr(main.gitscan, "_run_remote", history_cannot_be_deepened)
+    if not deepening_recovers:
+        monkeypatch.setattr(main.gitscan, "_run_remote", history_cannot_be_deepened)
     cfg = SimpleNamespace(
         forge_base_url="https://forge.fixture",
         forge_token="fixture-token",
@@ -440,11 +462,12 @@ def test_unrecoverable_shallow_boundary_is_published_in_metadata_and_health(
     main._record_cycle_outcome("published", generated_at, partial_history)
 
     deepens = [call for call in remote_calls if any(arg.startswith("--deepen=") for arg in call)]
-    assert len(deepens) == gitscan._DEEPEN_MAX_ATTEMPTS
-    assert not main.gitscan.mirror_history_complete(
+    if not deepening_recovers:
+        assert len(deepens) == gitscan._DEEPEN_MAX_ATTEMPTS
+    assert main.gitscan.mirror_history_complete(
         str(mirror), main._reporting_window(GENERATED_AT, cfg.window_days).start,
         cfg.shallow_since_days, cfg.git_timeout_seconds,
-    )
+    ) is deepening_recovers
 
     pointer, staged, _fixed = _read_cycle(s3)
     assert pointer["generated_at"] == GENERATED_AT
@@ -452,15 +475,11 @@ def test_unrecoverable_shallow_boundary_is_published_in_metadata_and_health(
     assert meta["repos_total"] == 1
     assert meta["repos_scanned"] == 1
     assert meta["repos_failed"] == []
-    assert meta["repos_partial_history"] == ["shallow-repo"]
-    assert {row["subject"] for row in _rows(staged["commits.parquet"])} == {
-        "shallow boundary", "newest commit",
-    }
+    assert meta["repos_partial_history"] == expected_partial_history
+    assert {row["subject"] for row in _rows(staged["commits.parquet"])} == expected_subjects
     assert generated_at == GENERATED_AT
-    assert partial_history == ["shallow-repo"]
-    assert main._health_snapshot()["last_successful_repos_partial_history"] == [
-        "shallow-repo"
-    ]
+    assert partial_history == expected_partial_history
+    assert main._health_snapshot()["last_successful_repos_partial_history"] == expected_partial_history
 
 
 def _lifecycle_repo(name, source, empty=False):
