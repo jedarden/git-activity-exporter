@@ -9,6 +9,7 @@ from botocore.exceptions import (
     ConnectTimeoutError,
     ConnectionClosedError,
     EndpointConnectionError,
+    IncompleteReadError,
     ProxyConnectionError,
     ReadTimeoutError,
     SSLError,
@@ -224,7 +225,7 @@ def download_bytes(s3, bucket: str, key: str):
     """Returns the object body, or None if it doesn't exist yet (first run)."""
     def get():
         try:
-            return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            return _read_object_body(s3.get_object(Bucket=bucket, Key=key))
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
                 return None
@@ -242,13 +243,44 @@ def fetch_object(s3, bucket: str, key: str):
     def get():
         try:
             resp = s3.get_object(Bucket=bucket, Key=key)
-            return resp["Body"].read(), resp.get("ContentType")
+            return _read_object_body(resp), resp.get("ContentType")
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
                 return None
             raise
 
     return _call(get, f"S3 GET s3://{bucket}/{key}")
+
+
+def _read_object_body(response):
+    """Read a complete S3 response body, retrying a short response.
+
+    S3's ContentLength lets recovery distinguish a complete object from a
+    stream that ended early. Returning short bytes here could make a
+    pointer-resolved cycle look complete even though one immutable object was
+    truncated in transit.
+    """
+    body = response["Body"]
+    try:
+        try:
+            data = body.read()
+        except IncompleteReadError:
+            raise S3OperationError(
+                "S3 GET returned an incomplete object body",
+                retryable=True,
+            ) from None
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+
+    content_length = response.get("ContentLength")
+    if type(content_length) is int and len(data) != content_length:
+        raise S3OperationError(
+            "S3 GET returned an incomplete object body",
+            retryable=True,
+        )
+    return data
 
 
 def delete_key(s3, bucket: str, key: str):

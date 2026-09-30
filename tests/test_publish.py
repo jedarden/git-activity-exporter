@@ -6,10 +6,11 @@ assembles objects from two cycles. FakeS3 is deliberately bare -- it models
 put/get/delete/list exactly as boto3 shapes them, so the faults land on the
 same calls the real client makes.
 """
+import io
 import json
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, IncompleteReadError
 
 from src import publish, s3io
 from tests.fake_s3 import FakeS3
@@ -23,6 +24,17 @@ _CYCLES = {
     )
     for index, tag in enumerate("ABCDE", start=0)
 }
+
+
+class IncompleteReadBody:
+    def __init__(self, expected_bytes):
+        self.expected_bytes = expected_bytes
+
+    def read(self):
+        raise IncompleteReadError(actual_bytes=b"short", expected_bytes=self.expected_bytes)
+
+    def close(self):
+        pass
 
 
 def identity(tag):
@@ -325,6 +337,151 @@ def test_unusable_pointer_is_not_dereferenced_for_recovery():
         s3, BUCKET, PREFIX, expected_names=publish.DEFAULT_FIXED_NAMES
     ) is None
     assert ("get", named_object) not in s3.calls
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_error"),
+    [
+        ("missing", "names missing object"),
+        ("malformed-meta", "pointer meta.json is malformed"),
+        ("truncated-meta", "pointer meta.json is malformed"),
+        ("cross-cycle-meta", "pointer meta.json does not match the pointer"),
+    ],
+    ids=("missing-object", "malformed-object", "truncated-object", "cross-cycle-object"),
+)
+def test_incomplete_pointer_cycle_fails_closed_without_repair(damage, expected_error):
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    pointer_key = f"{PREFIX}/current.json"
+    pointer = s3.objects[pointer_key]
+    fixed_before = fixed_keys(s3)
+    puts_before = list(s3.puts)
+    deletes_before = [call for call in s3.calls if call[0] == "delete"]
+
+    if damage == "missing":
+        damaged_key = put_key(f"cycles/{cycle_id('A')}", "hourly.parquet")
+        del s3.objects[damaged_key]
+    else:
+        damaged_key = put_key(f"cycles/{cycle_id('A')}", "meta.json")
+        if damage == "malformed-meta":
+            body = b"not-json"
+        elif damage == "truncated-meta":
+            body = b'{"cycle_id":'
+        else:
+            body = next(data for name, data, _ in payloads("B") if name == "meta.json")
+        s3.objects[damaged_key] = (body, "application/json")
+
+    pointer_doc = json.loads(pointer[0])
+    with pytest.raises(publish.PublicationError, match=expected_error):
+        publish._pointer_snapshot(
+            s3, BUCKET, PREFIX, pointer_doc,
+            expected_names=publish.DEFAULT_FIXED_NAMES,
+        )
+
+    assert publish.recover_publication(
+        s3, BUCKET, PREFIX, expected_names=publish.DEFAULT_FIXED_NAMES
+    ) is None
+
+    assert s3.objects[pointer_key] == pointer
+    assert fixed_keys(s3) == fixed_before
+    assert s3.puts == puts_before
+    assert [call for call in s3.calls if call[0] == "delete"] == deletes_before
+    assert ("get", damaged_key) in s3.calls
+
+
+def test_pointer_cannot_name_an_object_from_another_cycle():
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    pointer_key = f"{PREFIX}/current.json"
+    pointer = json.loads(s3.objects[pointer_key][0])
+    foreign_key = f"cycles/{cycle_id('B')}/hourly.parquet"
+    pointer["objects"]["hourly.parquet"] = foreign_key
+    s3.objects[pointer_key] = (json.dumps(pointer).encode(), "application/json")
+    pointer_bytes = s3.objects[pointer_key][0]
+    fixed_before = fixed_keys(s3)
+    calls_before = list(s3.calls)
+    puts_before = list(s3.puts)
+
+    assert publish.recover_publication(
+        s3, BUCKET, PREFIX, expected_names=publish.DEFAULT_FIXED_NAMES
+    ) is None
+
+    assert ("get", f"{PREFIX}/{foreign_key}") not in s3.calls
+    assert fixed_keys(s3) == fixed_before
+    assert s3.puts == puts_before
+    assert s3.objects[pointer_key][0] == pointer_bytes
+    assert s3.calls[len(calls_before)] == ("get", pointer_key)
+
+
+@pytest.mark.parametrize("truncation", ("short-body", "read-exception"))
+def test_pointer_snapshot_retries_a_truncated_s3_response_then_recovers(
+    monkeypatch, truncation
+):
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    object_key = put_key(f"cycles/{cycle_id('A')}", "hourly.parquet")
+    real_get_object = s3.get_object
+    attempts = {"count": 0}
+
+    def truncate_first_responses(Bucket, Key):
+        response = real_get_object(Bucket=Bucket, Key=Key)
+        if Key == object_key:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                complete = response["Body"].read()
+                response["Body"].close()
+                response["Body"] = (
+                    io.BytesIO(complete[:-1])
+                    if truncation == "short-body"
+                    else IncompleteReadBody(len(complete))
+                )
+        return response
+
+    monkeypatch.setattr(s3, "get_object", truncate_first_responses)
+    sleeps = []
+    monkeypatch.setattr(s3io.retry.time, "sleep", sleeps.append)
+
+    assert publish.recover_publication(
+        s3, BUCKET, PREFIX, expected_names=publish.DEFAULT_FIXED_NAMES
+    ) == cycle_id("A")
+
+    assert attempts["count"] == s3io.retry.MAX_ATTEMPTS
+    assert sleeps == [1, 2]
+
+
+def test_exhausted_truncated_pointer_object_read_fails_without_mixing(monkeypatch):
+    s3 = FakeS3()
+    do_publish(s3, "A")
+    pointer_key = f"{PREFIX}/current.json"
+    pointer = s3.objects[pointer_key]
+    object_key = put_key(f"cycles/{cycle_id('A')}", "hourly.parquet")
+    fixed_before = fixed_keys(s3)
+    puts_before = list(s3.puts)
+    real_get_object = s3.get_object
+    attempts = {"count": 0}
+
+    def always_truncate(Bucket, Key):
+        response = real_get_object(Bucket=Bucket, Key=Key)
+        if Key == object_key:
+            attempts["count"] += 1
+            complete = response["Body"].read()
+            response["Body"].close()
+            response["Body"] = io.BytesIO(complete[:-1])
+        return response
+
+    monkeypatch.setattr(s3, "get_object", always_truncate)
+    monkeypatch.setattr(s3io.retry.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(s3io.S3OperationError) as error:
+        publish.recover_publication(
+            s3, BUCKET, PREFIX, expected_names=publish.DEFAULT_FIXED_NAMES
+        )
+
+    assert error.value.retryable is True
+    assert attempts["count"] == s3io.retry.MAX_ATTEMPTS
+    assert s3.objects[pointer_key] == pointer
+    assert fixed_keys(s3) == fixed_before
+    assert s3.puts == puts_before
 
 
 def test_absent_pointer_bootstraps_without_pruning_existing_cycles():

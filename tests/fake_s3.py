@@ -60,6 +60,7 @@ class FakeS3:
         data, ct = self.objects[Key]
         return {
             "Body": io.BytesIO(data),
+            "ContentLength": len(data),
             "ContentType": ct,
             "CacheControl": self.cache_controls.get(Key),
         }
