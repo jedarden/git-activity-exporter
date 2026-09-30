@@ -1,0 +1,46 @@
+---
+# Tuning for the git-activity exporter. Every value here is a measurement,
+# not a preference -- see the repo's docs/notes/configuration.md for the
+# numbers behind each one.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-activity-exporter-config
+  namespace: git-activity-exporter
+data:
+  FORGE_BASE_URL: "https://git.ardenone.com"
+  FORGE_OWNER: "jedarden"
+
+  # Reporting window. The clone bound sits above it deliberately: a mirror
+  # shallower than the window truncates the oldest hours of every chart with
+  # no error, so the exporter refuses that combination at startup.
+  WINDOW_DAYS: "90"
+  SHALLOW_SINCE_DAYS: "100"
+
+  CLONE_ROOT: "/data/mirrors"
+
+  # Hourly. Git history is immutable once written, so unlike the Argo
+  # exporter there is no TTL race to outrun -- nothing is lost by polling
+  # slowly, and a cycle re-walks every mirror.
+  POLL_INTERVAL_SECONDS: "3600"
+
+  # A single cold clone of a large repo measured 148.6s (NEEDLE, 60-day
+  # bound), but the first live cold pass still timed out at 600s on the two
+  # largest histories (agent-transcript-archive 3.4 GiB,
+  # unfairmarket-research 1.5 GiB). Raised to cover them; this only ever
+  # binds on a cold clone, since an incremental fetch of an existing mirror
+  # measured 1.21s.
+  GIT_TIMEOUT_SECONDS: "1800"
+
+  # Above either bound a commit still counts as a commit but stops
+  # contributing to line totals. Largest observed artifact commits reached
+  # 9,072,022 lines and 25,639 files against a 104-line median.
+  TRIM_MAX_LINES: "5000"
+  TRIM_MAX_FILES: "200"
+
+  # Closures per (repo, hour) above which the cell is flagged a bulk import.
+  # The bead-rs migration produced cells up to 1,966; the busiest genuine
+  # hour any repo has recorded is 69.
+  BEAD_BULK_CLOSE_THRESHOLD: "150"
+
+  LOG_LEVEL: "INFO"

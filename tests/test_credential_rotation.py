@@ -24,6 +24,7 @@ CONFIGMAP_RELATIVE = Path(
 EXTERNALSECRET_RELATIVE = Path(
     "k8s/ardenone-cluster/git-activity-exporter/externalsecret.yml"
 )
+RUNTIME_MANIFEST_FIXTURE_DIR = ROOT / "tests/fixtures/git-activity-exporter-runtime"
 
 RUNTIME_CONFIG_DATA = {
     "FORGE_BASE_URL": "https://git.ardenone.com",
@@ -116,86 +117,38 @@ def _env_by_name(template: dict) -> dict[str, dict]:
 
 def _runtime_resources() -> list[dict]:
     sibling_dir = ROOT.parent / "declarative-config" / DEPLOYMENT_RELATIVE.parent
-    paths = [
+    live_paths = [
         sibling_dir / DEPLOYMENT_RELATIVE.name,
         sibling_dir / CONFIGMAP_RELATIVE.name,
         sibling_dir / EXTERNALSECRET_RELATIVE.name,
     ]
-    if all(path.is_file() for path in paths):
-        return [
-            resource
-            for path in paths
-            for resource in yaml.safe_load_all(path.read_text())
-            if resource
-        ]
-    return _reference_runtime_resources()
-
-
-def _reference_runtime_resources() -> list[dict]:
-    """Value-free expected workload resources for isolated source archives."""
-
-    namespace = "git-activity-exporter"
-    return [
-        {
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": "git-activity-exporter-config",
-                "namespace": namespace,
-            },
-            "data": dict(RUNTIME_CONFIG_DATA),
-        },
-        {
-            "apiVersion": "external-secrets.io/v1",
-            "kind": "ExternalSecret",
-            "metadata": {
-                "name": "git-activity-exporter-forge",
-                "namespace": namespace,
-                "annotations": {"reloader.stakater.com/auto": "true"},
-            },
-            "spec": dict(FORGE_EXTERNAL_SECRET_SPEC),
-        },
-        {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {
-                "name": "git-activity-exporter",
-                "namespace": namespace,
-                "annotations": {"reloader.stakater.com/auto": "true"},
-            },
-            "spec": {
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "exporter",
-                                "envFrom": [
-                                    {
-                                        "configMapRef": {
-                                            "name": "git-activity-exporter-config"
-                                        }
-                                    }
-                                ],
-                                "env": [
-                                    *[
-                                        {
-                                            "name": name,
-                                            "valueFrom": {"secretKeyRef": dict(ref)},
-                                        }
-                                        for name, ref in EXPECTED_RUNTIME_SECRET_REFS.items()
-                                    ],
-                                    *[
-                                        {"name": name, "value": value}
-                                        for name, value in EXPECTED_RUNTIME_LITERALS.items()
-                                    ],
-                                ],
-                            }
-                        ]
-                    }
-                }
-            },
-        },
+    paths = live_paths if all(path.is_file() for path in live_paths) else [
+        RUNTIME_MANIFEST_FIXTURE_DIR / "deployment.yml",
+        RUNTIME_MANIFEST_FIXTURE_DIR / "configmap.yml",
     ]
+    resources = [
+        resource
+        for path in paths
+        for resource in yaml.safe_load_all(path.read_text())
+        if resource
+    ]
+    if len(paths) != len(live_paths):
+        # The ExternalSecret mapping is value-free and kept as a contract
+        # alongside the YAML snapshots. The live source is checked below
+        # whenever the declarative-config checkout is available.
+        resources.append(
+            {
+                "apiVersion": "external-secrets.io/v1",
+                "kind": "ExternalSecret",
+                "metadata": {
+                    "name": "git-activity-exporter-forge",
+                    "namespace": "git-activity-exporter",
+                    "annotations": {"reloader.stakater.com/auto": "true"},
+                },
+                "spec": FORGE_EXTERNAL_SECRET_SPEC,
+            }
+        )
+    return resources
 
 
 def _deployment_and_configmap() -> tuple[dict, dict]:
@@ -455,54 +408,57 @@ def test_rendered_runtime_manifests_map_config_and_external_secret_to_required_e
     assert projected["DEST_S3_BUCKET"] == "dashboard-site"
 
 
-def test_available_gitops_manifests_match_the_checked_in_runtime_contract():
+def test_available_gitops_manifests_match_checked_in_rendered_fixtures():
     sibling_dir = ROOT.parent / "declarative-config" / DEPLOYMENT_RELATIVE.parent
-    paths = [
+    live_paths = [
         sibling_dir / DEPLOYMENT_RELATIVE.name,
         sibling_dir / CONFIGMAP_RELATIVE.name,
         sibling_dir / EXTERNALSECRET_RELATIVE.name,
     ]
-    if not all(path.is_file() for path in paths):
+    if not all(path.is_file() for path in live_paths):
         pytest.skip("sibling declarative-config checkout is not available")
 
-    live_resources = [
-        resource
-        for path in paths
-        for resource in yaml.safe_load_all(path.read_text())
-        if resource
+    fixture_paths = [
+        RUNTIME_MANIFEST_FIXTURE_DIR / "deployment.yml",
+        RUNTIME_MANIFEST_FIXTURE_DIR / "configmap.yml",
     ]
-    live_deployment = next(
-        resource for resource in live_resources if resource["kind"] == "Deployment"
-    )
-    live_configmap = next(
-        resource for resource in live_resources if resource["kind"] == "ConfigMap"
-    )
-    live_external_secret = next(
-        resource for resource in live_resources if resource["kind"] == "ExternalSecret"
-    )
-    expected_deployment = next(
-        resource
-        for resource in _reference_runtime_resources()
-        if resource["kind"] == "Deployment"
-    )
-    expected_external_secret = next(
-        resource
-        for resource in _reference_runtime_resources()
-        if resource["kind"] == "ExternalSecret"
-    )
 
-    assert live_configmap["data"] == RUNTIME_CONFIG_DATA
+    def load_resources(paths: list[Path]) -> list[dict]:
+        return [
+            resource
+            for path in paths
+            for resource in yaml.safe_load_all(path.read_text())
+            if resource
+        ]
+
+    live_resources = load_resources(live_paths)
+    fixture_resources = load_resources(fixture_paths)
+    for kind, name in (
+        ("Deployment", "git-activity-exporter"),
+        ("ConfigMap", "git-activity-exporter-config"),
+    ):
+        live = next(
+            resource
+            for resource in live_resources
+            if resource["kind"] == kind and resource["metadata"]["name"] == name
+        )
+        fixture = next(
+            resource
+            for resource in fixture_resources
+            if resource["kind"] == kind and resource["metadata"]["name"] == name
+        )
+        assert live == fixture
+
+    live_external_secret = next(
+        resource
+        for resource in live_resources
+        if resource["kind"] == "ExternalSecret"
+        and resource["metadata"]["name"] == "git-activity-exporter-forge"
+    )
     assert live_external_secret["spec"] == FORGE_EXTERNAL_SECRET_SPEC
-    assert live_external_secret["metadata"]["annotations"] == (
-        expected_external_secret["metadata"]["annotations"]
-    )
-    assert live_deployment["metadata"]["annotations"] == (
-        expected_deployment["metadata"]["annotations"]
-    )
-    live_container = _exporter_container(live_deployment)
-    expected_container = _exporter_container(expected_deployment)
-    assert live_container["envFrom"] == expected_container["envFrom"]
-    assert live_container["env"] == expected_container["env"]
+    assert live_external_secret["metadata"]["annotations"] == {
+        "reloader.stakater.com/auto": "true"
+    }
 
 
 @pytest.mark.parametrize(
