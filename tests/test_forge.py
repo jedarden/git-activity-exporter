@@ -33,13 +33,15 @@ def no_retry_sleep(monkeypatch):
 
 
 class FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, error_message=None):
         self.payload = payload
         self.status_code = status
+        self.error_message = error_message
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            error = requests.HTTPError(f"{self.status_code} error for repos/search")
+            message = self.error_message or f"{self.status_code} error for repos/search"
+            error = requests.HTTPError(message)
             error.response = self
             raise error
 
@@ -385,6 +387,36 @@ def test_client_error_is_not_retried(monkeypatch):
     assert len(f.calls) == 1
 
 
+def test_authentication_error_redacts_token_from_exception(monkeypatch, caplog):
+    response = FakeResponse(None, status=401, error_message=f"credential rejected: {TOKEN}")
+    f = FakeForge([response]).install(monkeypatch)
+
+    with pytest.raises(requests.HTTPError) as raised:
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert TOKEN not in str(raised.value)
+    assert raised.value.response.status_code == 401
+    assert raised.value.response.request is None
+    assert TOKEN not in caplog.text
+    assert len(f.calls) == 1
+
+
+def test_retry_log_and_final_exception_redact_token(monkeypatch, caplog):
+    response = requests.Response()
+    response.status_code = 503
+    error = requests.HTTPError(f"temporary Forgejo failure echoed {TOKEN}", response=response)
+    f = FakeForge([error]).install(monkeypatch)
+    caplog.set_level("WARNING", logger="src.retry")
+
+    with pytest.raises(requests.HTTPError) as raised:
+        forge.list_repos(BASE, TOKEN, OWNER, TIMEOUT)
+
+    assert TOKEN not in str(raised.value)
+    assert TOKEN not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert len(f.calls) == forge.retry.MAX_ATTEMPTS
+
+
 def test_transport_error_fails_the_walk(monkeypatch):
     f = FakeForge([requests.ConnectionError("connection refused")]).install(monkeypatch)
     with pytest.raises(requests.ConnectionError):
@@ -428,6 +460,28 @@ def _mirror(tmp_path, name):
     d.mkdir()
     (d / "HEAD").write_text("ref: refs/heads/main\n")
     return d
+
+
+def _seed_previous_publication(s3, prefix):
+    generated_at = "2026-09-29T12:00:00Z"
+    cycle_id = "20260929T120000Z-01234567"
+    names = main.publish.DEFAULT_FIXED_NAMES
+    for name in names:
+        if name == "meta.json":
+            data = json.dumps({
+                "cycle_id": cycle_id,
+                "generated_at": generated_at,
+            }).encode()
+            content_type = "application/json"
+        else:
+            data = f"previous:{name}".encode()
+            content_type = "application/octet-stream"
+        s3.objects[f"{prefix}/cycles/{cycle_id}/{name}"] = (data, content_type)
+        s3.objects[f"{prefix}/{name}"] = (data, content_type)
+    s3.objects[f"{prefix}/current.json"] = (
+        main.publish.pointer_bytes(cycle_id, generated_at, names),
+        "application/json",
+    )
 
 
 def test_collect_prunes_only_against_the_complete_multi_page_enumeration(monkeypatch, tmp_path):
@@ -505,6 +559,42 @@ def test_enumeration_error_fails_the_cycle_before_any_prune_or_publish(monkeypat
     assert s3.puts == []
     assert s3.objects == {}
     assert (tmp_path / "survivor.git").exists()
+
+
+def test_authentication_failure_preserves_mirrors_publication_and_readiness(
+    monkeypatch, tmp_path, caplog
+):
+    """A revoked discovery credential fails before mirror pruning or publish."""
+    cfg = _cfg(tmp_path)
+    existing = _mirror(tmp_path, "repo-1")
+    orphan = _mirror(tmp_path, "orphan")
+    response = FakeResponse(
+        None, status=401, error_message=f"authentication failed: {TOKEN}"
+    )
+    f = FakeForge([response]).install(monkeypatch)
+    s3 = FakeS3()
+    _seed_previous_publication(s3, cfg.dest_prefix)
+    publication_before = dict(s3.objects)
+    health_before = main._health_snapshot()
+    published_before = main._published.is_set()
+    main._published.set()
+
+    try:
+        with pytest.raises(requests.HTTPError) as raised:
+            main._run_cycle(cfg, s3, {})
+
+        assert TOKEN not in str(raised.value)
+        assert TOKEN not in caplog.text
+        assert len(f.calls) == 1
+        assert existing.is_dir()
+        assert orphan.is_dir()
+        assert s3.objects == publication_before
+        assert s3.puts == []
+        assert main._published.is_set()
+        assert main._health_snapshot() == health_before
+    finally:
+        if not published_before:
+            main._published.clear()
 
 
 @pytest.mark.parametrize(

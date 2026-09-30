@@ -29,6 +29,27 @@ class EnumerationError(RuntimeError):
     """The Forgejo response was successful but not a valid repo listing."""
 
 
+def redact_token(text: str, token: str) -> str:
+    """Remove the configured API token from exception and log text."""
+    text = str(text or "")
+    return text.replace(token, "<redacted>") if token else text
+
+
+def _sanitize_request_exception(error: requests.RequestException, token: str):
+    """Remove token text and request objects from a requests error in place."""
+    error.args = (redact_token(str(error), token),)
+    if isinstance(error, requests.HTTPError):
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        response = requests.Response()
+        if isinstance(status, int):
+            response.status_code = status
+        error.response = response
+    else:
+        error.response = None
+    error.request = None
+    return error
+
+
 def _is_transient(error: Exception) -> bool:
     """Whether a Forgejo page request may succeed on another attempt."""
     if isinstance(error, (requests.ConnectionError, requests.Timeout)):
@@ -128,11 +149,25 @@ def list_repos(base_url: str, token: str, owner: str, timeout: int, denylist=())
             resp.raise_for_status()
             return resp
 
-        resp = retry.call(
-            get_page,
-            is_retryable=_is_transient,
-            label=f"Forgejo repository enumeration page {page}",
-        )
+        try:
+            resp = retry.call(
+                get_page,
+                is_retryable=_is_transient,
+                label=f"Forgejo repository enumeration page {page}",
+                error_summary=lambda error: redact_token(str(error), token),
+            )
+        except requests.RequestException as error:
+            # Request/response objects may retain the prepared Authorization
+            # header even when the exception message itself is harmless.
+            _sanitize_request_exception(error, token)
+            raise
+        except Exception as error:
+            # An adapter or mock can still echo request data in a non-requests
+            # exception. Keep the useful message while removing the secret.
+            safe_message = redact_token(str(error), token)
+            if safe_message != str(error):
+                error.args = (safe_message,)
+            raise
         batch = _validated_page(resp, page, base_url)
         for repository in batch:
             name = repository["name"]
