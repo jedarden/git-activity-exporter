@@ -123,6 +123,27 @@ def _parameter_values(resource: dict) -> dict[str, str]:
     }
 
 
+def _event_value(event: dict, path: str):
+    value = event
+    for component in path.split("."):
+        value = value[component]
+    return value
+
+
+def _sensor_accepts_push(sensor: dict, event: dict) -> bool:
+    """Apply the fixture's string filters to a representative push event."""
+    dependency = sensor["spec"]["dependencies"][0]
+    for item in dependency["filters"]["data"]:
+        actual = _event_value(event, item["path"])
+        expected = item["value"]
+        if item.get("comparator") == "!=":
+            if actual in expected:
+                return False
+        elif actual not in expected:
+            return False
+    return True
+
+
 def _assert_origin_only(source: str) -> None:
     """Ensure release scripts cannot select a second or GitHub push remote."""
     assert "github.com" not in source.lower()
@@ -313,6 +334,116 @@ def _run_resolve_version(
         return result
     assert result.returncode == 0, result.stderr
     return expected_version_path.read_text(encoding="utf-8").strip()
+
+
+def _run_test_step(
+    workflow: dict,
+    root: Path,
+    origin: Path,
+    commit_sha: str,
+    *,
+    attempt: str,
+    pytest_exit_code: int,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Execute the fixture test script against a local origin and fake pytest."""
+    script = _templates(workflow)["test"]["script"]["source"]
+    checkout = root / f"test-checkout-{attempt}"
+    assert script.count("{{workflow.parameters.branch}}") == 1
+    assert script.count(
+        '"https://git.ardenone.com/{{workflow.parameters.git-repo}}.git"'
+    ) == 1
+    script = script.replace(
+        "{{workflow.parameters.branch}}", "main"
+    )
+    script = script.replace(
+        '"https://git.ardenone.com/{{workflow.parameters.git-repo}}.git"',
+        shlex.quote(str(origin)),
+    )
+    script = script.replace("/tmp/repo", str(checkout))
+    script = script.replace("{{workflow.parameters.commit-sha}}", commit_sha)
+
+    fake_bin = root / f"test-bin-{attempt}"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
+        '  git rev-parse HEAD > "$PYTEST_CHECKOUT_SHA"\n'
+        '  exit "$PYTEST_EXIT_CODE"\n'
+        "fi\n"
+        'exec /usr/bin/python3 "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    checked_out_sha = root / f"test-checkout-sha-{attempt}"
+    command_env = os.environ.copy()
+    command_env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{command_env['PATH']}",
+            "PYTEST_CHECKOUT_SHA": str(checked_out_sha),
+            "PYTEST_EXIT_CODE": str(pytest_exit_code),
+        }
+    )
+    result = subprocess.run(
+        ["sh", "-c", script],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=command_env,
+    )
+    observed_sha = (
+        checked_out_sha.read_text(encoding="utf-8").strip()
+        if checked_out_sha.is_file()
+        else ""
+    )
+    return result, observed_sha
+
+
+def _run_buildkit(
+    workflow: dict,
+    root: Path,
+    origin: Path,
+    version: str,
+    source_sha: str,
+) -> list[str]:
+    """Execute the fixture's build command with a fake buildctl binary."""
+    source = _templates(workflow)["docker-build"]["container"]["args"][0]
+    source = source.replace(
+        'CONTEXT="https://git.ardenone.com/{{workflow.parameters.git-repo}}.git'
+        '#{{inputs.parameters.source-sha}}"',
+        f'CONTEXT="{origin}#{source_sha}"',
+    )
+    source = source.replace("{{inputs.parameters.version}}", version)
+    source = source.replace("{{inputs.parameters.source-sha}}", source_sha)
+
+    fake_bin = root / "buildkit-bin"
+    fake_bin.mkdir()
+    fake_buildctl = fake_bin / "buildctl"
+    fake_buildctl.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\0\' "$@" > "$BUILDKIT_ARGV_FILE"\n',
+        encoding="utf-8",
+    )
+    fake_buildctl.chmod(0o755)
+    argv_path = root / "buildkit-argv"
+    command_env = os.environ.copy()
+    command_env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{command_env['PATH']}",
+            "BUILDKIT_ARGV_FILE": str(argv_path),
+        }
+    )
+    result = subprocess.run(
+        ["sh", "-c", source],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=command_env,
+    )
+    assert result.returncode == 0, result.stderr
+    return argv_path.read_bytes().decode("utf-8").rstrip("\0").split("\0")
 
 
 def _gitops_repository(root: Path) -> Path:
@@ -578,6 +709,163 @@ def test_release_fixture_captures_event_sha_and_rejects_stale_main():
     assert "#{{inputs.parameters.source-sha}}" in build_source
     assert "git pull --rebase" not in resolve_source
     assert "refusing stale release" in resolve_source
+
+
+def test_release_fixture_runs_a_push_from_event_sha_through_gitops_promotion(
+    tmp_path: Path,
+):
+    """Follow one webhook through checkout, version, image build, and promotion."""
+    workflow = _fixture_workflow()
+    sensor = yaml.safe_load(
+        (FIXTURES / "git-activity-exporter-sensor.yml").read_text()
+    )
+    application_origin = _application_origin(
+        tmp_path, explicit_version_change=False
+    )
+    trigger_sha = _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    )
+    event = {
+        "headers": {"X-Github-Event": "push"},
+        "body": {
+            "ref": "refs/heads/main",
+            "after": trigger_sha,
+            "head_commit": {"author": {"name": "Contributor"}},
+        },
+    }
+
+    assert _sensor_accepts_push(sensor, event)
+    argo_authored_event = {
+        **event,
+        "body": {
+            **event["body"],
+            "head_commit": {"author": {"name": "Argo Workflows CI"}},
+        },
+    }
+    assert not _sensor_accepts_push(sensor, argo_authored_event)
+
+    trigger = sensor["spec"]["triggers"][0]["template"]
+    workflow_resource = trigger["argoWorkflow"]["source"]["resource"]
+    workflow_parameters = workflow_resource["spec"]["arguments"]["parameters"]
+    assert _parameter_values(workflow_resource)["commit-sha"] == ""
+    for mapping in trigger["parameters"]:
+        event_sha = _event_value(event, mapping["src"]["dataKey"])
+        parameter_index = int(mapping["dest"].rsplit(".", 2)[1])
+        workflow_parameters[parameter_index]["value"] = event_sha
+    captured_sha = _parameter_values(workflow_resource)["commit-sha"]
+    assert captured_sha == trigger_sha
+
+    build_steps = _templates(workflow)["build"]["steps"]
+    assert [group[0]["name"] for group in build_steps] == [
+        "test",
+        "resolve-version",
+        "docker-build",
+        "self-hosting-smoke",
+        "smoke",
+        "promote",
+        "verify-rollout",
+    ]
+
+    # The actual test script checks out the webhook SHA. Simulate failing and
+    # passing pytest results so the failed gate can prove it leaves main alone.
+    failed_test, failed_checkout_sha = _run_test_step(
+        workflow,
+        tmp_path,
+        application_origin,
+        captured_sha,
+        attempt="failed",
+        pytest_exit_code=1,
+    )
+    assert failed_test.returncode == 1
+    assert failed_checkout_sha == trigger_sha
+    assert _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    ) == trigger_sha
+    assert _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "show",
+        "main:VERSION",
+    ) == "1.2.3"
+
+    passing_test, passing_checkout_sha = _run_test_step(
+        workflow,
+        tmp_path,
+        application_origin,
+        captured_sha,
+        attempt="passing",
+        pytest_exit_code=0,
+    )
+    assert passing_test.returncode == 0, passing_test.stderr
+    assert passing_checkout_sha == trigger_sha
+
+    version_path = tmp_path / "resolved-version"
+    resolved_version = _run_resolve_version(
+        workflow,
+        tmp_path,
+        application_origin,
+        version_path,
+        commit_sha=captured_sha,
+    )
+    source_sha = Path(f"{version_path}.sha").read_text(encoding="utf-8").strip()
+    assert resolved_version == "1.2.4"
+    assert source_sha == _git(
+        tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
+    )
+    assert _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "show",
+        f"{source_sha}:VERSION",
+    ) == resolved_version
+
+    retry_version_path = tmp_path / "retry-version"
+    retry_version = _run_resolve_version(
+        workflow,
+        tmp_path,
+        application_origin,
+        retry_version_path,
+        commit_sha=captured_sha,
+    )
+    retry_source_sha = Path(f"{retry_version_path}.sha").read_text(
+        encoding="utf-8"
+    ).strip()
+    assert (retry_version, retry_source_sha) == (resolved_version, source_sha)
+    assert _git(
+        tmp_path,
+        "--git-dir",
+        str(application_origin),
+        "log",
+        "--format=%s",
+        "main",
+    ).splitlines().count(f"ci: auto-bump version to {resolved_version}") == 1
+
+    build_argv = _run_buildkit(
+        workflow, tmp_path, application_origin, resolved_version, source_sha
+    )
+    assert f"context={application_origin}#{source_sha}" in build_argv
+    assert f"build-arg:VERSION={resolved_version}" in build_argv
+    assert (
+        "type=image,name=ronaldraygun/git-activity-exporter:"
+        f"{resolved_version},push=true"
+    ) in build_argv
+
+    verified_image = f"ronaldraygun/git-activity-exporter:{resolved_version}"
+    gitops_origin = _gitops_repository(tmp_path)
+    revision, promoted_image = _run_promotion(
+        workflow,
+        tmp_path,
+        gitops_origin,
+        resolved_version,
+        attempt="event-to-promotion",
+        verified_image=verified_image,
+    )
+    assert promoted_image == verified_image
+    assert revision == _git(
+        tmp_path, "--git-dir", str(gitops_origin), "rev-parse", "main"
+    )
 
 
 def test_queued_release_fails_when_main_advanced_past_trigger(tmp_path):
