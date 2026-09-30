@@ -677,18 +677,19 @@ def test_release_workflow_uses_forgejo_main_repositories_and_origin_only():
     ) in build_source
 
 
-def test_release_fixture_captures_event_sha_and_rejects_stale_main():
-    workflow = _fixture_workflow()
-    sensor = yaml.safe_load(
-        (FIXTURES / "git-activity-exporter-sensor.yml").read_text()
-    )
+def test_release_workflow_captures_event_sha_and_rejects_stale_main():
+    workflow = _workflow()
+    sensor = _sensor()
     workflow_parameters = _parameter_values(workflow)
     assert workflow_parameters["commit-sha"] == ""
 
     trigger = sensor["spec"]["triggers"][0]["template"]
     trigger_resource = trigger["argoWorkflow"]["source"]["resource"]
     assert _parameter_values(trigger_resource)["commit-sha"] == ""
-    assert trigger["parameters"] == [
+    parameter_mappings = trigger.get(
+        "parameters", trigger["argoWorkflow"].get("parameters")
+    )
+    assert parameter_mappings == [
         {
             "src": {
                 "dependencyName": "git-activity-exporter-push",
@@ -869,7 +870,7 @@ def test_release_fixture_runs_a_push_from_event_sha_through_gitops_promotion(
 
 
 def test_queued_release_fails_when_main_advanced_past_trigger(tmp_path):
-    workflow = _fixture_workflow()
+    workflow = _workflow()
     application_origin = _application_origin(tmp_path, explicit_version_change=False)
     trigger_sha = _git(
         tmp_path, "--git-dir", str(application_origin), "rev-parse", "main"
